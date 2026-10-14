@@ -8,6 +8,7 @@ use crate::editor::EditorArea;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::explorer::Explorer;
 use crate::geom::{PointF, RectF, SizeF};
+use crate::objects::{LoadResult, ObjectService};
 use crate::panel::{Action, Cx, Panel};
 use crate::split::{Anchor, Axis, Splitter};
 use crate::sys::dialog::{self, ComGuard};
@@ -203,6 +204,7 @@ struct Views {
     visualizer: Visualizer,
     owner: Option<MouseOwner>,
     window_focused: bool,
+    objects: ObjectService,
 }
 
 impl Views {
@@ -374,6 +376,52 @@ impl Views {
         cx.repaint();
     }
 
+    /// Shows finished object loads in the Explorer and the Output panel.
+    fn drain_objects(&mut self, cx: &mut Cx) {
+        while let Some(LoadResult {
+            path,
+            reload,
+            elapsed,
+            graph,
+        }) = self.objects.try_recv()
+        {
+            let file = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let shown = self
+                .code
+                .explorer
+                .apply_object(&path, graph.as_ref().map_err(|e| e.reason.as_str()));
+            match &graph {
+                Ok(g) => {
+                    let count = |k| g.nodes_of(k).count();
+                    let locals = g
+                        .edges()
+                        .iter()
+                        .filter(|e| e.kind == engine::EdgeKind::Contains)
+                        .count();
+                    cx.log(format!(
+                        "{} {file}: {} functions, {} globals, {locals} locals, {} externals                          (debug: {:?}) in {} ms",
+                        if reload { "Reloaded" } else { "Loaded" },
+                        count(engine::NodeKind::Function),
+                        count(engine::NodeKind::Variable).saturating_sub(locals),
+                        count(engine::NodeKind::External),
+                        g.debug,
+                        elapsed.as_millis()
+                    ));
+                    for w in &g.warnings {
+                        cx.log_error(format!("{file}: {w}"));
+                    }
+                }
+                Err(e) => cx.log_error(format!("Load failed: {}", e.message)),
+            }
+            if shown {
+                cx.repaint();
+            }
+        }
+    }
+
     /// Applies queued actions until none remain (actions may queue more).
     fn process_actions(&mut self, cx: &mut Cx) {
         loop {
@@ -387,6 +435,11 @@ impl Views {
                         self.code.editor.open(&path, cx);
                         if self.code.editor.has_documents() {
                             self.code.set_focus(Region::Editor, cx);
+                        }
+                    }
+                    Action::LoadObject(path) => {
+                        if let Some(warning) = self.objects.load(&path) {
+                            cx.log_error(warning);
                         }
                     }
                     Action::PickFolder => match dialog::pick_folder(cx.window) {
@@ -423,6 +476,7 @@ impl Shell {
     pub fn new(window: NativeWindow, dpi: u32, folder: Option<PathBuf>) -> Result<Self, Error> {
         let com = ComGuard::init()?;
         let waker = Waker::new(window);
+        let (objects, objects_error) = ObjectService::new(waker.clone());
         let mut shell = Self {
             window,
             gfx: Graphics::new(window, dpi)?,
@@ -437,6 +491,7 @@ impl Shell {
                 visualizer: Visualizer::default(),
                 owner: None,
                 window_focused: true,
+                objects,
             },
             waker,
             cursor: CursorShape::Arrow,
@@ -448,6 +503,9 @@ impl Shell {
             "Lattice started (editor font: {})",
             shell.text.mono_family()
         ));
+        if let Some(e) = objects_error {
+            cx.log_error(e);
+        }
         if let Some(folder) = folder {
             shell.views.open_folder(&folder, &mut cx);
         }
@@ -521,6 +579,7 @@ impl Shell {
         self.waker.reset();
         let mut cx = Cx::new(&self.text, self.window);
         self.views.code.bottom.terminal.pump(&mut cx);
+        self.views.drain_objects(&mut cx);
         self.views.process_actions(&mut cx);
         Response {
             repaint: cx.needs_repaint(),

@@ -11,6 +11,7 @@ mod error;
 pub mod event;
 mod explorer;
 pub mod geom;
+mod objects;
 mod output;
 mod panel;
 mod shell;

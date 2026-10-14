@@ -1,0 +1,197 @@
+//! Graph shape per fixture, asserted by names rather than offsets.
+
+mod common;
+
+use common::{edge, fixture, load, names};
+use engine::{DebugFormat, EdgeKind, NodeKind, ObjectFormat};
+
+/// Objects compiled from `src/graph.c`.
+const GRAPH_C: &[&str] = &[
+    "msvc_z7.obj",
+    "msvc_nodebug.obj",
+    "mingw_dwarf.o",
+    "mingw_nodebug.o",
+];
+
+/// 1-based line of the first line in a fixture source containing `needle`.
+fn source_line(source: &str, needle: &str) -> u32 {
+    let text = std::fs::read_to_string(fixture("src").join(source)).expect("fixture source");
+    let index = text
+        .lines()
+        .position(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} not in {source}"));
+    u32::try_from(index + 1).expect("line fits")
+}
+
+#[test]
+fn c_objects_have_layer_a_shape() {
+    for name in GRAPH_C {
+        let g = load(name);
+        assert_eq!(g.format, ObjectFormat::Coff, "{name}");
+        assert_eq!(
+            names(&g, NodeKind::Function),
+            ["callee", "caller", "helper", "read_counter"],
+            "{name}"
+        );
+        assert_eq!(names(&g, NodeKind::External), ["external_fn"], "{name}");
+
+        assert!(edge(&g, "caller", "callee", EdgeKind::Calls), "{name}");
+        assert!(edge(&g, "callee", "helper", EdgeKind::Calls), "{name}");
+        assert!(edge(&g, "caller", "external_fn", EdgeKind::Calls), "{name}");
+
+        // Global written by callee, read by helper and read_counter.
+        for user in ["callee", "helper", "read_counter"] {
+            assert!(
+                edge(&g, user, "counter", EdgeKind::References),
+                "{name}: {user}"
+            );
+        }
+        // Taking an address is a reference, not a call.
+        assert!(
+            edge(&g, "callback", "read_counter", EdgeKind::References),
+            "{name}"
+        );
+        assert!(
+            !edge(&g, "callback", "read_counter", EdgeKind::Calls),
+            "{name}"
+        );
+
+        let callee = g.find(NodeKind::Function, "callee").expect("callee");
+        assert!(callee.size.is_some_and(|s| s > 0), "{name}");
+        assert!(
+            g.edges_from(callee.id)
+                .any(|e| e.kind == EdgeKind::DefinedIn),
+            "{name}: callee has a section"
+        );
+        // Unwind and debug sections never become nodes.
+        assert!(
+            g.nodes_of(NodeKind::Section)
+                .all(|s| s.display_name.starts_with(".text")
+                    || s.display_name.starts_with(".data")
+                    || s.display_name.starts_with(".bss")),
+            "{name}: {:?}",
+            names(&g, NodeKind::Section)
+        );
+    }
+}
+
+#[test]
+fn debug_info_adds_sources_locals_and_types() {
+    let callee_line = source_line("graph.c", "NOINLINE int callee(");
+    for (name, format) in [
+        ("msvc_z7.obj", DebugFormat::CodeView),
+        ("mingw_dwarf.o", DebugFormat::Dwarf),
+    ] {
+        let g = load(name);
+        assert_eq!(g.debug, format, "{name}");
+        assert!(g.warnings.is_empty(), "{name}: {:?}", g.warnings);
+
+        let callee = g.find(NodeKind::Function, "callee").expect("callee");
+        let src = callee.source.as_ref().expect("callee source");
+        assert!(src.file.ends_with("graph.c"), "{name}: {}", src.file);
+        assert_eq!(src.line, callee_line, "{name}");
+
+        for local in ["a", "b", "sum"] {
+            assert!(
+                edge(&g, "callee", local, EdgeKind::Contains),
+                "{name}: {local}"
+            );
+            assert!(edge(&g, local, "int", EdgeKind::HasType), "{name}: {local}");
+        }
+        assert!(edge(&g, "caller", "total", EdgeKind::Contains), "{name}");
+        assert!(edge(&g, "counter", "int", EdgeKind::HasType), "{name}");
+        assert!(edge(&g, "callback", "fn*", EdgeKind::HasType), "{name}");
+    }
+}
+
+#[test]
+fn objects_without_debug_info_have_no_layer_b() {
+    for name in ["msvc_nodebug.obj", "mingw_nodebug.o"] {
+        let g = load(name);
+        assert_eq!(g.debug, DebugFormat::None, "{name}");
+        assert!(g.nodes().iter().all(|n| n.source.is_none()), "{name}");
+        assert_eq!(g.nodes_of(NodeKind::Type).count(), 0, "{name}");
+    }
+}
+
+#[test]
+fn elf_rust_object() {
+    let g = load("elf_dwarf.o");
+    assert_eq!(g.format, ObjectFormat::Elf);
+    assert_eq!(g.debug, DebugFormat::Dwarf);
+    assert_eq!(
+        names(&g, NodeKind::Function),
+        [
+            "callee",
+            "caller",
+            "helper",
+            "lib::mangled_rust_fn",
+            "read_counter"
+        ]
+    );
+    assert_eq!(
+        names(&g, NodeKind::External),
+        ["core::panicking::panic_bounds_check"]
+    );
+    // Called through a hoisted GOT load (`mov r13, [rip+callee]; call r13`).
+    assert!(edge(&g, "caller", "callee", EdgeKind::Calls));
+    assert!(edge(
+        &g,
+        "caller",
+        "core::panicking::panic_bounds_check",
+        EdgeKind::Calls
+    ));
+    assert!(edge(&g, "lib::mangled_rust_fn", "helper", EdgeKind::Calls));
+    assert!(edge(&g, "callee", "lib::COUNTER", EdgeKind::References));
+    assert!(edge(&g, "lib::COUNTER", "AtomicI32", EdgeKind::HasType));
+    assert!(edge(&g, "caller", "values", EdgeKind::Contains));
+
+    let callee = g.find(NodeKind::Function, "callee").expect("callee");
+    let src = callee.source.as_ref().expect("source");
+    assert!(src.file.ends_with("lib.rs"), "{}", src.file);
+    assert_eq!(
+        src.line,
+        source_line("lib.rs", "pub extern \"C\" fn callee")
+    );
+}
+
+#[test]
+fn comdat_functions_appear_once_with_demangled_names() {
+    let g = load("msvc_comdat.obj");
+    assert_eq!(
+        names(&g, NodeKind::Function),
+        [
+            "shared_inline",
+            "twice<int64_t>",
+            "twice<int>",
+            "use_comdat"
+        ]
+    );
+    let shared = g.find(NodeKind::Function, "shared_inline").expect("node");
+    assert_eq!(&*shared.linkage_name, "?shared_inline@@YAHH@Z");
+    assert!(edge(&g, "use_comdat", "shared_inline", EdgeKind::Calls));
+    assert!(edge(&g, "use_comdat", "twice<int64_t>", EdgeKind::Calls));
+    assert!(edge(&g, "shared_inline", "twice<int>", EdgeKind::Calls));
+}
+
+#[test]
+fn empty_object_is_a_valid_empty_graph() {
+    let g = load("msvc_empty.obj");
+    assert_eq!(g.nodes().len(), 0, "{}", common::describe(&g));
+    assert!(g.edges().is_empty());
+}
+
+#[test]
+fn ids_are_stable_across_reloads_and_scoped_by_path() {
+    let a = load("msvc_z7.obj");
+    let b = load("msvc_z7.obj");
+    let ids = |g: &engine::CodeGraph| g.nodes().iter().map(|n| n.id).collect::<Vec<_>>();
+    assert_eq!(ids(&a), ids(&b));
+    assert_eq!(a.edges(), b.edges());
+
+    let bytes = std::fs::read(fixture("msvc_z7.obj")).expect("fixture");
+    let elsewhere = engine::load_bytes(&bytes, std::path::Path::new("other/copy.obj"))
+        .expect("loads from memory");
+    let callee = |g: &engine::CodeGraph| g.find(NodeKind::Function, "callee").map(|n| n.id);
+    assert_ne!(callee(&a), callee(&elsewhere));
+}

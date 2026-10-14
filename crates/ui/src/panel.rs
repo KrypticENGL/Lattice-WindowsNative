@@ -14,8 +14,13 @@ use crate::theme::Theme;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     OpenFile(PathBuf),
+    /// Load (or retry) an object file with the engine.
+    LoadObject(PathBuf),
     PickFolder,
-    Log { error: bool, text: String },
+    Log {
+        error: bool,
+        text: String,
+    },
 }
 
 /// Context for one event dispatch.

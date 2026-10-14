@@ -4,10 +4,13 @@ A native Windows IDE with a code-graph visualizer, written in Rust directly
 against Win32 via the [`windows`](https://crates.io/crates/windows) crate (no
 GUI framework).
 
-**Status:** Stage 2 is the IDE shell. It has top-level **Code** and
-**Visualizer** tabs. The Code tab holds the Solution Explorer, a tabbed
-editor, an Output panel and a ConPTY terminal, with resizable splitters. The
-Visualizer tab is a placeholder until stage 4.
+**Status:** Stage 3, the object-file engine. The IDE shell from stage 2 is
+unchanged: top-level **Code** and **Visualizer** tabs, and in the Code tab
+the Solution Explorer, a tabbed editor, an Output panel and a ConPTY
+terminal. Object files (`.obj`, `.o`) now expand in the Explorer into their
+functions, variables and externals, read by `crates/engine`. The engine
+reloads them automatically when they change on disk. The Visualizer tab is
+still a placeholder until stage 4.
 
 ## Build
 
@@ -36,6 +39,7 @@ cargo test --workspace
 |---|---|
 | Open a folder | `Ctrl+O`, the **Open Folder** button, or a path on the command line |
 | Open a file | Double-click it in the Explorer (or select it and press `Enter`) |
+| Inspect an object file | Click a `.obj` / `.o` in the Explorer. Its symbols load in the background, grouped as Functions / Variables / Externals, with `file:line` when debug info has it. Rebuilding the file reloads it |
 | Switch top tabs | Click **Code** / **Visualizer**, or `Ctrl+1` / `Ctrl+2` |
 | Editor | Type to edit. `Ctrl+S` save, `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+Z` redo, `Ctrl+A/C/X/V`, `Ctrl+W` close tab, `Ctrl+Tab` next tab. Shift+arrows or a mouse drag selects; double-click selects a word |
 | Terminal | Click **TERMINAL** or press `` Ctrl+` ``. `Ctrl+V` pastes; the mouse wheel scrolls the history. Press `Enter` to restart the shell after it exits |
@@ -54,7 +58,7 @@ Cargo workspace of small crates:
 |---|---|
 | `crates/app` | Binary `lattice`: process setup, main window, message loop. It translates window messages into `ui` events |
 | `crates/ui` | The IDE shell: Direct2D/DirectWrite drawing, panels, layout, the editor buffer, the terminal emulator |
-| `crates/engine` | Object-file parsing and graph model. Portable, `forbid(unsafe_code)` (skeleton until stage 3) |
+| `crates/engine` | Object-file parsing (COFF, ELF) into a `CodeGraph`. Portable, `forbid(unsafe_code)`, no Windows dependency. See [`crates/engine/README.md`](crates/engine/README.md) for what it reads and its limits |
 | `crates/renderer` | Visualizer viewport drawing (skeleton until stage 4) |
 
 **Unsafe boundary.** `unsafe_code` is denied across the workspace. Only
@@ -105,9 +109,14 @@ it. `app` hands the window to `ui` as an opaque `ui::NativeWindow`.
     screen and DSR replies;
   - the key-to-VT encoding.
 
-**Threads.** Two background threads per shell, `pty-reader` and `pty-wait`,
-send data over an mpsc channel and post one coalesced `WAKE_MESSAGE`
-(`WM_APP+1`, no payload). The UI thread drains the channel in
+**Threads.** Background threads never touch the window:
+- `pty-reader` and `pty-wait` serve the terminal;
+- `object-loader` runs `engine::load`;
+- a `notify` watcher reports object files that change and are due a reload,
+  debounced by 300 ms.
+
+Each sends data over an mpsc channel and posts one coalesced `WAKE_MESSAGE`
+(`WM_APP+1`, no payload). The UI thread drains the channels in
 `Shell::on_wake`. No window or COM objects cross threads.
 
 **Known limits (stage 2).** The editor has no syntax highlighting, word
