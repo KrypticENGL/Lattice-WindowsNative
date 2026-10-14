@@ -195,3 +195,67 @@ fn ids_are_stable_across_reloads_and_scoped_by_path() {
     let callee = |g: &engine::CodeGraph| g.find(NodeKind::Function, "callee").map(|n| n.id);
     assert_ne!(callee(&a), callee(&elsewhere));
 }
+
+#[test]
+fn mingw_cpp_resolves_refptr_cells_and_flags_generated_symbols() {
+    let g = load("mingw_cpp.o");
+    let locals: std::collections::HashSet<_> = g
+        .edges()
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Contains)
+        .map(|e| e.to)
+        .collect();
+    let user = |kind| {
+        let mut v: Vec<String> = g
+            .nodes_of(kind)
+            .filter(|n| !n.artificial && !locals.contains(&n.id))
+            .map(|n| n.display_name.to_string())
+            .collect();
+        v.sort();
+        v
+    };
+
+    // `.refptr.imported_value` is resolved to the variable it points at.
+    assert!(g
+        .nodes()
+        .iter()
+        .all(|n| !n.linkage_name.starts_with(".refptr.")));
+    assert!(edge(&g, "main", "imported_value", EdgeKind::References));
+
+    // Only the user's globals remain once generated data is set aside.
+    assert_eq!(user(NodeKind::Variable), ["total", "unit"]);
+    let functions = user(NodeKind::Function);
+    for f in ["main", "measure(Shape const&)", "Square::area() const"] {
+        assert!(functions.iter().any(|n| n == f), "{f} in {functions:?}");
+    }
+    for linkage in [
+        "_ZTV6Square",
+        "_ZTI5Shape",
+        "_ZTS5Shape",
+        "_GLOBAL__sub_I_total",
+        "_Z41__static_initialization_and_destruction_0v",
+        "__main",
+    ] {
+        let node = g
+            .nodes()
+            .iter()
+            .find(|n| &*n.linkage_name == linkage)
+            .unwrap_or_else(|| panic!("{linkage} missing"));
+        assert!(node.artificial, "{linkage}");
+    }
+
+    // Locals come from DWARF; compiler-supplied `this` is not one of them.
+    for local in ["count", "sq", "sum"] {
+        assert!(edge(&g, "main", local, EdgeKind::Contains), "{local}");
+    }
+    assert!(g.nodes().iter().all(|n| &*n.display_name != "this"));
+
+    // Constructors get their location through the abstract-origin chain.
+    let ctor = g
+        .find(NodeKind::Function, "Square::Square(double)")
+        .expect("ctor");
+    assert_eq!(
+        ctor.source.as_ref().map(|s| s.line),
+        Some(source_line("shapes.cpp", "explicit Square(double v)"))
+    );
+}

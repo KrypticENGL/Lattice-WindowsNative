@@ -9,6 +9,37 @@ use crate::graph::{Builder, EdgeKind, NodeKind};
 pub(crate) struct Location {
     pub(crate) file: String,
     pub(crate) line: u32,
+    /// The file lies outside the project (see [`is_library_path`]).
+    pub(crate) library: bool,
+}
+
+/// Path fragments of toolchain, SDK and package-manager install locations.
+/// Matched against the lower-cased path with `/` separators.
+const LIBRARY_PATHS: &[&str] = &[
+    "/microsoft visual studio/",
+    "/windows kits/",
+    "/mingw",
+    "/msys64/",
+    "/cygwin",
+    "/include/c++/",
+    "/lib/gcc/",
+    "/usr/include/",
+    "/usr/lib/",
+    "/usr/local/include/",
+    "/.rustup/",
+    "/rustlib/",
+    "/.cargo/registry/",
+    "/.cargo/git/",
+    "/vcpkg/",
+];
+
+/// Whether `file` belongs to an installed toolchain or library rather than
+/// the user's project: Visual Studio and Windows SDK headers, MinGW/MSYS and
+/// libstdc++, system includes, the Rust standard library (`/rustc/<hash>/`
+/// or rustup) and cargo/vcpkg packages. Relative paths are project files.
+pub(crate) fn is_library_path(file: &str) -> bool {
+    let path = file.replace('\\', "/").to_ascii_lowercase();
+    path.starts_with("/rustc/") || LIBRARY_PATHS.iter().any(|p| path.contains(p))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -44,6 +75,7 @@ impl DebugInfo {
             }
             if let Some(src) = &f.source {
                 b.set_source(id, &src.file, src.line);
+                b.mark_library(id, src.library);
             }
             if let Some(size) = f.size {
                 b.set_size(id, size);
@@ -67,6 +99,7 @@ impl DebugInfo {
             }
             if let Some(src) = &g.source {
                 b.set_source(id, &src.file, src.line);
+                b.mark_library(id, src.library);
             }
             add_type(b, id, g.type_name.as_deref());
         }
@@ -77,5 +110,32 @@ fn add_type(b: &mut Builder, var: crate::graph::NodeId, type_name: Option<&str>)
     if let Some(t) = type_name.filter(|t| !t.is_empty()) {
         let type_id = b.add_node(NodeKind::Type, &format!("type:{t}"), Some(t));
         b.add_edge(var, type_id, EdgeKind::HasType);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn library_paths() {
+        for lib in [
+            r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51\include\xstring",
+            r"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt\stdio.h",
+            "C:/ProgramData/mingw64/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include/c++/bits/basic_string.h",
+            "/usr/include/c++/13/bits/basic_string.h",
+            "/rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/slice/mod.rs",
+            r"C:\Users\me\.cargo\registry\src\index\object-0.40.0\src\read\mod.rs",
+        ] {
+            assert!(is_library_path(lib), "{lib}");
+        }
+        for user in [
+            "src/main.cpp",
+            "./src/graph.c",
+            r"E:\Lattice\crates\engine\tests\fixtures\src\graph.c",
+            "/home/me/proj/include/shapes.h",
+        ] {
+            assert!(!is_library_path(user), "{user}");
+        }
     }
 }

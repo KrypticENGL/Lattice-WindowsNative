@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::debug::{DebugInfo, Location, VarInfo};
+use crate::debug::{is_library_path, DebugInfo, Location, VarInfo};
 use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 
 const CV_SIGNATURE_C13: u32 = 4;
@@ -84,7 +84,9 @@ pub(crate) fn read(file: &object::File<'_>, warnings: &mut Vec<String>) -> Optio
             let base = start as u64;
             match kind & !DEBUG_S_IGNORE {
                 _ if kind & DEBUG_S_IGNORE != 0 => {}
-                DEBUG_S_SYMBOLS => read_symbols(body, base, &relocs, &types, &mut info),
+                DEBUG_S_SYMBOLS => {
+                    read_symbols(body, base, &relocs, &types, &mut info);
+                }
                 DEBUG_S_LINES => read_lines(body, base, &relocs, &mut line_starts),
                 DEBUG_S_STRINGTABLE => strings = body,
                 DEBUG_S_FILECHKSMS => checksums = body,
@@ -98,7 +100,12 @@ pub(crate) fn read(file: &object::File<'_>, warnings: &mut Vec<String>) -> Optio
         if let Some(path) = file_name(checksums, strings, file_id) {
             let func = info.functions.entry(function).or_default();
             if func.source.is_none() {
-                func.source = Some(Location { file: path, line });
+                let library = is_library_path(&path);
+                func.source = Some(Location {
+                    file: path,
+                    line,
+                    library,
+                });
             }
         }
     }

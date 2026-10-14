@@ -1,8 +1,10 @@
 //! Display names. Linkage names stay the identity; this is cosmetic only.
 
 /// Demangles Rust (legacy and v0), MSVC C++ and Itanium C++ names; anything
-/// else is returned unchanged.
+/// else is returned unchanged. The `__imp_` prefix of DLL-import cells is
+/// dropped, so `__imp_?cout@std@@...` displays as `std::cout`.
 pub fn demangle(name: &str) -> String {
+    let name = name.strip_prefix("__imp_").unwrap_or(name);
     if let Ok(d) = rustc_demangle::try_demangle(name) {
         // `{:#}` drops the trailing hash of legacy Rust symbols.
         return format!("{d:#}");
@@ -42,6 +44,15 @@ mod tests {
     fn msvc_cpp() {
         assert_eq!(demangle("?use_comdat@@YAHH@Z"), "use_comdat");
         assert_eq!(demangle("??$twice@H@@YAHH@Z"), "twice<int>");
+    }
+
+    #[test]
+    fn import_cells_display_as_their_target() {
+        assert_eq!(
+            demangle("__imp_?cout@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A"),
+            "std::cout"
+        );
+        assert_eq!(demangle("__imp_ExitProcess"), "ExitProcess");
     }
 
     #[test]

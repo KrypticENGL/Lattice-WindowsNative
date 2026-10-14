@@ -12,6 +12,7 @@ pub const ALL_FIXTURES: &[&str] = &[
     "msvc_empty.obj",
     "mingw_dwarf.o",
     "mingw_nodebug.o",
+    "mingw_cpp.o",
     "elf_dwarf.o",
 ];
 

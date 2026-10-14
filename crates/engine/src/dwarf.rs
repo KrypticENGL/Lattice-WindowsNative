@@ -11,13 +11,14 @@ use std::borrow::Cow;
 use gimli::{AttributeValue, EndianSlice, RunTimeEndian};
 use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 
-use crate::debug::{DebugInfo, FuncInfo, Location, VarInfo};
+use crate::debug::{is_library_path, DebugInfo, FuncInfo, Location, VarInfo};
 
 type R<'a> = EndianSlice<'a, RunTimeEndian>;
 
 /// Bounds DIE-tree and type-chain recursion on hostile input.
 const MAX_DEPTH: usize = 64;
 const MAX_TYPE_DEPTH: usize = 8;
+const MAX_ORIGIN_HOPS: usize = 4;
 
 /// Reads DWARF, or `None` if the object has no `.debug_info`.
 pub(crate) fn read(file: &object::File<'_>, warnings: &mut Vec<String>) -> Option<DebugInfo> {
@@ -182,6 +183,10 @@ impl<'d> Cx<'_, 'd> {
                     self.walk(child, Some(&key), depth + 1, info)?;
                 }
                 gimli::DW_TAG_formal_parameter | gimli::DW_TAG_variable => {
+                    // Compiler-supplied parameters such as C++ `this`.
+                    if self.is_artificial(entry) {
+                        continue;
+                    }
                     let names = self.names(entry);
                     let Some(name) = names.name.clone() else {
                         continue;
@@ -218,23 +223,55 @@ impl<'d> Cx<'_, 'd> {
         Some(String::from_utf8_lossy(s.slice()).into_owned())
     }
 
+    /// Name attributes, completed from the `DW_AT_abstract_origin` /
+    /// `DW_AT_specification` chain. C++ out-of-line members (constructors
+    /// especially) are concrete -> abstract -> in-class declaration, and the
+    /// name and declaration line live only at the end of that chain.
     fn names(&self, entry: &gimli::DebuggingInformationEntry<R<'d>>) -> Names {
         let mut names = self.own_names(entry);
-        if names.name.is_none() && names.linkage.is_none() {
-            for attr in [gimli::DW_AT_specification, gimli::DW_AT_abstract_origin] {
-                if let Some(AttributeValue::UnitRef(offset)) = entry.attr_value(attr) {
-                    if let Ok(origin) = self.unit.entry(offset) {
-                        let o = self.own_names(&origin);
-                        names.name = names.name.or(o.name);
-                        names.linkage = names.linkage.or(o.linkage);
-                        names.decl_file = names.decl_file.or(o.decl_file);
-                        names.decl_line = names.decl_line.or(o.decl_line);
-                        break;
-                    }
-                }
+        let mut current = entry.clone();
+        for _ in 0..MAX_ORIGIN_HOPS {
+            if names.name.is_some() && names.decl_line.is_some() {
+                break;
             }
+            let next = [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification]
+                .into_iter()
+                .find_map(|attr| match current.attr_value(attr) {
+                    Some(AttributeValue::UnitRef(offset)) => self.unit.entry(offset).ok(),
+                    _ => None,
+                });
+            let Some(origin) = next else {
+                break;
+            };
+            let o = self.own_names(&origin);
+            names.name = names.name.or(o.name);
+            names.linkage = names.linkage.or(o.linkage);
+            if names.decl_line.is_none() {
+                names.decl_file = o.decl_file;
+                names.decl_line = o.decl_line;
+            }
+            current = origin;
         }
         names
+    }
+
+    /// `DW_AT_artificial`, which concrete instances inherit from their
+    /// abstract origin rather than repeating.
+    fn is_artificial(&self, entry: &gimli::DebuggingInformationEntry<R<'d>>) -> bool {
+        let mut current = entry.clone();
+        for _ in 0..=MAX_ORIGIN_HOPS {
+            if is_flag_set(current.attr_value(gimli::DW_AT_artificial)) {
+                return true;
+            }
+            match current.attr_value(gimli::DW_AT_abstract_origin) {
+                Some(AttributeValue::UnitRef(offset)) => match self.unit.entry(offset) {
+                    Ok(origin) => current = origin,
+                    Err(_) => return false,
+                },
+                _ => return false,
+            }
+        }
+        false
     }
 
     fn own_names(&self, entry: &gimli::DebuggingInformationEntry<R<'d>>) -> Names {
@@ -258,9 +295,12 @@ impl<'d> Cx<'_, 'd> {
         let entry = header.file(names.decl_file?)?;
         let file = self.string(entry.path_name())?;
         let dir = entry.directory(header).and_then(|d| self.string(d));
+        let file = join_path(dir.as_deref(), &file);
+        let library = is_library_path(&file);
         Some(Location {
-            file: join_path(dir.as_deref(), &file),
+            file,
             line,
+            library,
         })
     }
 
@@ -290,7 +330,15 @@ impl<'d> Cx<'_, 'd> {
             gimli::DW_TAG_reference_type | gimli::DW_TAG_rvalue_reference_type => {
                 inner().map(|t| format!("{t}&"))
             }
-            gimli::DW_TAG_const_type => Some(format!("const {}", inner().unwrap_or("void".into()))),
+            gimli::DW_TAG_const_type => {
+                let t = inner().unwrap_or_else(|| "void".into());
+                // `T* const` (const pointer) vs `const T` (pointer to const).
+                Some(if t.ends_with(['*', '&']) {
+                    format!("{t} const")
+                } else {
+                    format!("const {t}")
+                })
+            }
             gimli::DW_TAG_volatile_type | gimli::DW_TAG_restrict_type => inner(),
             gimli::DW_TAG_array_type => inner().map(|t| format!("{t}[]")),
             gimli::DW_TAG_subroutine_type => Some("fn".into()),

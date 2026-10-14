@@ -395,18 +395,40 @@ impl Views {
                 .apply_object(&path, graph.as_ref().map_err(|e| e.reason.as_str()));
             match &graph {
                 Ok(g) => {
-                    let count = |k| g.nodes_of(k).count();
-                    let locals = g
+                    // Same classification as the Explorer groups.
+                    let locals: std::collections::HashSet<engine::NodeId> = g
                         .edges()
                         .iter()
                         .filter(|e| e.kind == engine::EdgeKind::Contains)
+                        .map(|e| e.to)
+                        .collect();
+                    let top = || g.nodes().iter().filter(|n| !locals.contains(&n.id));
+                    let user = |k| {
+                        top()
+                            .filter(|n| n.kind == k && !n.artificial && !n.library)
+                            .count()
+                    };
+                    let symbol = |n: &&engine::Node| {
+                        matches!(
+                            n.kind,
+                            engine::NodeKind::Function
+                                | engine::NodeKind::Variable
+                                | engine::NodeKind::External
+                        )
+                    };
+                    let library = top()
+                        .filter(symbol)
+                        .filter(|n| n.library && !n.artificial)
                         .count();
+                    let generated = top().filter(symbol).filter(|n| n.artificial).count();
                     cx.log(format!(
-                        "{} {file}: {} functions, {} globals, {locals} locals, {} externals                          (debug: {:?}) in {} ms",
+                        "{} {file}: {} functions, {} variables, {} locals, {} externals \
+                         (+{library} library, +{generated} compiler-generated; debug: {:?}) in {} ms",
                         if reload { "Reloaded" } else { "Loaded" },
-                        count(engine::NodeKind::Function),
-                        count(engine::NodeKind::Variable).saturating_sub(locals),
-                        count(engine::NodeKind::External),
+                        user(engine::NodeKind::Function),
+                        user(engine::NodeKind::Variable),
+                        locals.len(),
+                        user(engine::NodeKind::External),
                         g.debug,
                         elapsed.as_millis()
                     ));

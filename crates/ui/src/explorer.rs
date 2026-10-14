@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use engine::{CodeGraph, EdgeKind, NodeId, NodeKind};
+use engine::{CodeGraph, DebugFormat, EdgeKind, Node, NodeId, NodeKind};
 
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::geom::{PointF, RectF};
@@ -20,12 +20,16 @@ const INDENT: f32 = 12.0;
 const LEFT_PAD: f32 = 8.0;
 /// Directory names that are never listed.
 const HIDDEN: &[&str] = &[".git"];
-/// Symbol groups under a loaded object, in display order.
+/// Symbol groups under a loaded object, in display order. Compiler-
+/// generated symbols of every kind go to `GENERATED` instead.
 const GROUPS: &[(&str, NodeKind)] = &[
     ("Functions", NodeKind::Function),
     ("Variables", NodeKind::Variable),
     ("Externals", NodeKind::External),
 ];
+/// Code from headers outside the project (standard-library templates...).
+const LIBRARY: &str = "Library";
+const GENERATED: &str = "Compiler-generated";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObjectState {
@@ -43,15 +47,6 @@ enum EntryKind {
     /// "Functions (n)" etc. under a loaded object.
     Group,
     Symbol(NodeKind),
-}
-
-impl EntryKind {
-    fn expandable(self) -> bool {
-        matches!(
-            self,
-            EntryKind::Dir | EntryKind::Object(_) | EntryKind::Group
-        )
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +72,24 @@ impl Entry {
             expanded: false,
             children: None,
             detail: None,
+        }
+    }
+
+    /// Folders, objects and groups always; functions when they have
+    /// parameters or locals to show.
+    fn expandable(&self) -> bool {
+        match self.kind {
+            EntryKind::Dir | EntryKind::Object(_) | EntryKind::Group => true,
+            EntryKind::Symbol(_) => self.children.as_ref().is_some_and(|c| !c.is_empty()),
+            EntryKind::File => false,
+        }
+    }
+
+    /// Identity used to restore expansion after a reload.
+    fn expansion_key(&self) -> String {
+        match self.kind {
+            EntryKind::Group => format!("group:{}", group_key(&self.name)),
+            _ => format!("symbol:{}", self.name),
         }
     }
 }
@@ -220,6 +233,7 @@ impl Explorer {
                 }
             }
             EntryKind::Group => {}
+            EntryKind::Symbol(_) if entry.expandable() => {}
             EntryKind::File | EntryKind::Symbol(_) => return,
         }
         self.entries[idx].expanded = expand;
@@ -229,9 +243,10 @@ impl Explorer {
     }
 
     fn activate(&mut self, idx: usize, cx: &mut Cx) {
-        match self.entries[idx].kind {
-            EntryKind::File => cx.act(Action::OpenFile(self.entries[idx].path.clone())),
-            kind if kind.expandable() => self.toggle(idx, cx),
+        let entry = &self.entries[idx];
+        match entry.kind {
+            EntryKind::File => cx.act(Action::OpenFile(entry.path.clone())),
+            _ if entry.expandable() => self.toggle(idx, cx),
             _ => {}
         }
     }
@@ -246,14 +261,21 @@ impl Explorer {
         else {
             return false;
         };
-        // Remember which groups were open so a reload keeps them open.
-        let open_groups: HashSet<String> = self.entries[idx]
+        // Remember what was open so a reload keeps it open.
+        let mut open_groups: HashSet<String> = HashSet::new();
+        let mut stack: Vec<usize> = self.entries[idx]
             .children
             .iter()
             .flatten()
-            .filter(|&&c| self.entries[c].kind == EntryKind::Group && self.entries[c].expanded)
-            .map(|&c| group_key(&self.entries[c].name).to_owned())
+            .copied()
             .collect();
+        while let Some(c) = stack.pop() {
+            let e = &self.entries[c];
+            if e.expanded {
+                open_groups.insert(e.expansion_key());
+                stack.extend(e.children.iter().flatten().copied());
+            }
+        }
         let first_load = self.entries[idx].kind != EntryKind::Object(ObjectState::Loaded);
 
         let depth = self.entries[idx].depth;
@@ -261,7 +283,13 @@ impl Explorer {
             Ok(graph) => {
                 let (children, total) =
                     self.symbol_groups(graph, path, depth, &open_groups, first_load);
-                (ObjectState::Loaded, format!("{total} symbols"), children)
+                let detail = if graph.debug == DebugFormat::None {
+                    // Without debug info there are no locals, types or lines.
+                    format!("{total} symbols · no debug info")
+                } else {
+                    format!("{total} symbols")
+                };
+                (ObjectState::Loaded, detail, children)
             }
             Err(message) => (ObjectState::Failed, message.to_owned(), Vec::new()),
         };
@@ -276,53 +304,121 @@ impl Explorer {
     }
 
     /// Appends group and symbol entries for `graph`; returns the group
-    /// indices and the symbol count. Locals (targets of `Contains`) are not
-    /// listed: they belong under their function, which stage 3 does not show.
+    /// indices and the number of top-level symbols. Parameters and locals
+    /// (targets of `Contains`) are listed under their function, with their
+    /// type as the detail; compiler-generated symbols get their own group.
     fn symbol_groups(
         &mut self,
         graph: &CodeGraph,
         path: &Path,
         depth: usize,
-        open_groups: &HashSet<String>,
+        open: &HashSet<String>,
         first_load: bool,
     ) -> (Vec<usize>, usize) {
-        let locals: HashSet<NodeId> = graph
+        let mut locals_of: HashMap<NodeId, Vec<&Node>> = HashMap::new();
+        for e in graph
             .edges()
             .iter()
             .filter(|e| e.kind == EdgeKind::Contains)
-            .map(|e| e.to)
+        {
+            if let Some(local) = graph.node(e.to) {
+                locals_of.entry(e.from).or_default().push(local);
+            }
+        }
+        let is_local: HashSet<NodeId> = locals_of.values().flatten().map(|n| n.id).collect();
+        let type_of = |id: NodeId| {
+            graph
+                .edges_from(id)
+                .find(|e| e.kind == EdgeKind::HasType)
+                .and_then(|e| graph.node(e.to))
+                .map(|t| t.display_name.to_string())
+        };
+
+        let mut buckets: Vec<(&str, NodeKind, Vec<&Node>)> = GROUPS
+            .iter()
+            .map(|&(label, kind)| (label, kind, Vec::new()))
             .collect();
+        let mut generated: Vec<&Node> = Vec::new();
+        let mut library: Vec<&Node> = Vec::new();
+        for node in graph.nodes() {
+            if is_local.contains(&node.id) {
+                continue;
+            }
+            if node.artificial {
+                if matches!(
+                    node.kind,
+                    NodeKind::Function | NodeKind::Variable | NodeKind::External
+                ) {
+                    generated.push(node);
+                }
+                continue;
+            }
+            if node.library {
+                library.push(node);
+                continue;
+            }
+            if let Some(bucket) = buckets.iter_mut().find(|b| b.1 == node.kind) {
+                bucket.2.push(node);
+            }
+        }
+
         let mut groups = Vec::new();
         let mut total = 0;
-        for &(label, kind) in GROUPS {
-            let mut symbols: Vec<_> = graph
-                .nodes_of(kind)
-                .filter(|n| !locals.contains(&n.id))
-                .collect();
+        let all = buckets.into_iter().chain([
+            (LIBRARY, NodeKind::Function, library),
+            (GENERATED, NodeKind::Function, generated),
+        ]);
+        for (label, _, mut symbols) in all {
             if symbols.is_empty() {
                 continue;
             }
             symbols.sort_by_key(|n| n.display_name.to_lowercase());
-            total += symbols.len();
+            if label != GENERATED && label != LIBRARY {
+                total += symbols.len();
+            }
             let mut group = Entry::new(
                 format!("{label} ({})", symbols.len()),
                 path.to_path_buf(),
                 EntryKind::Group,
                 depth + 1,
             );
-            group.expanded = open_groups.contains(label) || (first_load && label == "Functions");
+            group.expanded =
+                open.contains(&group.expansion_key()) || (first_load && label == "Functions");
             let mut members = Vec::with_capacity(symbols.len());
             for node in symbols {
                 let mut e = Entry::new(
                     node.display_name.to_string(),
                     path.to_path_buf(),
-                    EntryKind::Symbol(kind),
+                    EntryKind::Symbol(node.kind),
                     depth + 2,
                 );
                 e.detail = node
                     .source
                     .as_ref()
                     .map(|s| short_location(&s.file, s.line));
+                if let Some(locals) = locals_of.get_mut(&node.id) {
+                    // Declaration order when lines are known, else by name.
+                    locals.sort_by_key(|l| {
+                        (
+                            l.source.as_ref().map_or(u32::MAX, |s| s.line),
+                            l.display_name.clone(),
+                        )
+                    });
+                    let mut children = Vec::with_capacity(locals.len());
+                    for local in locals.iter() {
+                        let mut le = Entry::new(
+                            local.display_name.to_string(),
+                            path.to_path_buf(),
+                            EntryKind::Symbol(NodeKind::Variable),
+                            depth + 3,
+                        );
+                        le.detail = type_of(local.id);
+                        children.push(self.entries.len());
+                        self.entries.push(le);
+                    }
+                    e.children = Some(children);
+                    e.expanded = open.contains(&e.expansion_key());
+                }
                 members.push(self.entries.len());
                 self.entries.push(e);
             }
@@ -429,7 +525,7 @@ impl Explorer {
             Key::Right => {
                 if let Some(r) = row {
                     let idx = self.rows[r];
-                    if self.entries[idx].kind.expandable() && !self.entries[idx].expanded {
+                    if self.entries[idx].expandable() && !self.entries[idx].expanded {
                         self.toggle(idx, cx);
                     }
                 }
@@ -437,7 +533,7 @@ impl Explorer {
             Key::Left => {
                 if let Some(r) = row {
                     let idx = self.rows[r];
-                    if self.entries[idx].kind.expandable() && self.entries[idx].expanded {
+                    if self.entries[idx].expandable() && self.entries[idx].expanded {
                         self.toggle(idx, cx);
                     } else if let Some(p) = self.parent_row(r) {
                         self.select_row(p, cx);
@@ -535,16 +631,25 @@ impl Panel for Explorer {
                     d.fill_rect(r, theme.hover_bg);
                 }
                 let x = list.x + LEFT_PAD + (e.depth.saturating_sub(1)) as f32 * INDENT;
-                let marker = match e.kind {
-                    k if k.expandable() => {
-                        Some((if e.expanded { "▾" } else { "▸" }, theme.text_dim))
-                    }
+                let chevron = e.expandable().then_some(if e.expanded { "▾" } else { "▸" });
+                let icon = match e.kind {
                     EntryKind::Symbol(NodeKind::Function) => Some(("ƒ", theme.accent)),
                     EntryKind::Symbol(NodeKind::External) => Some(("↗", theme.text_dim)),
                     EntryKind::Symbol(_) => Some(("▪", theme.text_dim)),
                     _ => None,
                 };
-                if let Some((glyph, color)) = marker {
+                // A function with locals shows its chevron left of its icon,
+                // in the indent column.
+                let chevron_x = if icon.is_some() { x - INDENT } else { x };
+                if let Some(glyph) = chevron {
+                    d.text(
+                        TextStyle::Ui,
+                        glyph,
+                        RectF::new(chevron_x, y, 14.0, ROW_H),
+                        theme.text_dim,
+                    );
+                }
+                if let Some((glyph, color)) = icon {
                     d.text(TextStyle::Ui, glyph, RectF::new(x, y, 14.0, ROW_H), color);
                 }
                 let name_x = x + 16.0;
@@ -594,8 +699,7 @@ impl Panel for Explorer {
                 if let Some(row) = self.row_at(pos) {
                     let idx = self.rows[row];
                     self.selected = Some(idx);
-                    let kind = self.entries[idx].kind;
-                    if kind.expandable() {
+                    if self.entries[idx].expandable() {
                         if clicks == 1 {
                             self.toggle(idx, cx);
                         }
@@ -687,6 +791,60 @@ mod tests {
     }
 
     #[test]
+    fn cpp_object_lists_user_symbols_and_sets_generated_aside() {
+        let root = temp_dir("cpp");
+        let obj = root.join("shapes.o");
+        std::fs::copy(fixture("mingw_cpp.o"), &obj).unwrap();
+        let mut ex = Explorer::default();
+        ex.set_root(&root).unwrap();
+        let graph = engine::load(&obj).unwrap();
+        assert!(ex.apply_object(&obj, Ok(&graph)));
+        let obj_idx = ex.rows[0];
+        ex.entries[obj_idx].expanded = true;
+        ex.rebuild_rows();
+
+        let groups: Vec<&str> = ex.entries[obj_idx]
+            .children
+            .iter()
+            .flatten()
+            .map(|&g| ex.entries[g].name.as_str())
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                "Functions (8)",
+                "Variables (2)",
+                "Externals (4)",
+                "Compiler-generated (14)"
+            ],
+        );
+        let vars = ex.entries[obj_idx].children.as_ref().unwrap()[1];
+        let var_names: Vec<&str> = ex.entries[vars]
+            .children
+            .iter()
+            .flatten()
+            .map(|&v| ex.entries[v].name.as_str())
+            .collect();
+        assert_eq!(var_names, ["total", "unit"]);
+
+        // Open main, reload: it stays open and shows its locals.
+        let main = ex
+            .rows
+            .iter()
+            .copied()
+            .find(|&i| ex.entries[i].name == "main")
+            .unwrap();
+        ex.entries[main].expanded = true;
+        assert!(ex.apply_object(&obj, Ok(&graph)));
+        ex.rebuild_rows();
+        let rows = names(&ex);
+        let at = rows.iter().position(|&n| n == "main").unwrap();
+        assert_eq!(&rows[at + 1..at + 4], ["count", "sq", "sum"]);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn object_files_expand_into_grouped_symbols_and_reload_in_place() {
         let root = temp_dir("objects");
         let obj = root.join("graph.obj");
@@ -734,6 +892,21 @@ mod tests {
         assert_eq!(ex.entries.len(), before);
         assert!(names(&ex).contains(&"counter"));
         assert!(names(&ex).contains(&"callee"));
+
+        // Functions with debug info expand into their typed locals.
+        let callee = ex
+            .rows
+            .iter()
+            .copied()
+            .find(|&i| ex.entries[i].name == "callee")
+            .unwrap();
+        assert!(ex.entries[callee].expandable());
+        ex.entries[callee].expanded = true;
+        ex.rebuild_rows();
+        let at = names(&ex).iter().position(|&n| n == "callee").unwrap();
+        assert_eq!(&names(&ex)[at + 1..at + 4], ["a", "b", "sum"]);
+        let a = ex.rows[at + 1];
+        assert_eq!(ex.entries[a].detail.as_deref(), Some("int"));
 
         assert!(ex.apply_object(&obj, Err("broken")));
         ex.rebuild_rows();

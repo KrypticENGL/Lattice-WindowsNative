@@ -28,8 +28,36 @@ Unwind tables (`.pdata`, `.xdata`, `.eh_frame`), debug sections and linker
 directives are not graphed. MSVC associative COMDATs are ignored with them.
 A linkage name defined more than once becomes a single node.
 
-Exception-handling funclets (`?dtor$N@?0?f@4HA` and the like) do not
-become nodes. They are cleanup code belonging to `f`, so their code range,
+Each node carries two flags so consumers can keep noise away from user
+code. Neither removes anything from the graph.
+
+- `artificial`: compiler-generated. This covers:
+  - MSVC: RTTI, vftables, string literals (`??_C@`), `/RTC` frame data,
+    `/JMC` flags, dynamic initialisers and deleting destructors;
+  - Itanium: vtables, typeinfo, guard variables, GCC static initialisers,
+    and EH/runtime helpers such as `__gxx_personality` and `__main`.
+- `library`: C++ or Rust standard-library code. It is set by namespace
+  (`std::`, `core::`, `__gnu_cxx::`, Itanium `St`/`Sa`/`Ss`/`So`/… and
+  local `_ZZ` entities) or, with debug info, by a source path inside a
+  toolchain or package location (Visual Studio, Windows Kits, MinGW,
+  libstdc++, `/usr/include`, rustup, the cargo registry, vcpkg). Template
+  instantiations and implicit members often have no line info, which is
+  why the namespace rule exists.
+
+Two indirections are resolved to their target:
+
+- MinGW `.refptr.X` cells: a reference through the cell is a reference to
+  `X`, and the cell itself is not a node.
+- `__imp_X` import cells keep their linkage name, but display as `X` (for
+  example `std::cout`).
+
+DWARF `this` and other `DW_AT_artificial` parameters are skipped, including
+through abstract origins. Names and declaration lines follow the
+`abstract_origin` and `specification` chain, so C++ constructors get
+`file:line` too.
+
+Exception-handling funclets (`?dtor$N@?0?f@4HA`, `__catch$…`, MSVC `/ZI`
+`f$dtor$0` and the like) do not become nodes. They are cleanup code belonging to `f`, so their code range,
 and any calls made from it, are attributed to the function before them.
 
 On this repository's own `target/` folder (2,923 rustc objects, 161 MB),
@@ -46,7 +74,10 @@ build). 99.9% of functions get a source location.
   just the records it needs: procedures, data, `S_LOCAL`, `S_REGREL32`,
   `S_BPREL32`, line starts, and type names.
 - **CodeView types are names only.** Supported: primitives, pointers,
-  `const`, arrays, struct/class/union/enum and procedures.
+  `const`, arrays, struct/class/union/enum and procedures. With `/Zi` and
+  `/ZI`, non-primitive types live in the PDB's type server, so a local such
+  as `std::string name` is listed without its type. `/Z7` keeps the types
+  in the object.
 - **`Calls` refinement is x86-64 only.** On other architectures every
   symbol relocation is `References`. The register tracking behind the
   hoisted-load case is a simple linear scan, not data flow.

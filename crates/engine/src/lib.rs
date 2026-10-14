@@ -13,6 +13,7 @@
 //! input yields an [`EngineError`], never a panic.
 #![forbid(unsafe_code)]
 
+mod artificial;
 mod calls;
 mod codeview;
 mod debug;

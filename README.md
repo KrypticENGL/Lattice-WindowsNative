@@ -39,12 +39,17 @@ cargo test --workspace
 |---|---|
 | Open a folder | `Ctrl+O`, the **Open Folder** button, or a path on the command line |
 | Open a file | Double-click it in the Explorer (or select it and press `Enter`) |
-| Inspect an object file | Click a `.obj` / `.o` in the Explorer. Its symbols load in the background, grouped as Functions / Variables / Externals, with `file:line` when debug info has it. Rebuilding the file reloads it |
+| Inspect an object file | Click a `.obj` / `.o` in the Explorer. Its symbols load in the background, grouped as Functions / Variables / Externals, with `file:line` when debug info has it. Expand a function to see its parameters and locals, with their types. Standard-library code and compiler-generated symbols are in collapsed **Library** and **Compiler-generated** groups. Rebuilding the file reloads it |
 | Switch top tabs | Click **Code** / **Visualizer**, or `Ctrl+1` / `Ctrl+2` |
 | Editor | Type to edit. `Ctrl+S` save, `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+Z` redo, `Ctrl+A/C/X/V`, `Ctrl+W` close tab, `Ctrl+Tab` next tab. Shift+arrows or a mouse drag selects; double-click selects a word |
 | Terminal | Click **TERMINAL** or press `` Ctrl+` ``. `Ctrl+V` pastes; the mouse wheel scrolls the history. Press `Enter` to restart the shell after it exits |
 | Resize panes | Drag the divider between Explorer and editor, or between editor and the bottom panel |
 | Debug only | `Ctrl+Shift+F12` simulates GPU device loss to exercise recovery |
+
+Locals and types come from debug info. Compile with `-g` (gcc/clang) or
+`/Z7`, `/Zi` or `/ZI` (MSVC; VS Debug builds use `/ZI`). An object built
+without debug info shows "no debug info" and lists only functions, globals
+and externals.
 
 Files that are not valid UTF-8 open read-only. Saving keeps the original
 line endings (LF/CRLF) and BOM. Closing a modified tab, or the window, asks

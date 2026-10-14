@@ -56,6 +56,13 @@ pub struct Node {
     pub source: Option<SourceLoc>,
     /// Size in bytes when known.
     pub size: Option<u64>,
+    /// Compiler-generated (RTTI, vtables, string literals, runtime-check
+    /// data, static initialisers, EH helpers) rather than user code.
+    pub artificial: bool,
+    /// Library rather than project code: in a standard-library namespace,
+    /// or (with debug info) declared in a toolchain or package header, e.g.
+    /// a template instantiated into this object.
+    pub library: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -179,6 +186,10 @@ impl Builder {
     ) -> NodeId {
         let id = self.id_for(kind, linkage);
         if !self.nodes.contains_key(&id) {
+            let library = matches!(
+                kind,
+                NodeKind::Function | NodeKind::Variable | NodeKind::External
+            );
             let display = match display {
                 Some(d) => self.interner.intern(d),
                 None => {
@@ -187,6 +198,7 @@ impl Builder {
                 }
             };
             let linkage_name = self.interner.intern(linkage);
+            let library = library && crate::artificial::is_library_symbol(linkage, &display);
             self.nodes.insert(
                 id,
                 Node {
@@ -196,6 +208,8 @@ impl Builder {
                     linkage_name,
                     source: None,
                     size: None,
+                    artificial: crate::artificial::is_artificial(linkage),
+                    library,
                 },
             );
         }
@@ -220,6 +234,13 @@ impl Builder {
             if n.source.is_none() {
                 n.source = Some(SourceLoc { file, line });
             }
+        }
+    }
+
+    /// Marks a node as library code (never clears the flag).
+    pub(crate) fn mark_library(&mut self, id: NodeId, library: bool) {
+        if let Some(n) = self.nodes.get_mut(&id) {
+            n.library |= library;
         }
     }
 

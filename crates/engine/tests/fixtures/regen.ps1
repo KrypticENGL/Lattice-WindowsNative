@@ -33,6 +33,9 @@ try {
     if ($LASTEXITCODE) { throw 'gcc failed' }
     gcc -c -O0 -ffunction-sections -fdata-sections -o mingw_nodebug.o src/graph.c
     if ($LASTEXITCODE) { throw 'gcc failed' }
+    # MinGW C++: vtables, typeinfo, static initialisers, .refptr cells.
+    g++ -c -O0 -g -ffunction-sections $map -o mingw_cpp.o src/shapes.cpp
+    if ($LASTEXITCODE) { throw 'g++ failed' }
 
     # ELF with DWARF.
     rustc --crate-type=lib --edition=2021 --target x86_64-unknown-linux-gnu `

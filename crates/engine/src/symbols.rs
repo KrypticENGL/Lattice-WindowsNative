@@ -29,7 +29,14 @@ const SKIPPED_PREFIXES: &[&str] = &[
     ".debug",
     ".drectve",
     ".chks64",
+    // MinGW auto-import indirection cells (see `REFPTR`).
+    ".rdata$.refptr",
 ];
+
+/// MinGW emits `.refptr.X`, a pointer cell holding `&X`, for symbols that
+/// may come from a DLL. Code references the cell, so the cell is resolved
+/// to `X` instead of becoming a node.
+const REFPTR: &str = ".refptr.";
 
 /// One symbol's byte range inside its section.
 #[derive(Debug, Clone, Copy)]
@@ -72,12 +79,21 @@ pub(crate) fn is_analysed_section(section: &object::Section<'_, '_>) -> bool {
 /// cleanup code of their parent function. Skipping a funclet folds its code
 /// range, and the calls in it, into the function before it in the section.
 fn is_noise_symbol(name: &str) -> bool {
-    const FUNCLETS: &[&str] = &["?dtor$", "?catch$", "?fin$", "?filt$"];
+    const FUNCLETS: &[&str] = &[
+        "?dtor$",
+        "?catch$",
+        "?fin$",
+        "?filt$",
+        "__catch$",
+        "__unwindfunclet$",
+    ];
     name.is_empty()
         || name.starts_with('$')
         || name.starts_with('@')
         || name.starts_with(".L")
         || FUNCLETS.iter().any(|p| name.starts_with(p))
+        // MSVC /ZI names cleanup funclets after their parent: `main$dtor$0`.
+        || name.contains("$dtor$")
 }
 
 impl LayerA {
@@ -119,11 +135,16 @@ impl LayerA {
 pub(crate) fn collect(file: &object::File<'_>, b: &mut Builder) -> LayerA {
     let mut a = LayerA::default();
     let mut placed: HashMap<SectionIndex, Vec<(u64, u64, NodeId)>> = HashMap::new();
+    let mut refptrs: Vec<(SymbolIndex, String)> = Vec::new();
 
     for sym in file.symbols() {
         let Ok(name) = sym.name() else {
             continue;
         };
+        if let Some(target) = name.strip_prefix(REFPTR) {
+            refptrs.push((sym.index(), target.to_owned()));
+            continue;
+        }
         if is_noise_symbol(name)
             || matches!(
                 sym.kind(),
@@ -167,6 +188,15 @@ pub(crate) fn collect(file: &object::File<'_>, b: &mut Builder) -> LayerA {
             }
             _ => {}
         }
+    }
+
+    for (index, target) in refptrs {
+        let existing = [NodeKind::Function, NodeKind::Variable, NodeKind::External]
+            .into_iter()
+            .map(|kind| b.id_for(kind, &target))
+            .find(|&id| b.contains(id));
+        let id = existing.unwrap_or_else(|| b.add_node(NodeKind::External, &target, None));
+        a.symbols.insert(index, id);
     }
 
     for (index, mut syms) in placed {
