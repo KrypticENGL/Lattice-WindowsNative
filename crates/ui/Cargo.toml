@@ -4,6 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+vte = { workspace = true }
+windows = { workspace = true }
+windows-numerics = { workspace = true }
 
 [lints]
 workspace = true

@@ -20,6 +20,15 @@ impl Error {
         }
     }
 
+    /// A failure from outside Win32 (e.g. the UI crate), with no code.
+    pub(super) fn other(context: &'static str, message: String) -> Self {
+        Self {
+            context,
+            code: 0,
+            message,
+        }
+    }
+
     /// Captures the calling thread's last-error value. Call immediately after
     /// the failing API, before anything else can overwrite it.
     pub(super) fn last_win32(context: &'static str) -> Self {

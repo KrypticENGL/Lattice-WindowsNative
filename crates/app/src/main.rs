@@ -2,6 +2,8 @@
 //! the message loop until the window is closed.
 //!
 //! Everything Win32 lives in [`sys`]; this file is safe Rust only.
+//!
+//! Usage: `lattice [FOLDER]` opens `FOLDER` in the Solution Explorer.
 
 // Release builds are GUI-subsystem (no console); debug builds keep a console
 // so log lines written to stderr are visible.
@@ -9,6 +11,7 @@
 
 mod sys;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use sys::{Backdrop, MainWindow};
@@ -28,17 +31,26 @@ fn main() -> ExitCode {
 fn run() -> Result<i32, sys::Error> {
     // Must happen before any window exists. Failure is not fatal: the window
     // still works, it is just bitmap-scaled by the system.
-    if let Err(err) = sys::dpi::enable_per_monitor_v2() {
-        eprintln!("lattice: per-monitor DPI awareness unavailable: {err}");
-    }
+    let dpi_error = sys::dpi::enable_per_monitor_v2().err();
 
-    let window = MainWindow::create(APP_TITLE)?;
+    let folder = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir());
+    let window = MainWindow::create(APP_TITLE, folder)?;
+
+    if let Some(err) = dpi_error {
+        window.log(
+            true,
+            &format!("Per-monitor DPI awareness unavailable: {err}"),
+        );
+    }
     let appearance = window.appearance();
     if !appearance.dark_title_bar {
-        eprintln!("lattice: dark title bar unavailable on this system");
+        window.log(false, "Dark title bar unavailable on this system");
     }
     if appearance.backdrop == Backdrop::Solid {
-        eprintln!("lattice: Mica backdrop unavailable, using solid background");
+        window.log(false, "Mica backdrop unavailable; using the default frame");
     }
 
     window.show();

@@ -1,21 +1,21 @@
-//! DWM styling: dark title bar and system backdrop, each with a fallback.
+//! DWM styling: dark title bar and title-bar backdrop, each with a fallback.
 
 use std::ffi::c_void;
 use std::mem::size_of;
 
 use windows::Win32::Foundation::{HWND, TRUE};
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_MAINWINDOW,
-    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE,
+    DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE,
 };
-use windows::Win32::UI::Controls::MARGINS;
 
-/// What is painted behind the client area.
+/// System backdrop behind the window frame. The client area is opaque
+/// (Direct2D on an HWND swap chain), so Mica shows in the title bar only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backdrop {
-    /// Windows 11 22H2+ Mica material shows through the client area.
+    /// Windows 11 22H2+ Mica material in the title bar.
     Mica,
-    /// Opaque dark fill; used wherever Mica is unavailable.
+    /// The default frame; used wherever Mica is unavailable.
     Solid,
 }
 
@@ -29,23 +29,10 @@ pub(super) fn apply_dark_title_bar(hwnd: HWND) -> bool {
         || set_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_LEGACY, &TRUE).is_ok()
 }
 
-/// Enables Mica behind the whole window, or reports [`Backdrop::Solid`] if
-/// any step is unsupported.
+/// Enables Mica for the frame, or reports [`Backdrop::Solid`] if the OS does
+/// not support it.
 pub(super) fn apply_backdrop(hwnd: HWND) -> Backdrop {
-    if set_attribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &DWMSBT_MAINWINDOW).is_err() {
-        return Backdrop::Solid;
-    }
-    // Negative margins extend the frame over the entire client area, so
-    // pixels painted black (alpha 0) let the backdrop through.
-    let margins = MARGINS {
-        cxLeftWidth: -1,
-        cxRightWidth: -1,
-        cyTopHeight: -1,
-        cyBottomHeight: -1,
-    };
-    // SAFETY: `hwnd` is a live window owned by this thread and `margins`
-    // outlives the call.
-    match unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) } {
+    match set_attribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &DWMSBT_MAINWINDOW) {
         Ok(()) => Backdrop::Mica,
         Err(_) => Backdrop::Solid,
     }

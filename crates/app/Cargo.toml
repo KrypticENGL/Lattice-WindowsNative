@@ -8,6 +8,7 @@ name = "lattice"
 path = "src/main.rs"
 
 [dependencies]
+ui = { path = "../ui" }
 windows = { workspace = true }
 
 [lints]
