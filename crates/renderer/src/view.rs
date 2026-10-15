@@ -23,6 +23,8 @@ const DETAIL_ZOOM: f32 = 0.8;
 /// this many; otherwise just for the selection and hover.
 const MAX_LABELS: usize = 250;
 const MAX_NEIGHBOR_LABELS: usize = 60;
+/// Type chips around the selected node; the rest are counted.
+const MAX_TYPE_CHIPS: usize = 12;
 /// Pointer travel (DIPs) before a press becomes a drag or pan.
 const DRAG_SLOP: f32 = 3.0;
 /// Hover/hit tolerance around a node, in DIPs.
@@ -584,7 +586,62 @@ impl GraphView {
         c.reset_transform();
 
         self.paint_labels(c, style, detail);
+        self.paint_types(c, style);
         self.paint_card(c, style);
+    }
+
+    /// The selected node's types, as chips in a ring around it. Types are
+    /// not graph nodes; this is the only place they appear.
+    fn paint_types(&self, c: &mut dyn Canvas, style: &Style) {
+        let Some(sel) = &self.selection else {
+            return;
+        };
+        let Some(n) = self.model.node(sel.node) else {
+            return;
+        };
+        let Some(&p) = self.positions.get(sel.node as usize) else {
+            return;
+        };
+        if n.types.is_empty() {
+            return;
+        }
+        let mut tags: Vec<String> = n
+            .types
+            .iter()
+            .take(MAX_TYPE_CHIPS)
+            .map(|t| {
+                if t.role.is_empty() {
+                    t.ty.to_string()
+                } else {
+                    format!("{}: {}", t.role, t.ty)
+                }
+            })
+            .collect();
+        if n.types.len() > MAX_TYPE_CHIPS {
+            tags.push(format!("+{} more", n.types.len() - MAX_TYPE_CHIPS));
+        }
+        let center = self.camera.to_screen(p);
+        let lh = c.line_height();
+        let k = tags.len() as f32;
+        let ry = 56.0 + 5.0 * k;
+        let rx = ry * 1.6;
+        let color = style.node[NodeClass::Type.index()];
+        let mut spokes = Vec::with_capacity(tags.len());
+        let mut chips = Vec::with_capacity(tags.len());
+        for (i, t) in tags.iter().enumerate() {
+            let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / k;
+            let at = center + Vec2::new(a.cos() * rx, a.sin() * ry);
+            let w = c.measure_text(t, false) + 14.0;
+            let r = Rect::new(at.x - w / 2.0, at.y - (lh + 6.0) / 2.0, w, lh + 6.0);
+            spokes.push([center, at]);
+            chips.push((r, t));
+        }
+        c.stroke_segments(&spokes, color.faded(0.45), 1.0);
+        for (r, t) in chips {
+            c.fill_rect(r, r.h / 2.0, style.card_bg);
+            c.stroke_rect(r, r.h / 2.0, color.faded(0.8), 1.0);
+            c.text(t, Vec2::new(r.x + 7.0, r.y + 3.0), color, false);
+        }
     }
 
     /// Labels, placed greedily so none overlap: the hovered node first,

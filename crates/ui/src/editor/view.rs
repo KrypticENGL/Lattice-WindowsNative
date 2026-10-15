@@ -9,7 +9,7 @@ use super::buffer::{byte_to_utf16, order, utf16_to_byte, Buffer, Pos};
 use super::undo::{Edit, EditKind, UndoStack};
 use crate::event::{CursorShape, Event, Key, Modifiers, MouseButton};
 use crate::geom::{PointF, RectF};
-use crate::panel::Cx;
+use crate::panel::{Action, Cx};
 use crate::sys::clipboard;
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::{TextLayout, TextStyle, TextSystem};
@@ -40,6 +40,10 @@ pub struct Document {
     line_h: f32,
     layouts: HashMap<u64, TextLayout>,
     dragging: bool,
+    /// Breakpoint lines (1-based), drawn as gutter dots.
+    breakpoints: Vec<u32>,
+    /// The line the debugger is stopped on (1-based).
+    exec_line: Option<u32>,
 }
 
 impl Document {
@@ -82,6 +86,8 @@ impl Document {
             line_h: 18.0,
             layouts: HashMap::new(),
             dragging: false,
+            breakpoints: Vec::new(),
+            exec_line: None,
         }
     }
 
@@ -125,6 +131,19 @@ impl Document {
         self.preferred_x = None;
         self.scroll = PointF::new(0.0, line as f32 * self.line_h - self.text_rect.h / 3.0);
         self.clamp_scroll();
+    }
+
+    /// The caret's line (1-based).
+    pub fn caret_line(&self) -> u32 {
+        self.caret.line as u32 + 1
+    }
+
+    /// Debugger marks; returns `true` if they changed.
+    pub fn set_marks(&mut self, breakpoints: Vec<u32>, exec_line: Option<u32>) -> bool {
+        let changed = self.breakpoints != breakpoints || self.exec_line != exec_line;
+        self.breakpoints = breakpoints;
+        self.exec_line = exec_line;
+        changed
     }
 
     /// Drops cached layouts (DPI change).
@@ -435,6 +454,19 @@ impl Document {
             Event::MouseDown {
                 pos,
                 button: MouseButton::Left,
+                ..
+            } if self.rect.contains(pos) && pos.x < self.text_rect.x => {
+                // Gutter: toggle a breakpoint on that line.
+                let line = self.pos_at_point(cx.text, pos).line as u32 + 1;
+                cx.act(Action::ToggleBreakpoint {
+                    path: self.path.clone(),
+                    line,
+                });
+                true
+            }
+            Event::MouseDown {
+                pos,
+                button: MouseButton::Left,
                 mods,
                 clicks,
             } if self.rect.contains(pos) => {
@@ -541,7 +573,40 @@ impl Document {
             // Gutter.
             let gutter = RectF::new(rect.x, rect.y, self.gutter_w, rect.h);
             d.fill_rect(gutter, theme.editor_bg);
+            let exec = self.exec_line.map(|l| l as usize - 1);
             for &(line, y, _) in &rows {
+                if exec == Some(line) {
+                    d.fill_rect(
+                        RectF::new(rect.x, y, rect.w, self.line_h),
+                        theme.exec_line_bg,
+                    );
+                }
+                let dot = 9.0f32.min(self.line_h - 4.0);
+                let cy = y + self.line_h / 2.0;
+                if self.breakpoints.binary_search(&(line as u32 + 1)).is_ok() {
+                    d.fill_round_rect(
+                        RectF::new(rect.x + 4.0, cy - dot / 2.0, dot, dot),
+                        dot / 2.0,
+                        theme.breakpoint,
+                    );
+                }
+                if exec == Some(line) {
+                    // A chevron pointing at the line, right of any
+                    // breakpoint dot.
+                    let x = rect.x + 15.0;
+                    d.line(
+                        PointF::new(x, cy - 4.5),
+                        PointF::new(x + 5.0, cy),
+                        theme.accent,
+                        2.0,
+                    );
+                    d.line(
+                        PointF::new(x + 5.0, cy),
+                        PointF::new(x, cy + 4.5),
+                        theme.accent,
+                        2.0,
+                    );
+                }
                 let num = (line + 1).to_string();
                 let x = gutter.right() - GUTTER_PAD - num.len() as f32 * cell.w;
                 let color = if line == caret_line {
@@ -555,7 +620,7 @@ impl Document {
             d.clip(self.text_rect, |d| {
                 for &(line, y, sel) in &rows {
                     let row = RectF::new(self.text_rect.x, y, self.text_rect.w, self.line_h);
-                    if line == caret_line && !has_selection && focused {
+                    if line == caret_line && !has_selection && focused && exec != Some(line) {
                         d.fill_rect(row, theme.current_line_bg);
                     }
                     if let Some((x0, x1)) = sel {

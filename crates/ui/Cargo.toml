@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+debugger = { path = "../debugger" }
 engine = { path = "../engine" }
 notify = "8"
 renderer = { path = "../renderer" }

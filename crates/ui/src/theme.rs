@@ -70,6 +70,19 @@ pub struct Theme {
     pub graph_card_bg: Color,
     /// Alpha multiplier for nodes unrelated to the selection.
     pub graph_dim: f32,
+    /// Data mode (live program data) boxes and pointers.
+    pub data_frame_bg: Color,
+    pub data_header_bg: Color,
+    pub data_box_bg: Color,
+    pub data_border: Color,
+    pub data_grid: Color,
+    pub data_pointer: Color,
+    pub data_cross: Color,
+    pub data_changed: Color,
+    /// Breakpoint dots in the editor gutter.
+    pub breakpoint: Color,
+    /// The line the debugger is stopped on.
+    pub exec_line_bg: Color,
     pub term_fg: Color,
     pub term_bg: Color,
     /// ANSI colours 0–15 (normal then bright).
@@ -121,6 +134,16 @@ impl Theme {
             graph_hover: Color::hex(0xFFFFFF).with_alpha(0.85),
             graph_card_bg: Color::hex(0x1C1F1A).with_alpha(0.96),
             graph_dim: 0.16,
+            data_frame_bg: Color::hex(0x1B1E19),
+            data_header_bg: Color::hex(0x26301A),
+            data_box_bg: Color::hex(0x1F231C),
+            data_border: Color::hex(0x414B34),
+            data_grid: Color::hex(0x323A29),
+            data_pointer: Color::hex(0x9DB872),
+            data_cross: Color::hex(0x8A96A3).with_alpha(0.7),
+            data_changed: Color::hex(0xA3E635).with_alpha(0.22),
+            breakpoint: Color::hex(0xE5484D),
+            exec_line_bg: Color::hex(0xA3E635).with_alpha(0.13),
             term_fg: Color::hex(0xCCCCCC),
             term_bg: Color::hex(0x181818),
             term_palette: [

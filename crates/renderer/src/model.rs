@@ -20,7 +20,8 @@ pub struct Filter {
     pub library: bool,
     /// Compiler-generated symbols (RTTI, vtables, literals, ...).
     pub generated: bool,
-    /// Parameters, locals and their types.
+    /// Parameters and locals. (Types are never nodes: they are listed on
+    /// the node that uses them, see [`ModelNode::types`].)
     pub locals: bool,
 }
 
@@ -48,7 +49,8 @@ impl NodeClass {
             Self::Function | Self::Variable | Self::External => true,
             Self::Library => f.library,
             Self::Generated => f.generated,
-            Self::Local | Self::Type => f.locals,
+            Self::Local => f.locals,
+            Self::Type => false,
         }
     }
 
@@ -90,6 +92,16 @@ pub struct ModelNode {
     pub source: Option<SourceLoc>,
     /// The object file the node came from (for resolving relative paths).
     pub object: Arc<Path>,
+    /// Types this node uses, shown only while it is selected: a variable's
+    /// type (empty role), or a function's parameters and locals with their
+    /// types (role = the local's name).
+    pub types: Arc<[TypeTag]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeTag {
+    pub role: Arc<str>,
+    pub ty: Arc<str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -148,6 +160,7 @@ impl GraphModel {
         let mut model = Self::default();
         for (g, locals) in graphs.iter().zip(&locals) {
             let object: Arc<Path> = Arc::from(g.path.as_path());
+            let types = type_tags(g);
             for n in g.nodes() {
                 let target = match n.kind {
                     NodeKind::Section => continue,
@@ -165,9 +178,10 @@ impl GraphModel {
                 canon.insert(n.id, target);
                 if target == n.id {
                     let class = classify(n, locals.contains(&n.id));
+                    let tags = types.get(&n.id).cloned().unwrap_or_default();
                     if class.visible(filter) {
-                        model.push_node(n, class, &object);
-                    } else {
+                        model.push_node(n, class, &object, tags);
+                    } else if class != NodeClass::Type {
                         model.hidden += 1;
                     }
                 }
@@ -222,6 +236,7 @@ impl GraphModel {
                 label,
                 source: None,
                 object: object.clone(),
+                types: Arc::from([]),
             });
         }
         let mut edges = Vec::new();
@@ -252,7 +267,7 @@ impl GraphModel {
         model
     }
 
-    fn push_node(&mut self, n: &Node, class: NodeClass, object: &Arc<Path>) {
+    fn push_node(&mut self, n: &Node, class: NodeClass, object: &Arc<Path>, types: Arc<[TypeTag]>) {
         self.index.insert(n.id, self.nodes.len() as u32);
         self.nodes.push(ModelNode {
             id: n.id,
@@ -261,6 +276,7 @@ impl GraphModel {
             label: n.display_name.clone(),
             source: n.source.clone(),
             object: object.clone(),
+            types,
         });
     }
 
@@ -319,6 +335,50 @@ impl GraphModel {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
+}
+
+/// Per node of one object: the types it uses (see [`ModelNode::types`]).
+fn type_tags(g: &CodeGraph) -> HashMap<NodeId, Arc<[TypeTag]>> {
+    let by_id: HashMap<NodeId, &Node> = g.nodes().iter().map(|n| (n.id, n)).collect();
+    let mut own: HashMap<NodeId, Vec<Arc<str>>> = HashMap::new();
+    let mut contains: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for e in g.edges() {
+        match e.kind {
+            EdgeKind::HasType => {
+                if let Some(t) = by_id.get(&e.to) {
+                    own.entry(e.from).or_default().push(t.display_name.clone());
+                }
+            }
+            EdgeKind::Contains => contains.entry(e.from).or_default().push(e.to),
+            _ => {}
+        }
+    }
+    let empty: Arc<str> = Arc::from("");
+    let mut out = HashMap::new();
+    for n in g.nodes() {
+        let mut tags: Vec<TypeTag> = own
+            .get(&n.id)
+            .into_iter()
+            .flatten()
+            .map(|ty| TypeTag {
+                role: empty.clone(),
+                ty: ty.clone(),
+            })
+            .collect();
+        for local in contains.get(&n.id).into_iter().flatten() {
+            let Some(l) = by_id.get(local) else { continue };
+            for ty in own.get(local).into_iter().flatten() {
+                tags.push(TypeTag {
+                    role: l.display_name.clone(),
+                    ty: ty.clone(),
+                });
+            }
+        }
+        if !tags.is_empty() {
+            out.insert(n.id, Arc::from(tags));
+        }
+    }
+    out
 }
 
 fn classify(n: &Node, is_local: bool) -> NodeClass {
@@ -412,6 +472,26 @@ mod tests {
         assert_eq!(
             with.hidden + with.nodes().len(),
             without.hidden + without.nodes().len()
+        );
+        assert!(with.nodes().iter().all(|n| n.class != NodeClass::Type));
+    }
+
+    #[test]
+    fn types_ride_on_the_nodes_that_use_them() {
+        let m = GraphModel::build(&[fixture("msvc_z7.obj")], Filter::default());
+        let tagged: Vec<(&str, &[TypeTag])> = m
+            .nodes()
+            .iter()
+            .filter(|n| !n.types.is_empty())
+            .map(|n| (&*n.label, &*n.types))
+            .collect();
+        assert!(!tagged.is_empty(), "no node carries types");
+        // A function lists its locals with their types.
+        assert!(
+            tagged
+                .iter()
+                .any(|(_, t)| t.iter().any(|t| !t.role.is_empty())),
+            "{tagged:?}"
         );
     }
 

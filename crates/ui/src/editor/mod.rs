@@ -113,6 +113,23 @@ impl EditorArea {
         true
     }
 
+    /// The active file and caret line (1-based).
+    pub fn caret_location(&self) -> Option<(std::path::PathBuf, u32)> {
+        let doc = self.docs.get(self.active)?;
+        Some((doc.path().to_path_buf(), doc.caret_line()))
+    }
+
+    /// Updates every open document's debugger marks. Returns `true` if any
+    /// changed.
+    pub fn set_marks(&mut self, marks: impl Fn(&Path) -> (Vec<u32>, Option<u32>)) -> bool {
+        let mut changed = false;
+        for doc in &mut self.docs {
+            let (bps, exec) = marks(doc.path());
+            changed |= doc.set_marks(bps, exec);
+        }
+        changed
+    }
+
     pub fn clear_caches(&mut self) {
         for doc in &mut self.docs {
             doc.clear_layouts();

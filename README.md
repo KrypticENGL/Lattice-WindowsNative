@@ -4,15 +4,20 @@ A native Windows IDE with a code-graph visualizer, written in Rust directly
 against Win32 via the [`windows`](https://crates.io/crates/windows) crate (no
 GUI framework).
 
-**Status:** Stage 4, the graph renderer. The app has two top-level tabs:
+**Status:** Stage 4, the visualizer. The app has two top-level tabs:
 - **Code:** the Solution Explorer, a tabbed editor, an Output panel and a
   ConPTY terminal. Object files (`.obj`, `.o`) expand in the Explorer into
   their functions, variables and externals, read by `crates/engine`, and
   reload automatically when they change on disk.
-- **Visualizer:** the call and reference graph of every loaded object,
-  merged into one graph and laid out by a force simulation on a worker
-  thread. You can pan, zoom, drag, hover and select, and double-click a
-  node to open its source.
+- **Visualizer**, in two modes:
+  - **Call graph:** the call and reference graph of every loaded object,
+    merged into one graph and laid out by a force simulation on a worker
+    thread. You can pan, zoom, drag, hover and select, and double-click a
+    node to open its source.
+  - **Data:** the live data of a program stopped under GDB, drawn by
+    shape: trees as trees, linked lists as chains, arrays and vectors as
+    rows of cells, 2-D arrays as grids, with the stack frames beside them.
+    Run, break and step from the toolbar or with the usual debugger keys.
 
 ## Build
 
@@ -20,6 +25,11 @@ Requirements: Windows 10 1903 or later (ConPTY; Windows 11 22H2+ for Mica),
 and stable Rust with the MSVC toolchain
 (`rustup default stable-x86_64-pc-windows-msvc`) plus the Visual Studio C++
 build tools.
+
+The Visualizer's Data mode also needs GDB with Python (MinGW-w64 or MSYS2
+builds have it; tested with GDB 16.3) on `PATH`, or `LATTICE_GDB` pointing
+at `gdb.exe`. The programs it debugs must be built with gcc or g++ and
+`-g`; GDB cannot read MSVC's PDB debug info.
 
 ```powershell
 cargo run -p app -- E:\some\folder   # debug build; the folder argument is optional
@@ -48,7 +58,11 @@ cargo test --workspace
 | See the graph | Every object you load shows up in the **Visualizer**, merged into one graph: a call to an external in one object links to its definition in another. **Add folder objects** loads every `.obj` / `.o` under the open folder. Lime nodes are functions, teal globals, amber unresolved externals. Calls are the brighter edges; arrowheads appear when zoomed in |
 | Move around the graph | Drag empty space to pan, wheel to zoom, drag a node to move it. **Fit** (or `F`) frames everything. The arrow keys pan and `+` / `-` zoom. `Space` re-runs the layout |
 | Inspect a node | Hover for its name. Click to select: its neighbours and edges light up, everything else dims, and a card shows its kind, source location and caller/callee counts. `Esc` clears the selection. Double-click opens its source at the line, in the Code tab (needs debug info) |
-| Filter the graph | **Library** (standard library and toolchain headers), **Generated** (compiler-generated symbols) and **Locals & types** are off by default; toggling them keeps existing nodes where they are |
+| Filter the graph | **Library** (standard library and toolchain headers), **Generated** (compiler-generated symbols) and **Locals** are off by default; toggling them keeps existing nodes where they are. Types are never nodes: selecting a node shows the types it uses (a variable's type, a function's parameters and locals with theirs) as chips around it |
+| Switch Visualizer mode | **Call graph** / **Data** at the left of the Visualizer toolbar. Each mode keeps its own view |
+| Debug a program (Data mode) | Build it with `g++ -g` (or `gcc -g`). Set breakpoints with `F9` on the caret line, or click the editor's gutter. `F5` runs it: the program is `foo.exe` next to the open `foo.cpp`, or the one chosen with **Program**. With no breakpoints it stops at `main`. It gets its own console window for input and output |
+| Step | `F5` continue, `F10` step over, `F11` step into, `Shift+F11` step out, `Shift+F5` stop, or the toolbar buttons; **Pause** interrupts a running program. In the Code tab the editor follows each stop |
+| Read the data | Frames are on the left, outermost first. Pointers are dots with arrows to what they point at; back pointers (`prev`, `parent`, cycles, shared nodes) are grey curves. A value that changed in the last step is tinted lime. Click a box to focus it: its type, size and address and each field's type appear, and unrelated boxes dim. Double-click a frame to open its source line. Drag to pan, wheel to zoom, `F` or **Fit** to frame everything |
 | Benchmark | `Ctrl+Shift+G` loads a synthetic 10,000-node graph; `Ctrl+Shift+B` measures frame times and prints them to Output (see [`crates/renderer/DESIGN.md`](crates/renderer/DESIGN.md)) |
 | Editor | Type to edit. `Ctrl+S` save, `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+Z` redo, `Ctrl+A/C/X/V`, `Ctrl+W` close tab, `Ctrl+Tab` next tab. Shift+arrows or a mouse drag selects; double-click selects a word |
 | Terminal | Click **TERMINAL** or press `` Ctrl+` ``. `Ctrl+V` pastes; the mouse wheel scrolls the history. Press `Enter` to restart the shell after it exits |
@@ -73,7 +87,8 @@ Cargo workspace of small crates:
 | `crates/app` | Binary `lattice`: process setup, main window, message loop. It translates window messages into `ui` events |
 | `crates/ui` | The IDE shell: Direct2D/DirectWrite drawing, panels, layout, the editor buffer, the terminal emulator |
 | `crates/engine` | Object-file parsing (COFF, ELF) into a `CodeGraph`. Portable, `forbid(unsafe_code)`, no Windows dependency. See [`crates/engine/README.md`](crates/engine/README.md) for what it reads and its limits |
-| `crates/renderer` | The Visualizer's graph: it merges the loaded objects into one model, runs the force layout on a worker thread, and handles the camera, hit testing, culling, level of detail and input. It draws through a `Canvas` trait. Portable, `forbid(unsafe_code)`, no Windows dependency. [`DESIGN.md`](crates/renderer/DESIGN.md) explains why it uses Direct2D rather than Direct3D and records the measured frame rates |
+| `crates/debugger` | Runs GDB (`--interpreter=mi3`) as a child process: an MI parser, the session (breakpoints, run, step) on reader threads, and `snapshot.py`, a GDB Python command that returns the stopped program's frames and every object reachable from them as JSON. Portable, `forbid(unsafe_code)`, no Windows dependency |
+| `crates/renderer` | The Visualizer. Data mode (`data/`): a shape-aware layout of a snapshot and its viewport. Call graph: it merges the loaded objects into one model, runs the force layout on a worker thread, and handles the camera, hit testing, culling, level of detail and input. It draws through a `Canvas` trait. Portable, `forbid(unsafe_code)`, no Windows dependency. [`DESIGN.md`](crates/renderer/DESIGN.md) explains why it uses Direct2D rather than Direct3D and records the measured frame rates |
 
 **Unsafe boundary.** `unsafe_code` is denied across the workspace. Only
 modules named `sys` (`crates/app/src/sys/`, `crates/ui/src/sys/`) opt back
@@ -136,15 +151,20 @@ it. `app` hands the window to `ui` as an opaque `ui::NativeWindow`.
   snapshots, at most 60 a second, until the layout settles. Large graphs
   split the repulsion step across scoped threads;
 - a `notify` watcher reports object files that change and are due a reload,
-  debounced by 300 ms.
+  debounced by 300 ms;
+- `gdb-reader` and `gdb-stderr` read the debugger's output, turn it into
+  events and ask for a snapshot at every stop; `gdb-exit` makes sure GDB is
+  gone after Stop.
 
 Each sends data over an mpsc channel and posts one coalesced `WAKE_MESSAGE`
 (`WM_APP+1`, no payload). The UI thread drains the channels in
 `Shell::on_wake`. No window or COM objects cross threads.
 
 **Known limits.** See `crates/renderer/DESIGN.md` for the Visualizer's
-limits (straight edges, linkage-name merging, hairballs on very dense
-graphs).
+limits: for the call graph, straight edges, linkage-name merging and
+hairballs on very dense graphs; for Data mode, gcc/g++ programs only, the
+stopped thread's frames as the only roots, and caps of 2,000 objects and
+100 elements per container.
 
 From stage 2: the editor has no syntax highlighting, word
 wrap, IME composition window or find. The terminal has no text selection or

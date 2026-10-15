@@ -10,6 +10,7 @@
 
 mod camera;
 mod canvas;
+pub mod data;
 mod geom;
 mod layout;
 mod model;
@@ -20,5 +21,5 @@ pub use camera::Camera;
 pub use canvas::{Canvas, Rgba, Style};
 pub use geom::{Affine, Rect, Vec2};
 pub use layout::{LayoutWorker, Simulation, Snapshot};
-pub use model::{EdgeClass, Filter, GraphModel, ModelEdge, ModelNode, NodeClass};
+pub use model::{EdgeClass, Filter, GraphModel, ModelEdge, ModelNode, NodeClass, TypeTag};
 pub use view::{Cursor, GraphView, Response, NODE_RADIUS};

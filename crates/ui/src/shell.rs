@@ -4,19 +4,20 @@
 use std::path::{Path, PathBuf};
 
 use crate::bottom::{BottomArea, BottomTab};
+use crate::debug::{self, Debug, Phase, Update};
 use crate::editor::EditorArea;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::explorer::Explorer;
 use crate::geom::{PointF, RectF, SizeF};
 use crate::objects::{LoadResult, ObjectEvent, ObjectService};
-use crate::panel::{Action, Cx, Panel};
+use crate::panel::{Action, Cx, DebugAction, Panel};
 use crate::split::{Anchor, Axis, Splitter};
 use crate::sys::dialog::{self, ComGuard};
 use crate::sys::gfx::{DrawCtx, Frame, Graphics};
 use crate::sys::text::{TextStyle, TextSystem};
 use crate::sys::{NativeWindow, Waker};
 use crate::theme::Theme;
-use crate::visualizer::Visualizer;
+use crate::visualizer::{DebugStatus, Mode, Visualizer};
 use crate::Error;
 
 const TOP_STRIP_H: f32 = 34.0;
@@ -205,10 +206,19 @@ struct Views {
     owner: Option<MouseOwner>,
     window_focused: bool,
     objects: ObjectService,
+    debug: Debug,
 }
 
 impl Views {
     fn layout(&mut self, size: SizeF, text: &TextSystem) {
+        self.visualizer.set_debug_status(DebugStatus {
+            phase: self.debug.phase(),
+            program: self
+                .debug
+                .program()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
+            stopped: self.debug.stop_description(),
+        });
         let full = RectF::new(0.0, 0.0, size.w, size.h);
         let (strip, body) = full.split_top(TOP_STRIP_H);
         self.strip = strip;
@@ -264,6 +274,8 @@ impl Views {
             RectF::new(self.strip.x, self.strip.bottom() - 1.0, self.strip.w, 1.0),
             theme.border,
         );
+        let debug = &self.debug;
+        self.code.editor.set_marks(|p| debug.marks_for(p));
         match self.tab {
             TopTab::Code => self.code.paint(d, theme, self.window_focused),
             TopTab::Visualizer => self.visualizer.paint(d, theme, self.window_focused),
@@ -343,6 +355,27 @@ impl Views {
         let Event::KeyDown { key, mods } = *e else {
             return false;
         };
+        // Debugger keys (Visual Studio's), in both tabs.
+        if !mods.ctrl && !mods.alt {
+            let action = match key {
+                Key::F(5) if mods.shift => Some(DebugAction::Stop),
+                Key::F(5) => Some(DebugAction::Run),
+                Key::F(10) => Some(DebugAction::Step(debugger::Command::Next)),
+                Key::F(11) if mods.shift => Some(DebugAction::Step(debugger::Command::Finish)),
+                Key::F(11) => Some(DebugAction::Step(debugger::Command::Step)),
+                Key::F(9) => {
+                    if let Some((path, line)) = self.code.editor.caret_location() {
+                        self.debug.toggle_breakpoint(&path, line, cx);
+                    }
+                    return true;
+                }
+                _ => None,
+            };
+            if let Some(a) = action {
+                self.debug_action(a, cx);
+                return true;
+            }
+        }
         if !mods.ctrl || mods.alt {
             return false;
         }
@@ -358,6 +391,84 @@ impl Views {
             _ => return false,
         }
         true
+    }
+
+    fn debug_action(&mut self, a: DebugAction, cx: &mut Cx) {
+        match a {
+            DebugAction::Run => match self.debug.phase() {
+                Phase::Stopped => self.debug.command(debugger::Command::Continue, cx),
+                Phase::Idle => {
+                    if self.debug.program().is_none() {
+                        // `foo.exe` next to the open `foo.cpp`, else ask.
+                        let guess = self
+                            .code
+                            .editor
+                            .caret_location()
+                            .and_then(|(p, _)| debug::program_for_source(&p));
+                        match guess {
+                            Some(p) => self.debug.set_program(p),
+                            None => {
+                                if !self.pick_program(cx) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    self.visualizer.clear_data();
+                    self.visualizer.set_mode(Mode::Data, cx);
+                    self.debug.start(cx);
+                }
+                Phase::Starting | Phase::Running => {}
+            },
+            DebugAction::Pause => self.debug.command(debugger::Command::Interrupt, cx),
+            DebugAction::Step(c) => self.debug.command(c, cx),
+            DebugAction::Stop => {
+                if self.debug.is_active() {
+                    self.debug.stop(cx);
+                    self.visualizer.set_data_stale(true);
+                }
+            }
+            DebugAction::PickProgram => {
+                self.pick_program(cx);
+            }
+        }
+        cx.repaint();
+    }
+
+    /// Asks for the program to debug. `false` if cancelled.
+    fn pick_program(&mut self, cx: &mut Cx) -> bool {
+        match dialog::pick_file(cx.window, "Programs (*.exe)", "*.exe") {
+            Ok(Some(p)) => {
+                cx.log(format!("Program to debug: {}", p.display()));
+                self.debug.set_program(p);
+                cx.repaint();
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                cx.log_error(format!("File picker failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Applies the debugger's events.
+    fn drain_debug(&mut self, cx: &mut Cx) {
+        for u in self.debug.drain(cx) {
+            match u {
+                Update::Running => self.visualizer.set_data_stale(true),
+                Update::Stopped { file, line } => {
+                    // In the Code tab, follow the stop like any debugger.
+                    if let (TopTab::Code, Some(file), Some(line)) = (self.tab, file, line) {
+                        if file.is_file() {
+                            self.code.editor.open_at(&file, line, cx);
+                        }
+                    }
+                }
+                Update::Snapshot(snap) => self.visualizer.set_snapshot(*snap),
+                Update::Ended => self.visualizer.set_data_stale(true),
+            }
+        }
     }
 
     fn open_folder(&mut self, path: &Path, cx: &mut Cx) {
@@ -520,6 +631,10 @@ impl Views {
                             self.code.set_focus(Region::Editor, cx);
                         }
                     }
+                    Action::Debug(a) => self.debug_action(a, cx),
+                    Action::ToggleBreakpoint { path, line } => {
+                        self.debug.toggle_breakpoint(&path, line, cx);
+                    }
                     Action::PickFolder => match dialog::pick_folder(cx.window) {
                         Ok(Some(path)) => self.open_folder(&path, cx),
                         Ok(None) => {}
@@ -571,6 +686,7 @@ impl Shell {
                 owner: None,
                 window_focused: true,
                 objects,
+                debug: Debug::new(waker.clone()),
             },
             waker,
             cursor: CursorShape::Arrow,
@@ -679,6 +795,7 @@ impl Shell {
         let mut cx = Cx::new(&self.text, self.window);
         self.views.code.bottom.terminal.pump(&mut cx);
         self.views.drain_objects(&mut cx);
+        self.views.drain_debug(&mut cx);
         let moved = self.views.visualizer.update() | self.views.visualizer.poll();
         if moved && self.views.tab == TopTab::Visualizer {
             cx.repaint();

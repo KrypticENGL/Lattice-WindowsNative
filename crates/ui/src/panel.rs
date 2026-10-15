@@ -24,10 +24,27 @@ pub enum Action {
         line: u32,
     },
     PickFolder,
+    /// Debugger controls (Visualizer Data mode, F5/F10/F11).
+    Debug(DebugAction),
+    /// Add or remove a breakpoint (gutter click).
+    ToggleBreakpoint {
+        path: PathBuf,
+        line: u32,
+    },
     Log {
         error: bool,
         text: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugAction {
+    /// Start the program, or continue it when stopped.
+    Run,
+    Pause,
+    Step(debugger::Command),
+    Stop,
+    PickProgram,
 }
 
 /// Context for one event dispatch.

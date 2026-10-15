@@ -1,5 +1,9 @@
 # Graph renderer: design note
 
+The Visualizer has two modes. **Data** (live program data, by shape) is
+described in [Data mode](#data-mode) at the end; everything before it is
+about the **Call graph**.
+
 ## What it does
 
 The Visualizer tab draws the merged code graph of every loaded object file.
@@ -120,7 +124,7 @@ Machine: Intel Core i5-11260H, Intel UHD Graphics (the display adapter),
 | Synthetic | 10,000 / 24,180 | 147 | 143 | 3.4 / 5.8 ms |
 | Synthetic, per-call drawing (before sprite batching) | 10,000 / 24,180 | 86 | 95 | 10.9 / 13.8 ms |
 | Lattice's own `ui` crate (250 incremental objects), user code | 2,323 / 2,725 | 148 | 144 | 1.3 / 2.7 ms |
-| Same objects with Library, Generated and Locals & types on | 23,748 / 45,754 | — | — | 2.6 ms (status line, whole graph on screen) |
+| Same objects with Library, Generated and Locals & types on (measured when types were still nodes) | 23,748 / 45,754 | — | — | 2.6 ms (status line, whole graph on screen) |
 
 144 fps is the display's refresh rate: with sprite batching every case is
 vsync-bound, with 3–5× headroom on the draw side. Layout time:
@@ -139,5 +143,103 @@ The UI keeps rendering at full rate meanwhile.
   a `static` function that shares a name with a global one in another
   object could be linked wrongly.
 - Layout quality is that of a plain force simulation. Very dense graphs
-  form a hairball when zoomed out. The filters (Library, Generated, Locals
-  & types) and selection highlighting are the tools for reading them.
+  form a hairball when zoomed out. The filters (Library, Generated, Locals) and
+  selection highlighting are the tools for reading them.
+
+Types are not graph nodes. Each node carries the types it uses
+(`ModelNode::types`), and they are drawn as chips around the selected node
+only.
+
+## Data mode
+
+Data mode answers "what does my data structure look like right now": a
+program built with gcc/g++ `-g` runs under GDB, and at every stop the
+Visualizer draws its frames and the objects they reach.
+
+### Where the data comes from
+
+`crates/debugger` runs `gdb --interpreter=mi3` and talks GDB/MI over pipes.
+At each `*stopped` record it sends `-lattice-snapshot`, an MI command
+defined by `snapshot.py`, which GDB loads with `source`. The script:
+
+- walks the stopped thread's frames that have source (outermost first, at
+  most 12). After **Pause**, Windows GDB stops in a helper thread, so it
+  switches to the first thread with user code;
+- takes each frame's arguments and the locals declared above the current
+  line (later ones are still uninitialised);
+- follows values breadth-first:
+  - pointers and references are followed, using the dynamic type;
+  - C arrays are expanded;
+  - containers with a libstdc++ pretty-printer are expanded: `array` hints
+    (vector, list, deque) as arrays, `map` hints as key/value tables;
+  - smart pointers count as the pointer they hold;
+  - `char*` and `std::string` are text;
+- keys every object by `address:type`, so a heap block keeps its identity
+  from one stop to the next;
+- returns everything as one JSON string, capped at 2,000 objects and 100
+  elements per container.
+
+One round trip per stop, with the walk done inside GDB, is much faster
+than driving MI variable objects field by field.
+
+### Layout (`data/layout.rs`)
+
+The layout is deterministic and structural; no force simulation:
+
+1. **Boxes.**
+   - Frames and structs are rows of `name | value`.
+   - Arrays are cells with their indices underneath.
+   - An array whose elements are all arrays of scalars is drawn as one
+     grid.
+   - Pointers are dots.
+   - Types are not drawn.
+2. **Spanning forest.** A depth-first walk from the frames, in slot order,
+   gives every object one parent: the first slot that reaches it. Every
+   other pointer to it is a cross edge, drawn as a grey curve: back
+   pointers, `prev`, `parent`, cycles, sharing.
+3. **Shape per struct type.** A type's *child fields* are its same-type
+   pointer fields that are a tree edge somewhere.
+   - One child field (`next`): a **chain**, left to right, or downward when
+     the chain hangs off an array cell (hash buckets, adjacency lists).
+   - Two or more (`left`/`right`): a **tree**, children below in field
+     order. A null child keeps an empty slot, so a lone right child stays
+     on the right.
+   - Anything else a box owns hangs below it.
+4. **Placement.** Subtree extents are computed bottom-up, then boxes are
+   placed top-down. Frames form a column on the left. Each structure sits
+   to the right, level with the variable that first reaches it. Arrows
+   from frames are S-curves, so they never cross another frame.
+
+The walk and the extents use explicit stacks, so a 3,000-node list lays
+out without recursion (tested).
+
+### Viewport (`data/view.rs`)
+
+- **Text.** It is drawn in world space, so it scales with the zoom, and is
+  dropped below about 5 px.
+- **Camera.** It frames each new stop until the user pans or zooms; **Fit**
+  turns that back on.
+- **Changed values.** A value that differs from the previous stop is
+  tinted. The comparison uses the object id and slot name.
+- **Focus.** Clicking a box shows its type, size, address and
+  pretty-printer summary in a chip above it, and each field's type beside
+  its row. This is the only place types appear. Boxes not connected to the
+  focus dim. Box backgrounds stay opaque so edges never show through.
+- **Running.** While the program runs, the last stop stays on screen,
+  dimmed.
+
+### Data mode limits
+
+- GDB reads DWARF, so the program must be built with gcc/clang `-g`
+  (MinGW on Windows). MSVC programs and PDBs are not supported.
+- The roots are the stopped thread's frames. Globals and other threads are
+  not shown.
+- 2,000 objects and 100 elements per container. When the cap is hit, the
+  status line says "capped".
+- A pointer into the middle of an array points at that element's own cell
+  object, not at the array.
+- Shape detection is per type and needs one walk order. A doubly linked
+  list first reached from its middle (a variable declared before `head`)
+  is drawn as a tree, not a chain.
+- `std::map` and `std::set` are shown as tables, the way their
+  pretty-printers present them, not as their internal red-black trees.

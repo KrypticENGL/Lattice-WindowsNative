@@ -1,16 +1,18 @@
-//! COM apartment guard, folder picker and save prompts.
+//! COM apartment guard, folder and file pickers, and save prompts.
 
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
-use windows::core::HSTRING;
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::ERROR_CANCELLED;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
 };
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+    FileOpenDialog, IFileOpenDialog, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
+    SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDCANCEL, IDNO, IDYES, MB_ICONWARNING, MB_YESNOCANCEL,
@@ -48,6 +50,21 @@ impl Drop for ComGuard {
 /// Shows the system folder picker. `Ok(None)` if the user cancelled.
 /// Requires a live [`ComGuard`] on this thread.
 pub fn pick_folder(window: NativeWindow) -> Result<Option<PathBuf>, Error> {
+    pick(window, None)
+}
+
+/// Shows the system file picker for one existing file matching `pattern`
+/// (for example `*.exe`), described as `label`. `Ok(None)` if cancelled.
+/// Requires a live [`ComGuard`] on this thread.
+pub fn pick_file(
+    window: NativeWindow,
+    label: &str,
+    pattern: &str,
+) -> Result<Option<PathBuf>, Error> {
+    pick(window, Some((label, pattern)))
+}
+
+fn pick(window: NativeWindow, filter: Option<(&str, &str)>) -> Result<Option<PathBuf>, Error> {
     // SAFETY: COM is initialised on this thread (caller holds ComGuard).
     let dialog: IFileOpenDialog =
         unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }
@@ -55,9 +72,25 @@ pub fn pick_folder(window: NativeWindow) -> Result<Option<PathBuf>, Error> {
     // SAFETY: plain option calls on a live dialog object.
     unsafe {
         let options = dialog.GetOptions().map_err(|e| win_err("GetOptions", e))?;
+        let pick = if filter.is_some() {
+            FOS_FILEMUSTEXIST
+        } else {
+            FOS_PICKFOLDERS
+        };
         dialog
-            .SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)
+            .SetOptions(options | pick | FOS_FORCEFILESYSTEM)
             .map_err(|e| win_err("SetOptions", e))?;
+    }
+    if let Some((label, pattern)) = filter {
+        let label = HSTRING::from(label);
+        let pattern = HSTRING::from(pattern);
+        let spec = [COMDLG_FILTERSPEC {
+            pszName: PCWSTR(label.as_ptr()),
+            pszSpec: PCWSTR(pattern.as_ptr()),
+        }];
+        // SAFETY: the dialog copies the filter strings; `label` and
+        // `pattern` outlive the call.
+        unsafe { dialog.SetFileTypes(&spec) }.map_err(|e| win_err("SetFileTypes", e))?;
     }
     // SAFETY: modal; re-enters the window procedure, which tolerates a busy
     // shell. `window` is live on this thread.

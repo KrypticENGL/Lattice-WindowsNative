@@ -80,6 +80,12 @@ impl Camera {
         self.center = anchor - (screen - self.viewport.center()) * (1.0 / self.zoom);
     }
 
+    /// Shows `world_center` at the viewport centre with zoom `zoom`.
+    pub fn look_at(&mut self, world_center: Vec2, zoom: f32) {
+        self.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        self.center = world_center;
+    }
+
     /// Frames `bounds` with `margin` DIPs on each side, zooming in no
     /// further than `max_zoom`.
     pub fn fit(&mut self, bounds: Rect, margin: f32, max_zoom: f32) {

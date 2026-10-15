@@ -1,10 +1,14 @@
-//! Visualizer tab: the code graph of every loaded object file, merged and
-//! drawn by `crates/renderer`. It is a separate root view: it owns its whole
-//! area and never shares layout or input with the Code tab.
+//! Visualizer tab, drawn by `crates/renderer`, in two modes picked at the
+//! left of the toolbar. It is a separate root view: it owns its whole area
+//! and never shares layout or input with the Code tab.
 //!
-//! The toolbar loads objects and toggles which node classes show; the
-//! canvas pans (drag empty space), zooms (wheel), drags nodes, selects (click;
-//! neighbours stay lit) and opens a node's source (double-click).
+//! - **Call graph**: every loaded object file, merged. The toolbar loads
+//!   objects and toggles which node classes show; the canvas pans (drag
+//!   empty space), zooms (wheel), drags nodes, selects (click; neighbours
+//!   stay lit) and opens a node's source (double-click).
+//! - **Data**: the live data of a program stopped under GDB, drawn by shape
+//!   (trees as trees, arrays as cells). The toolbar runs and steps the
+//!   program; clicking a box shows its type.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,11 +16,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engine::CodeGraph;
+use renderer::data::{DataStyle, DataView};
 use renderer::{Cursor, Filter, GraphModel, GraphView, NodeClass, Rgba, Style, Vec2};
 
+use crate::debug::Phase;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::geom::{PointF, RectF};
-use crate::panel::{Action, Cx, Panel};
+use crate::panel::{Action, Cx, DebugAction, Panel};
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::{TextStyle, TextSystem};
 use crate::sys::Waker;
@@ -33,18 +39,44 @@ const BENCH_FRAMES: usize = 300;
 pub const SYNTHETIC_NODES: usize = 10_000;
 const SYNTHETIC_EDGES_PER_NODE: f32 = 2.5;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    Graph,
+    Data,
+}
+
+/// Debugger state shown by the Data mode toolbar.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DebugStatus {
+    pub phase: Phase,
+    /// File name of the chosen program.
+    pub program: Option<String>,
+    /// `func at file:line` while stopped.
+    pub stopped: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Button {
+    ModeGraph,
+    ModeData,
     AddFolder,
     Fit,
     Clear,
     Library,
     Generated,
     Locals,
+    Program,
+    Run,
+    Pause,
+    StepOver,
+    StepInto,
+    StepOut,
+    Stop,
 }
 
 impl Button {
-    const ALL: [Self; 6] = [
+    const GRAPH: [Self; 6] = [
         Self::AddFolder,
         Self::Fit,
         Self::Clear,
@@ -52,20 +84,60 @@ impl Button {
         Self::Generated,
         Self::Locals,
     ];
+    const DATA: [Self; 8] = [
+        Self::Program,
+        Self::Run,
+        Self::Pause,
+        Self::StepOver,
+        Self::StepInto,
+        Self::StepOut,
+        Self::Stop,
+        Self::Fit,
+    ];
 
-    fn label(self) -> &'static str {
+    fn label(self, debug: &DebugStatus) -> String {
         match self {
-            Self::AddFolder => "Add folder objects",
-            Self::Fit => "Fit",
-            Self::Clear => "Clear",
-            Self::Library => "Library",
-            Self::Generated => "Generated",
-            Self::Locals => "Locals & types",
+            Self::ModeGraph => "Call graph".into(),
+            Self::ModeData => "Data".into(),
+            Self::AddFolder => "Add folder objects".into(),
+            Self::Fit => "Fit".into(),
+            Self::Clear => "Clear".into(),
+            Self::Library => "Library".into(),
+            Self::Generated => "Generated".into(),
+            Self::Locals => "Locals".into(),
+            Self::Program => match &debug.program {
+                Some(p) => format!("Program: {p}"),
+                None => "Choose program\u{2026}".into(),
+            },
+            Self::Run => match debug.phase {
+                Phase::Stopped => "Continue".into(),
+                _ => "Run".into(),
+            },
+            Self::Pause => "Pause".into(),
+            Self::StepOver => "Step over".into(),
+            Self::StepInto => "Step into".into(),
+            Self::StepOut => "Step out".into(),
+            Self::Stop => "Stop".into(),
         }
     }
 
     fn is_toggle(self) -> bool {
         matches!(self, Self::Library | Self::Generated | Self::Locals)
+    }
+
+    fn is_mode(self) -> bool {
+        matches!(self, Self::ModeGraph | Self::ModeData)
+    }
+
+    fn enabled(self, debug: &DebugStatus) -> bool {
+        match self {
+            Self::Run => matches!(debug.phase, Phase::Idle | Phase::Stopped),
+            Self::Pause => debug.phase == Phase::Running,
+            Self::StepOver | Self::StepInto | Self::StepOut => debug.phase == Phase::Stopped,
+            Self::Stop => debug.phase != Phase::Idle,
+            Self::Program => debug.phase == Phase::Idle,
+            _ => true,
+        }
     }
 }
 
@@ -81,6 +153,9 @@ struct Bench {
 }
 
 pub struct Visualizer {
+    mode: Mode,
+    data: DataView,
+    debug: DebugStatus,
     rect: RectF,
     toolbar: RectF,
     canvas: RectF,
@@ -109,6 +184,9 @@ impl Visualizer {
     pub fn new(waker: Waker) -> (Self, Option<String>) {
         let (view, error) = GraphView::new(Box::new(move || waker.wake()));
         let v = Self {
+            mode: Mode::Graph,
+            data: DataView::new(),
+            debug: DebugStatus::default(),
             rect: RectF::default(),
             toolbar: RectF::default(),
             canvas: RectF::default(),
@@ -128,6 +206,35 @@ impl Visualizer {
             bench_queued: false,
         };
         (v, error)
+    }
+
+    pub fn set_mode(&mut self, mode: Mode, cx: &mut Cx) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.canvas_capture = false;
+            self.hover_button = None;
+            cx.repaint();
+        }
+    }
+
+    /// Debugger state for the Data toolbar (set before each layout).
+    pub fn set_debug_status(&mut self, status: DebugStatus) {
+        self.debug = status;
+    }
+
+    /// A new stop's data.
+    pub fn set_snapshot(&mut self, snap: debugger::Snapshot) {
+        self.data.set_snapshot(snap);
+    }
+
+    /// The program is running (or ended): the data shown is from the last
+    /// stop.
+    pub fn set_data_stale(&mut self, stale: bool) {
+        self.data.set_stale(stale);
+    }
+
+    pub fn clear_data(&mut self) {
+        self.data.clear();
     }
 
     pub fn set_root(&mut self, root: Option<PathBuf>) {
@@ -335,8 +442,21 @@ impl Visualizer {
     }
 
     fn press(&mut self, b: Button, cx: &mut Cx) {
+        if !b.enabled(&self.debug) {
+            return;
+        }
         match b {
+            Button::ModeGraph => self.set_mode(Mode::Graph, cx),
+            Button::ModeData => self.set_mode(Mode::Data, cx),
+            Button::Program => cx.act(Action::Debug(DebugAction::PickProgram)),
+            Button::Run => cx.act(Action::Debug(DebugAction::Run)),
+            Button::Pause => cx.act(Action::Debug(DebugAction::Pause)),
+            Button::StepOver => cx.act(Action::Debug(DebugAction::Step(debugger::Command::Next))),
+            Button::StepInto => cx.act(Action::Debug(DebugAction::Step(debugger::Command::Step))),
+            Button::StepOut => cx.act(Action::Debug(DebugAction::Step(debugger::Command::Finish))),
+            Button::Stop => cx.act(Action::Debug(DebugAction::Stop)),
             Button::AddFolder => cx.act(Action::LoadFolderObjects),
+            Button::Fit if self.mode == Mode::Data => self.data.fit(),
             Button::Fit => self.view.fit_and_follow(),
             Button::Clear => self.clear(cx),
             Button::Library => self.filter.library ^= true,
@@ -364,6 +484,25 @@ impl Visualizer {
         }
     }
 
+    fn apply_data(&mut self, r: renderer::data::DataResponse, cx: &mut Cx) {
+        if r.repaint {
+            cx.repaint();
+        }
+        cx.cursor = match r.cursor {
+            Cursor::Arrow => CursorShape::Arrow,
+            Cursor::Hand => CursorShape::Hand,
+            Cursor::Move => CursorShape::Move,
+        };
+        if let Some((file, line)) = r.open {
+            let path = PathBuf::from(&file);
+            if path.is_file() {
+                cx.act(Action::OpenSource { path, line });
+            } else {
+                cx.log_error(format!("Source file not found: {file}"));
+            }
+        }
+    }
+
     fn open_source(&mut self, i: u32, cx: &mut Cx) {
         let Some(node) = self.view.model().node(i) else {
             return;
@@ -388,6 +527,24 @@ impl Visualizer {
     }
 
     fn on_key(&mut self, key: Key, mods: crate::event::Modifiers, cx: &mut Cx) -> bool {
+        if self.mode == Mode::Data {
+            if mods.ctrl || mods.alt {
+                return false;
+            }
+            match key {
+                Key::Letter('F') => self.data.fit(),
+                Key::Escape => {
+                    self.data.clear_focus();
+                }
+                Key::Left => self.data.pan_by(Vec2::new(KEY_PAN, 0.0)),
+                Key::Right => self.data.pan_by(Vec2::new(-KEY_PAN, 0.0)),
+                Key::Up => self.data.pan_by(Vec2::new(0.0, KEY_PAN)),
+                Key::Down => self.data.pan_by(Vec2::new(0.0, -KEY_PAN)),
+                _ => return false,
+            }
+            cx.repaint();
+            return true;
+        }
         match key {
             Key::Letter('G') if mods.ctrl && mods.shift => {
                 self.load_synthetic(SYNTHETIC_NODES, cx);
@@ -410,6 +567,26 @@ impl Visualizer {
     }
 
     fn status(&self) -> String {
+        if self.mode == Mode::Data {
+            let mut s = match (self.debug.phase, &self.debug.stopped) {
+                (Phase::Idle, _) => "not running".to_string(),
+                (Phase::Starting, _) => "starting\u{2026}".to_string(),
+                (Phase::Running, _) => "running\u{2026}".to_string(),
+                (Phase::Stopped, Some(at)) => format!("stopped in {at}"),
+                (Phase::Stopped, None) => "stopped".to_string(),
+            };
+            if let Some(snap) = self.data.snapshot() {
+                s.push_str(&format!(
+                    " \u{b7} {} objects",
+                    group_digits(snap.objects.len())
+                ));
+                if snap.truncated {
+                    s.push_str(" (capped)");
+                }
+            }
+            s.push_str(&format!(" \u{b7} {:.0}%", self.data.zoom() * 100.0));
+            return s;
+        }
         let m = self.view.model();
         let mut s = format!(
             "{} nodes · {} edges",
@@ -438,6 +615,11 @@ impl Visualizer {
     }
 
     fn paint_toolbar(&self, d: &mut DrawCtx, theme: &Theme) {
+        self.paint_toolbar_body(d, theme);
+        self.paint_mode_switch(d, theme);
+    }
+
+    fn paint_toolbar_body(&self, d: &mut DrawCtx, theme: &Theme) {
         d.fill_rect(self.toolbar, theme.panel_bg);
         d.fill_rect(
             RectF::new(
@@ -449,50 +631,9 @@ impl Visualizer {
             theme.border,
         );
         for &(b, r) in &self.buttons {
-            let hover = self.hover_button == Some(b);
-            let on = self.toggled(b);
-            let (fill, text, border) = match b {
-                Button::AddFolder => (Some(theme.button_bg), theme.button_text, None),
-                _ if on => (
-                    Some(theme.selection_bg),
-                    theme.accent,
-                    Some(theme.accent.with_alpha(0.6)),
-                ),
-                _ => (
-                    hover.then_some(theme.hover_bg),
-                    if hover { theme.text } else { theme.text_dim },
-                    Some(theme.border),
-                ),
-            };
-            let radius = if b.is_toggle() { r.h / 2.0 } else { 5.0 };
-            if let Some(fill) = fill {
-                let fill = if hover && b == Button::AddFolder {
-                    theme.accent.with_alpha(0.85)
-                } else {
-                    fill
-                };
-                d.fill_round_rect(r, radius, fill);
+            if !b.is_mode() {
+                self.paint_button(d, theme, b, r);
             }
-            if let Some(border) = border {
-                renderer::Canvas::stroke_rect(d, to_rect(r), radius, rgba(border), 1.0);
-            }
-            let mut x = r.x + BUTTON_PAD;
-            if b.is_toggle() {
-                // A small state dot: filled lime when on, hollow when off.
-                let c = renderer::Vec2::new(x + 3.0, r.y + r.h / 2.0);
-                if on {
-                    renderer::Canvas::fill_discs(d, &[c], 3.5, rgba(theme.accent));
-                } else {
-                    renderer::Canvas::stroke_circle(d, c, 3.0, rgba(theme.text_dim), 1.0);
-                }
-                x += 12.0;
-            }
-            d.text(
-                TextStyle::Ui,
-                b.label(),
-                RectF::new(x, r.y, r.right() - x, r.h),
-                text,
-            );
         }
         let status = self.status();
         let w = d.text_system().measure(TextStyle::UiSmall, &status);
@@ -515,6 +656,146 @@ impl Visualizer {
         );
     }
 
+    fn paint_button(&self, d: &mut DrawCtx, theme: &Theme, b: Button, r: RectF) {
+        let hover = self.hover_button == Some(b);
+        let enabled = b.enabled(&self.debug);
+        let on = self.toggled(b);
+        let primary = matches!(b, Button::AddFolder | Button::Run);
+        let (fill, text, border) = match b {
+            _ if !enabled => (None, theme.text_dim.with_alpha(0.45), Some(theme.border)),
+            _ if primary => (Some(theme.button_bg), theme.button_text, None),
+            _ if on => (
+                Some(theme.selection_bg),
+                theme.accent,
+                Some(theme.accent.with_alpha(0.6)),
+            ),
+            _ => (
+                hover.then_some(theme.hover_bg),
+                if hover { theme.text } else { theme.text_dim },
+                Some(theme.border),
+            ),
+        };
+        let radius = if b.is_toggle() { r.h / 2.0 } else { 5.0 };
+        if let Some(fill) = fill {
+            let fill = if hover && primary {
+                theme.accent.with_alpha(0.85)
+            } else {
+                fill
+            };
+            d.fill_round_rect(r, radius, fill);
+        }
+        if let Some(border) = border {
+            renderer::Canvas::stroke_rect(d, to_rect(r), radius, rgba(border), 1.0);
+        }
+        let mut x = r.x + BUTTON_PAD;
+        if b.is_toggle() {
+            // A small state dot: filled lime when on, hollow when off.
+            let c = renderer::Vec2::new(x + 3.0, r.y + r.h / 2.0);
+            if on {
+                renderer::Canvas::fill_discs(d, &[c], 3.5, rgba(theme.accent));
+            } else {
+                renderer::Canvas::stroke_circle(d, c, 3.0, rgba(theme.text_dim), 1.0);
+            }
+            x += 12.0;
+        }
+        let label = b.label(&self.debug);
+        if !b.is_toggle() {
+            // Centred: Run/Continue is sized for its longer label.
+            let w = d.text_system().measure(TextStyle::Ui, &label);
+            x = r.x + (r.w - w) / 2.0;
+        }
+        d.text(
+            TextStyle::Ui,
+            &label,
+            RectF::new(x, r.y, r.right() - x, r.h),
+            text,
+        );
+    }
+
+    /// The Call graph | Data switch: one outlined pill, the active half
+    /// filled.
+    fn paint_mode_switch(&self, d: &mut DrawCtx, theme: &Theme) {
+        let rects: Vec<(Button, RectF)> = self
+            .buttons
+            .iter()
+            .copied()
+            .filter(|(b, _)| b.is_mode())
+            .collect();
+        let (Some(&(_, first)), Some(&(_, last))) = (rects.first(), rects.last()) else {
+            return;
+        };
+        let all = RectF::new(first.x, first.y, last.right() - first.x, first.h);
+        d.fill_round_rect(all, 6.0, theme.chrome_bg);
+        renderer::Canvas::stroke_rect(d, to_rect(all), 6.0, rgba(theme.border), 1.0);
+        for (b, r) in rects {
+            let active = (b == Button::ModeGraph) == (self.mode == Mode::Graph);
+            let hover = self.hover_button == Some(b);
+            if active {
+                d.fill_round_rect(r.inset(2.0), 4.0, theme.selection_bg);
+            } else if hover {
+                d.fill_round_rect(r.inset(2.0), 4.0, theme.hover_bg);
+            }
+            let color = if active {
+                theme.accent
+            } else if hover {
+                theme.text
+            } else {
+                theme.text_dim
+            };
+            let label = b.label(&self.debug);
+            let w = d.text_system().measure(TextStyle::Ui, &label);
+            d.text(
+                TextStyle::Ui,
+                &label,
+                RectF::new(r.x + (r.w - w) / 2.0, r.y, w + 2.0, r.h),
+                color,
+            );
+        }
+    }
+
+    fn paint_data_empty(&self, d: &mut DrawCtx, theme: &Theme) {
+        let lines: Vec<(&str, TextStyle, Color)> = match self.debug.phase {
+            Phase::Idle => vec![
+                ("No program running", TextStyle::UiBold, theme.text),
+                (
+                    "Build your program with gcc or g++ and -g (MinGW), then choose it with Program.",
+                    TextStyle::Ui,
+                    theme.text_dim,
+                ),
+                (
+                    "Set breakpoints with F9 or a click in the editor's gutter; with none, it stops at main.",
+                    TextStyle::Ui,
+                    theme.text_dim,
+                ),
+                (
+                    "F5 run / continue \u{b7} F10 step over \u{b7} F11 step into \u{b7} Shift+F11 step out \u{b7} Shift+F5 stop",
+                    TextStyle::UiSmall,
+                    theme.text_dim,
+                ),
+            ],
+            _ => vec![
+                ("Waiting for the program to stop\u{2026}", TextStyle::UiBold, theme.text),
+                (
+                    "Data appears at a breakpoint. Pause stops it where it is.",
+                    TextStyle::Ui,
+                    theme.text_dim,
+                ),
+            ],
+        };
+        let r = self.canvas;
+        let mut y = r.y + r.h / 2.0 - 48.0;
+        for (text, style, color) in lines {
+            let w = d.text_system().measure(style, text).min(r.w - 32.0);
+            d.text(
+                style,
+                text,
+                RectF::new(r.x + ((r.w - w) / 2.0).max(16.0), y, w + 4.0, 24.0),
+                color,
+            );
+            y += 26.0;
+        }
+    }
+
     fn paint_empty(&self, d: &mut DrawCtx, theme: &Theme) {
         let (title, body) = if self.graphs.is_empty() {
             (
@@ -527,7 +808,7 @@ impl Visualizer {
             (
                 "Nothing to show".to_string(),
                 format!(
-                    "All {} nodes are hidden. Turn on Library, Generated or Locals & types.",
+                    "All {} nodes are hidden. Turn on Library, Generated or Locals.",
                     self.view.model().hidden
                 ),
             )
@@ -554,6 +835,16 @@ impl Visualizer {
         }
     }
 
+    fn leave_canvas(&mut self, cx: &mut Cx) {
+        if self.mode == Mode::Data {
+            let r = self.data.pointer_leave();
+            self.apply_data(r, cx);
+        } else {
+            let r = self.view.pointer_leave();
+            self.apply(r, cx);
+        }
+    }
+
     fn button_at(&self, p: PointF) -> Option<Button> {
         self.buttons
             .iter()
@@ -571,22 +862,50 @@ impl Panel for Visualizer {
         self.buttons.clear();
         let y = toolbar.y + (toolbar.h - 1.0 - BUTTON_H) / 2.0;
         let mut x = toolbar.x + 10.0;
-        for b in Button::ALL {
-            if b == Button::Library {
-                x += 14.0; // separates actions from filters
+        for b in [Button::ModeGraph, Button::ModeData] {
+            let w = text.measure(TextStyle::Ui, &b.label(&self.debug)) + 2.0 * BUTTON_PAD;
+            self.buttons.push((b, RectF::new(x, y, w, BUTTON_H)));
+            x += w;
+        }
+        x += 18.0;
+        let rest: &[Button] = match self.mode {
+            Mode::Graph => &Button::GRAPH,
+            Mode::Data => &Button::DATA,
+        };
+        for &b in rest {
+            if matches!(b, Button::Library | Button::Run | Button::Stop) {
+                x += 14.0; // separates groups
             }
             let extra = if b.is_toggle() { 12.0 } else { 0.0 };
-            let w = text.measure(TextStyle::Ui, b.label()) + 2.0 * BUTTON_PAD + extra;
+            // Run/Continue keeps one width so the buttons after it stay put.
+            let label = match b {
+                Button::Run => "Continue".to_string(),
+                _ => b.label(&self.debug),
+            };
+            let w = text.measure(TextStyle::Ui, &label) + 2.0 * BUTTON_PAD + extra;
             self.buttons.push((b, RectF::new(x, y, w, BUTTON_H)));
             x += w + BUTTON_GAP;
         }
+        self.data.set_viewport(to_rect(canvas));
         self.view.set_viewport(to_rect(canvas));
     }
 
     fn paint(&mut self, d: &mut DrawCtx, theme: &Theme, _focused: bool) {
         self.bench_step();
-        self.paint_toolbar(d, theme);
         d.fill_rect(self.canvas, theme.graph_bg);
+        if self.mode == Mode::Data {
+            // Canvas first: it lays out a new stop, which the status reads.
+            if self.data.is_empty() {
+                self.paint_data_empty(d, theme);
+            } else {
+                let style = data_style(theme);
+                let data = &mut self.data;
+                d.clip(self.canvas, |d| data.paint(d, &style));
+            }
+            self.paint_toolbar(d, theme);
+            return;
+        }
+        self.paint_toolbar(d, theme);
         if self.view.model().is_empty() {
             self.paint_empty(d, theme);
             return;
@@ -605,7 +924,12 @@ impl Panel for Visualizer {
         match *e {
             Event::KeyDown { key, mods } => return self.on_key(key, mods, cx),
             Event::Char(ch @ ('+' | '=' | '-')) => {
-                self.view.zoom_by(if ch == '-' { 1.0 / 1.25 } else { 1.25 });
+                let f = if ch == '-' { 1.0 / 1.25 } else { 1.25 };
+                if self.mode == Mode::Data {
+                    self.data.zoom_by(f);
+                } else {
+                    self.view.zoom_by(f);
+                }
                 cx.repaint();
             }
             Event::MouseDown {
@@ -618,22 +942,30 @@ impl Panel for Visualizer {
                     self.press(b, cx);
                 } else if self.canvas.contains(pos) {
                     self.canvas_capture = true;
-                    let r = self.view.pointer_down(at(pos), clicks);
-                    self.apply(r, cx);
+                    if self.mode == Mode::Data {
+                        let r = self.data.pointer_down(at(pos), clicks);
+                        self.apply_data(r, cx);
+                    } else {
+                        let r = self.view.pointer_down(at(pos), clicks);
+                        self.apply(r, cx);
+                    }
                 }
             }
             Event::MouseMove { pos, left_down, .. } => {
                 if self.canvas_capture || self.canvas.contains(pos) {
-                    let r = self
-                        .view
-                        .pointer_move(at(pos), left_down && self.canvas_capture);
-                    self.apply(r, cx);
+                    let down = left_down && self.canvas_capture;
+                    if self.mode == Mode::Data {
+                        let r = self.data.pointer_move(at(pos), down);
+                        self.apply_data(r, cx);
+                    } else {
+                        let r = self.view.pointer_move(at(pos), down);
+                        self.apply(r, cx);
+                    }
                     if self.hover_button.take().is_some() {
                         cx.repaint();
                     }
                 } else {
-                    let r = self.view.pointer_leave();
-                    self.apply(r, cx);
+                    self.leave_canvas(cx);
                     let hover = self.button_at(pos);
                     if hover != self.hover_button {
                         self.hover_button = hover;
@@ -650,8 +982,13 @@ impl Panel for Visualizer {
                 ..
             } if self.canvas_capture => {
                 self.canvas_capture = false;
-                let r = self.view.pointer_up(at(pos));
-                self.apply(r, cx);
+                if self.mode == Mode::Data {
+                    let r = self.data.pointer_up(at(pos));
+                    self.apply_data(r, cx);
+                } else {
+                    let r = self.view.pointer_up(at(pos));
+                    self.apply(r, cx);
+                }
             }
             Event::Wheel {
                 pos,
@@ -659,12 +996,16 @@ impl Panel for Visualizer {
                 horizontal: false,
                 ..
             } if self.canvas.contains(pos) => {
-                let r = self.view.wheel(at(pos), lines);
-                self.apply(r, cx);
+                if self.mode == Mode::Data {
+                    let r = self.data.wheel(at(pos), lines);
+                    self.apply_data(r, cx);
+                } else {
+                    let r = self.view.wheel(at(pos), lines);
+                    self.apply(r, cx);
+                }
             }
             Event::MouseLeave => {
-                let r = self.view.pointer_leave();
-                self.apply(r, cx);
+                self.leave_canvas(cx);
                 if self.hover_button.take().is_some() {
                     cx.repaint();
                 }
@@ -730,6 +1071,27 @@ fn graph_style(t: &Theme) -> Style {
         card_bg: rgba(t.graph_card_bg),
         card_border: rgba(t.border),
         dim: t.graph_dim,
+    }
+}
+
+fn data_style(t: &Theme) -> DataStyle {
+    DataStyle {
+        canvas_bg: rgba(t.graph_bg),
+        frame_bg: rgba(t.data_frame_bg),
+        header_bg: rgba(t.data_header_bg),
+        box_bg: rgba(t.data_box_bg),
+        border: rgba(t.data_border),
+        grid_line: rgba(t.data_grid),
+        text: rgba(t.text),
+        text_dim: rgba(t.text_dim),
+        pointer: rgba(t.data_pointer),
+        cross: rgba(t.data_cross),
+        changed: rgba(t.data_changed),
+        highlight: rgba(t.accent),
+        hover: rgba(t.graph_hover),
+        chip_bg: rgba(t.graph_card_bg),
+        chip_border: rgba(t.border),
+        dim: 0.3,
     }
 }
 
