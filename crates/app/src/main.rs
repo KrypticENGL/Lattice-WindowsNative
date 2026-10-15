@@ -3,7 +3,12 @@
 //!
 //! Everything Win32 lives in [`sys`]; this file is safe Rust only.
 //!
-//! Usage: `lattice [FOLDER]` opens `FOLDER` in the Solution Explorer.
+//! Usage: `lattice [FOLDER] [--benchmark[=NODES]]`
+//!
+//! - `FOLDER` opens in the Solution Explorer.
+//! - `--benchmark` measures Visualizer frame times once the graph has
+//!   settled and writes them to the Output panel: on every object file under
+//!   `FOLDER`, or with `=NODES` (or without a folder) on a synthetic graph.
 
 // Release builds are GUI-subsystem (no console); debug builds keep a console
 // so log lines written to stderr are visible.
@@ -33,10 +38,17 @@ fn run() -> Result<i32, sys::Error> {
     // still works, it is just bitmap-scaled by the system.
     let dpi_error = sys::dpi::enable_per_monitor_v2().err();
 
-    let folder = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir());
+    let mut folder = None;
+    let mut benchmark = None;
+    for arg in std::env::args_os().skip(1) {
+        match arg.to_str() {
+            Some("--benchmark") => benchmark = Some(None),
+            Some(a) if a.starts_with("--benchmark=") => {
+                benchmark = Some(a["--benchmark=".len()..].parse::<usize>().ok());
+            }
+            _ => folder = Some(PathBuf::from(arg)).filter(|p| p.is_dir()),
+        }
+    }
     let window = MainWindow::create(APP_TITLE, folder)?;
 
     if let Some(err) = dpi_error {
@@ -54,5 +66,8 @@ fn run() -> Result<i32, sys::Error> {
     }
 
     window.show();
+    if let Some(synthetic) = benchmark {
+        window.benchmark(synthetic);
+    }
     sys::window::run_message_loop()
 }

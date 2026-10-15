@@ -115,6 +115,18 @@ impl Document {
         Ok(())
     }
 
+    /// Puts the caret at the start of `line` (1-based) and scrolls it to
+    /// about a third of the way down the view.
+    pub fn goto_line(&mut self, line: u32) {
+        let last = self.buffer.line_count().saturating_sub(1);
+        let line = (line.max(1) as usize - 1).min(last);
+        self.caret = Pos::new(line, 0);
+        self.anchor = self.caret;
+        self.preferred_x = None;
+        self.scroll = PointF::new(0.0, line as f32 * self.line_h - self.text_rect.h / 3.0);
+        self.clamp_scroll();
+    }
+
     /// Drops cached layouts (DPI change).
     pub fn clear_layouts(&mut self) {
         self.layouts.clear();

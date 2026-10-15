@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 engine = { path = "../engine" }
 notify = "8"
+renderer = { path = "../renderer" }
 vte = { workspace = true }
 windows = { workspace = true }
 windows-numerics = { workspace = true }

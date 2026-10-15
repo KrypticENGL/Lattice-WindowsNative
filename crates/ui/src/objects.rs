@@ -1,7 +1,8 @@
 //! Loads object files with the engine off the UI thread, and reloads them
 //! when they change on disk.
 //!
-//! Threads: `object-loader` runs `engine::load` for each request; the
+//! Threads: `object-loader` runs `engine::load` for each request (and walks
+//! folders for "load every object under the folder"); the
 //! `notify` watcher thread forwards file changes to it. Results return over
 //! an mpsc channel followed by `Waker::wake`, and the UI thread drains them
 //! in `Shell::on_wake`. Neither thread touches window APIs.
@@ -10,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,8 +35,22 @@ pub struct LoadResult {
     pub path: PathBuf,
     /// `true` when triggered by a change on disk.
     pub reload: bool,
+    /// Part of a folder load: summarised by [`ObjectEvent::FolderDone`]
+    /// instead of logged one by one.
+    pub quiet: bool,
     pub elapsed: Duration,
-    pub graph: Result<CodeGraph, LoadError>,
+    pub graph: Result<Arc<CodeGraph>, LoadError>,
+}
+
+pub enum ObjectEvent {
+    Loaded(LoadResult),
+    /// A folder load finished.
+    FolderDone {
+        root: PathBuf,
+        loaded: usize,
+        failed: usize,
+        elapsed: Duration,
+    },
 }
 
 pub struct LoadError {
@@ -46,12 +62,13 @@ pub struct LoadError {
 
 enum Request {
     Load(PathBuf),
+    LoadFolder(PathBuf),
     Changed(PathBuf),
 }
 
 pub struct ObjectService {
     requests: Sender<Request>,
-    results: Receiver<LoadResult>,
+    results: Receiver<ObjectEvent>,
     watcher: Option<RecommendedWatcher>,
     watched_dirs: HashSet<PathBuf>,
 }
@@ -116,12 +133,56 @@ impl ObjectService {
         }
     }
 
-    pub fn try_recv(&self) -> Option<LoadResult> {
+    /// Queues every object file under `root` (recursively, skipping hidden
+    /// folders) and watches the tree. Returns a message if watching failed.
+    pub fn load_folder(&mut self, root: &Path) -> Option<String> {
+        let _ = self.requests.send(Request::LoadFolder(root.to_path_buf()));
+        let watcher = self.watcher.as_mut()?;
+        if self.watched_dirs.contains(root) {
+            return None;
+        }
+        match watcher.watch(root, RecursiveMode::Recursive) {
+            Ok(()) => {
+                self.watched_dirs.insert(root.to_path_buf());
+                None
+            }
+            Err(e) => Some(format!("cannot watch {}: {e}", root.display())),
+        }
+    }
+
+    pub fn try_recv(&self) -> Option<ObjectEvent> {
         self.results.try_recv().ok()
     }
 }
 
-fn worker(requests: &Receiver<Request>, results: &Sender<LoadResult>, waker: &Waker) {
+/// Object files under `root`, sorted; hidden folders (`.git`, ...) skipped.
+fn find_objects(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if !name.starts_with('.') {
+                    dirs.push(entry.path());
+                }
+            } else if kind.is_file() && is_object_file(&name) {
+                found.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+fn worker(requests: &Receiver<Request>, results: &Sender<ObjectEvent>, waker: &Waker) {
     let mut loaded: HashSet<PathBuf> = HashSet::new();
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
     loop {
@@ -134,7 +195,29 @@ fn worker(requests: &Receiver<Request>, results: &Sender<LoadResult>, waker: &Wa
             Ok(Request::Load(path)) => {
                 pending.remove(&path);
                 loaded.insert(path.clone());
-                run(&path, false, results, waker);
+                run(&path, false, false, results, waker);
+            }
+            Ok(Request::LoadFolder(root)) => {
+                let start = Instant::now();
+                let (mut ok, mut failed) = (0, 0);
+                for path in find_objects(&root) {
+                    pending.remove(&path);
+                    loaded.insert(path.clone());
+                    if run(&path, false, true, results, waker) {
+                        ok += 1;
+                    } else {
+                        failed += 1;
+                    }
+                }
+                let done = ObjectEvent::FolderDone {
+                    root,
+                    loaded: ok,
+                    failed,
+                    elapsed: start.elapsed(),
+                };
+                if results.send(done).is_ok() {
+                    waker.wake();
+                }
             }
             Ok(Request::Changed(path)) => {
                 if loaded.contains(&path) {
@@ -152,17 +235,24 @@ fn worker(requests: &Receiver<Request>, results: &Sender<LoadResult>, waker: &Wa
             .collect();
         for path in due {
             pending.remove(&path);
-            run(&path, true, results, waker);
+            run(&path, true, false, results, waker);
         }
     }
 }
 
-fn run(path: &Path, reload: bool, results: &Sender<LoadResult>, waker: &Waker) {
+/// Loads one object and sends the result. Returns whether it loaded.
+fn run(
+    path: &Path,
+    reload: bool,
+    quiet: bool,
+    results: &Sender<ObjectEvent>,
+    waker: &Waker,
+) -> bool {
     let start = Instant::now();
     // The engine never panics on bad input by design; this is a backstop so
     // a bug cannot leave the row stuck at "loading".
     let graph = match panic::catch_unwind(AssertUnwindSafe(|| engine::load(path))) {
-        Ok(Ok(graph)) => Ok(graph),
+        Ok(Ok(graph)) => Ok(Arc::new(graph)),
         Ok(Err(e)) => Err(LoadError {
             reason: e.reason(),
             message: e.to_string(),
@@ -172,15 +262,18 @@ fn run(path: &Path, reload: bool, results: &Sender<LoadResult>, waker: &Waker) {
             message: format!("{}: internal error while loading", path.display()),
         }),
     };
+    let ok = graph.is_ok();
     let result = LoadResult {
         path: path.to_path_buf(),
         reload,
+        quiet,
         elapsed: start.elapsed(),
         graph,
     };
-    if results.send(result).is_ok() {
+    if results.send(ObjectEvent::Loaded(result)).is_ok() {
         waker.wake();
     }
+    ok
 }
 
 #[cfg(test)]
@@ -195,5 +288,28 @@ mod tests {
         assert!(!is_object_file("a.rs"));
         assert!(!is_object_file("objdump"));
         assert!(!is_object_file("x.out"));
+    }
+
+    #[test]
+    fn finds_objects_recursively_skipping_hidden_dirs() {
+        let root = std::env::temp_dir().join(format!("lattice-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["a/b", ".git", "c"] {
+            std::fs::create_dir_all(root.join(dir)).expect("mkdir");
+        }
+        for file in ["a/b/x.obj", "a/y.o", ".git/z.o", "c/readme.md", "top.OBJ"] {
+            std::fs::write(root.join(file), b"").expect("write");
+        }
+        let found: Vec<String> = find_objects(&root)
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .expect("under root")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, ["a/b/x.obj", "a/y.o", "top.OBJ"]);
     }
 }

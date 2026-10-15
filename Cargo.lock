@@ -264,6 +264,9 @@ dependencies = [
 [[package]]
 name = "renderer"
 version = "0.1.0"
+dependencies = [
+ "engine",
+]
 
 [[package]]
 name = "rustc-demangle"
@@ -365,6 +368,7 @@ version = "0.1.0"
 dependencies = [
  "engine",
  "notify",
+ "renderer",
  "vte",
  "windows",
  "windows-numerics",

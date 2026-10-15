@@ -8,7 +8,7 @@ use crate::editor::EditorArea;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::explorer::Explorer;
 use crate::geom::{PointF, RectF, SizeF};
-use crate::objects::{LoadResult, ObjectService};
+use crate::objects::{LoadResult, ObjectEvent, ObjectService};
 use crate::panel::{Action, Cx, Panel};
 use crate::split::{Anchor, Axis, Splitter};
 use crate::sys::dialog::{self, ComGuard};
@@ -365,6 +365,8 @@ impl Views {
             Ok(()) => cx.log(format!("Opened folder {}", path.display())),
             Err(e) => cx.log_error(format!("Could not read folder: {e}")),
         }
+        self.visualizer
+            .set_root(self.code.explorer.root_path().map(Path::to_path_buf));
         self.code.bottom.terminal.set_cwd(Some(path.to_path_buf()));
         if self.code.bottom.terminal.is_running() {
             self.code
@@ -376,15 +378,38 @@ impl Views {
         cx.repaint();
     }
 
-    /// Shows finished object loads in the Explorer and the Output panel.
+    /// Shows finished object loads in the Explorer, the Visualizer and the
+    /// Output panel.
     fn drain_objects(&mut self, cx: &mut Cx) {
-        while let Some(LoadResult {
-            path,
-            reload,
-            elapsed,
-            graph,
-        }) = self.objects.try_recv()
-        {
+        while let Some(event) = self.objects.try_recv() {
+            let LoadResult {
+                path,
+                reload,
+                quiet,
+                elapsed,
+                graph,
+            } = match event {
+                ObjectEvent::Loaded(result) => result,
+                ObjectEvent::FolderDone {
+                    root,
+                    loaded,
+                    failed,
+                    elapsed,
+                } => {
+                    self.visualizer.set_folder_loading(false);
+                    let failed = if failed > 0 {
+                        format!(", {failed} failed to load")
+                    } else {
+                        String::new()
+                    };
+                    cx.log(format!(
+                        "Loaded {loaded} object files from {}{failed} in {:.1} s",
+                        root.display(),
+                        elapsed.as_secs_f32()
+                    ));
+                    continue;
+                }
+            };
             let file = path.file_name().map_or_else(
                 || path.display().to_string(),
                 |n| n.to_string_lossy().into_owned(),
@@ -392,7 +417,16 @@ impl Views {
             let shown = self
                 .code
                 .explorer
-                .apply_object(&path, graph.as_ref().map_err(|e| e.reason.as_str()));
+                .apply_object(&path, graph.as_deref().map_err(|e| e.reason.as_str()));
+            if let Ok(g) = &graph {
+                self.visualizer.add_graph(g.clone());
+            }
+            if quiet {
+                if shown {
+                    cx.repaint();
+                }
+                continue;
+            }
             match &graph {
                 Ok(g) => {
                     // Same classification as the Explorer groups.
@@ -464,6 +498,28 @@ impl Views {
                             cx.log_error(warning);
                         }
                     }
+                    Action::LoadFolderObjects => match self.code.explorer.root_path() {
+                        Some(root) => {
+                            let root = root.to_path_buf();
+                            cx.log(format!(
+                                "Loading every object file under {}…",
+                                root.display()
+                            ));
+                            self.visualizer.set_folder_loading(true);
+                            if let Some(warning) = self.objects.load_folder(&root) {
+                                cx.log_error(warning);
+                            }
+                            cx.repaint();
+                        }
+                        None => cx.log_error("Open a folder first (Ctrl+O), then add its objects"),
+                    },
+                    Action::OpenSource { path, line } => {
+                        self.switch_tab(TopTab::Code, cx);
+                        self.code.editor.open_at(&path, line, cx);
+                        if self.code.editor.has_documents() {
+                            self.code.set_focus(Region::Editor, cx);
+                        }
+                    }
                     Action::PickFolder => match dialog::pick_folder(cx.window) {
                         Ok(Some(path)) => self.open_folder(&path, cx),
                         Ok(None) => {}
@@ -499,6 +555,7 @@ impl Shell {
         let com = ComGuard::init()?;
         let waker = Waker::new(window);
         let (objects, objects_error) = ObjectService::new(waker.clone());
+        let (visualizer, layout_error) = Visualizer::new(waker.clone());
         let mut shell = Self {
             window,
             gfx: Graphics::new(window, dpi)?,
@@ -510,7 +567,7 @@ impl Shell {
                 tab_rects: [RectF::default(); 2],
                 tab_hover: None,
                 code: CodeView::new(waker.clone()),
-                visualizer: Visualizer::default(),
+                visualizer,
                 owner: None,
                 window_focused: true,
                 objects,
@@ -525,7 +582,7 @@ impl Shell {
             "Lattice started (editor font: {})",
             shell.text.mono_family()
         ));
-        if let Some(e) = objects_error {
+        for e in [objects_error, layout_error].into_iter().flatten() {
             cx.log_error(e);
         }
         if let Some(folder) = folder {
@@ -596,12 +653,37 @@ impl Shell {
         }
     }
 
+    /// Opens the Visualizer and, once the graph has settled, measures frame
+    /// times while panning and zooming; the result goes to the Output panel.
+    /// `synthetic` picks a generated graph of that many nodes; `None` loads
+    /// every object file under the open folder instead.
+    pub fn benchmark(&mut self, synthetic: Option<usize>) -> Response {
+        let mut cx = Cx::new(&self.text, self.window);
+        self.views.switch_tab(TopTab::Visualizer, &mut cx);
+        let synthetic = match synthetic {
+            None if self.views.code.explorer.root_path().is_some() => {
+                cx.act(Action::LoadFolderObjects);
+                None
+            }
+            None => Some(crate::visualizer::SYNTHETIC_NODES),
+            n => n,
+        };
+        self.views.visualizer.queue_benchmark(synthetic, &mut cx);
+        self.views.process_actions(&mut cx);
+        Response { repaint: true }
+    }
+
     /// Background data is ready (see `WAKE_MESSAGE`).
     pub fn on_wake(&mut self) -> Response {
         self.waker.reset();
         let mut cx = Cx::new(&self.text, self.window);
         self.views.code.bottom.terminal.pump(&mut cx);
         self.views.drain_objects(&mut cx);
+        let moved = self.views.visualizer.update() | self.views.visualizer.poll();
+        if moved && self.views.tab == TopTab::Visualizer {
+            cx.repaint();
+        }
+        self.views.visualizer.start_queued_benchmark(&mut cx);
         self.views.process_actions(&mut cx);
         Response {
             repaint: cx.needs_repaint(),
@@ -625,7 +707,18 @@ impl Shell {
             .gfx
             .render(&self.text, theme.chrome_bg, |d| views.paint(d, theme));
         match frame {
-            Ok(Frame::Presented) => Response::default(),
+            Ok(Frame::Presented) => {
+                let visualizer = self.views.tab == TopTab::Visualizer;
+                if visualizer {
+                    let draw = self.gfx.last_draw_time();
+                    for line in self.views.visualizer.frame_done(draw) {
+                        self.views.code.bottom.output.push(false, &line);
+                    }
+                }
+                Response {
+                    repaint: visualizer && self.views.visualizer.wants_frame(),
+                }
+            }
             Ok(Frame::DeviceLost) => {
                 self.views
                     .code

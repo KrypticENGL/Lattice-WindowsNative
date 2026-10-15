@@ -68,6 +68,17 @@ impl EditorArea {
         }
     }
 
+    /// Opens `path` (or activates it) with the caret on `line` (1-based).
+    pub fn open_at(&mut self, path: &Path, line: u32, cx: &mut Cx) {
+        self.open(path, cx);
+        if let Some(doc) = self.docs.get_mut(self.active) {
+            if doc.path() == path {
+                doc.goto_line(line);
+                cx.repaint();
+            }
+        }
+    }
+
     /// Closes tab `i`, prompting if it has unsaved changes. Returns `false`
     /// if the user cancelled.
     fn close(&mut self, i: usize, cx: &mut Cx) -> bool {

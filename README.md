@@ -4,13 +4,15 @@ A native Windows IDE with a code-graph visualizer, written in Rust directly
 against Win32 via the [`windows`](https://crates.io/crates/windows) crate (no
 GUI framework).
 
-**Status:** Stage 3, the object-file engine. The IDE shell from stage 2 is
-unchanged: top-level **Code** and **Visualizer** tabs, and in the Code tab
-the Solution Explorer, a tabbed editor, an Output panel and a ConPTY
-terminal. Object files (`.obj`, `.o`) now expand in the Explorer into their
-functions, variables and externals, read by `crates/engine`. The engine
-reloads them automatically when they change on disk. The Visualizer tab is
-still a placeholder until stage 4.
+**Status:** Stage 4, the graph renderer. The app has two top-level tabs:
+- **Code:** the Solution Explorer, a tabbed editor, an Output panel and a
+  ConPTY terminal. Object files (`.obj`, `.o`) expand in the Explorer into
+  their functions, variables and externals, read by `crates/engine`, and
+  reload automatically when they change on disk.
+- **Visualizer:** the call and reference graph of every loaded object,
+  merged into one graph and laid out by a force simulation on a worker
+  thread. You can pan, zoom, drag, hover and select, and double-click a
+  node to open its source.
 
 ## Build
 
@@ -22,6 +24,8 @@ build tools.
 ```powershell
 cargo run -p app -- E:\some\folder   # debug build; the folder argument is optional
 cargo build -p app --release         # GUI-subsystem binary: target\release\lattice.exe
+target\release\lattice.exe --benchmark=10000          # Visualizer frame-rate benchmark on a synthetic graph
+target\release\lattice.exe E:\some\folder --benchmark # ... or on every object file under the folder
 ```
 
 Quality gates (all must pass before a stage is done):
@@ -41,6 +45,11 @@ cargo test --workspace
 | Open a file | Double-click it in the Explorer (or select it and press `Enter`) |
 | Inspect an object file | Click a `.obj` / `.o` in the Explorer. Its symbols load in the background, grouped as Functions / Variables / Externals, with `file:line` when debug info has it. Expand a function to see its parameters and locals, with their types. Standard-library code and compiler-generated symbols are in collapsed **Library** and **Compiler-generated** groups. Rebuilding the file reloads it |
 | Switch top tabs | Click **Code** / **Visualizer**, or `Ctrl+1` / `Ctrl+2` |
+| See the graph | Every object you load shows up in the **Visualizer**, merged into one graph: a call to an external in one object links to its definition in another. **Add folder objects** loads every `.obj` / `.o` under the open folder. Lime nodes are functions, teal globals, amber unresolved externals. Calls are the brighter edges; arrowheads appear when zoomed in |
+| Move around the graph | Drag empty space to pan, wheel to zoom, drag a node to move it. **Fit** (or `F`) frames everything. The arrow keys pan and `+` / `-` zoom. `Space` re-runs the layout |
+| Inspect a node | Hover for its name. Click to select: its neighbours and edges light up, everything else dims, and a card shows its kind, source location and caller/callee counts. `Esc` clears the selection. Double-click opens its source at the line, in the Code tab (needs debug info) |
+| Filter the graph | **Library** (standard library and toolchain headers), **Generated** (compiler-generated symbols) and **Locals & types** are off by default; toggling them keeps existing nodes where they are |
+| Benchmark | `Ctrl+Shift+G` loads a synthetic 10,000-node graph; `Ctrl+Shift+B` measures frame times and prints them to Output (see [`crates/renderer/DESIGN.md`](crates/renderer/DESIGN.md)) |
 | Editor | Type to edit. `Ctrl+S` save, `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+Z` redo, `Ctrl+A/C/X/V`, `Ctrl+W` close tab, `Ctrl+Tab` next tab. Shift+arrows or a mouse drag selects; double-click selects a word |
 | Terminal | Click **TERMINAL** or press `` Ctrl+` ``. `Ctrl+V` pastes; the mouse wheel scrolls the history. Press `Enter` to restart the shell after it exits |
 | Resize panes | Drag the divider between Explorer and editor, or between editor and the bottom panel |
@@ -64,7 +73,7 @@ Cargo workspace of small crates:
 | `crates/app` | Binary `lattice`: process setup, main window, message loop. It translates window messages into `ui` events |
 | `crates/ui` | The IDE shell: Direct2D/DirectWrite drawing, panels, layout, the editor buffer, the terminal emulator |
 | `crates/engine` | Object-file parsing (COFF, ELF) into a `CodeGraph`. Portable, `forbid(unsafe_code)`, no Windows dependency. See [`crates/engine/README.md`](crates/engine/README.md) for what it reads and its limits |
-| `crates/renderer` | Visualizer viewport drawing (skeleton until stage 4) |
+| `crates/renderer` | The Visualizer's graph: it merges the loaded objects into one model, runs the force layout on a worker thread, and handles the camera, hit testing, culling, level of detail and input. It draws through a `Canvas` trait. Portable, `forbid(unsafe_code)`, no Windows dependency. [`DESIGN.md`](crates/renderer/DESIGN.md) explains why it uses Direct2D rather than Direct3D and records the measured frame rates |
 
 **Unsafe boundary.** `unsafe_code` is denied across the workspace. Only
 modules named `sys` (`crates/app/src/sys/`, `crates/ui/src/sys/`) opt back
@@ -96,6 +105,11 @@ it. `app` hands the window to `ui` as an opaque `ui::NativeWindow`.
 - The editor caches one `IDWriteTextLayout` per visible line, keyed by line
   id. A line gets a new id whenever it changes. Off-screen layouts are
   evicted after each paint.
+- The graph renderer draws through `DrawCtx`, which implements
+  `renderer::Canvas`. Nodes and edges go through one `ID2D1SpriteBatch` per
+  frame, one call per style bucket: about 3 ms for 10k nodes and 24k edges.
+  The batch and its textures are device resources, rebuilt after device
+  loss.
 
 **Panels** (`ui/src/`):
 - `shell.rs` handles focus and input routing. The top strip is shared;
@@ -116,7 +130,11 @@ it. `app` hands the window to `ui` as an opaque `ui::NativeWindow`.
 
 **Threads.** Background threads never touch the window:
 - `pty-reader` and `pty-wait` serve the terminal;
-- `object-loader` runs `engine::load`;
+- `object-loader` runs `engine::load`, and walks folders for **Add folder
+  objects**;
+- `graph-layout` runs the force simulation and publishes position
+  snapshots, at most 60 a second, until the layout settles. Large graphs
+  split the repulsion step across scoped threads;
 - a `notify` watcher reports object files that change and are due a reload,
   debounced by 300 ms.
 
@@ -124,7 +142,11 @@ Each sends data over an mpsc channel and posts one coalesced `WAKE_MESSAGE`
 (`WM_APP+1`, no payload). The UI thread drains the channels in
 `Shell::on_wake`. No window or COM objects cross threads.
 
-**Known limits (stage 2).** The editor has no syntax highlighting, word
+**Known limits.** See `crates/renderer/DESIGN.md` for the Visualizer's
+limits (straight edges, linkage-name merging, hairballs on very dense
+graphs).
+
+From stage 2: the editor has no syntax highlighting, word
 wrap, IME composition window or find. The terminal has no text selection or
 copy, and wide (CJK) glyphs are not given two cells. These are candidates for
 stage 5.

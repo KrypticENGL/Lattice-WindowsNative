@@ -33,7 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_DBLCLKS,
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HTCLIENT, IDC_ARROW, IDC_HAND, IDC_IBEAM,
-    IDC_SIZENS, IDC_SIZEWE, MINMAXINFO, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+    IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE, MINMAXINFO, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
     SW_SHOWDEFAULT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
     WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
@@ -156,6 +156,12 @@ impl MainWindow {
     /// Writes a line to the Output panel.
     pub fn log(&self, error: bool, text: &str) {
         with_shell(self.hwnd, |s| s.log(error, text));
+    }
+
+    /// Starts a Visualizer benchmark (see `Shell::benchmark`).
+    pub fn benchmark(&self, synthetic: Option<usize>) {
+        let response = with_shell(self.hwnd, |s| s.benchmark(synthetic));
+        apply(self.hwnd, response);
     }
 
     pub fn show(&self) {
@@ -636,6 +642,7 @@ fn set_cursor(shape: CursorShape) {
         CursorShape::Hand => IDC_HAND,
         CursorShape::SizeWE => IDC_SIZEWE,
         CursorShape::SizeNS => IDC_SIZENS,
+        CursorShape::Move => IDC_SIZEALL,
     };
     // SAFETY: loads a shared system cursor (never freed) and sets it for
     // this thread.

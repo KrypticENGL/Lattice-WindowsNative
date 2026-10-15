@@ -16,6 +16,13 @@ pub enum Action {
     OpenFile(PathBuf),
     /// Load (or retry) an object file with the engine.
     LoadObject(PathBuf),
+    /// Load every object file under the open folder (Visualizer).
+    LoadFolderObjects,
+    /// Show a source file in the Code tab with the caret on `line` (1-based).
+    OpenSource {
+        path: PathBuf,
+        line: u32,
+    },
     PickFolder,
     Log {
         error: bool,

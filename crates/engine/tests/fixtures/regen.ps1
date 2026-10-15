@@ -33,6 +33,9 @@ try {
     if ($LASTEXITCODE) { throw 'gcc failed' }
     gcc -c -O0 -ffunction-sections -fdata-sections -o mingw_nodebug.o src/graph.c
     if ($LASTEXITCODE) { throw 'gcc failed' }
+    # Defines graph.c's external_fn (merged-graph tests in crates/renderer).
+    gcc -c -O0 -g -ffunction-sections $map -o mingw_external.o src/external.c
+    if ($LASTEXITCODE) { throw 'gcc failed' }
     # MinGW C++: vtables, typeinfo, static initialisers, .refptr cells.
     g++ -c -O0 -g -ffunction-sections $map -o mingw_cpp.o src/shapes.cpp
     if ($LASTEXITCODE) { throw 'g++ failed' }

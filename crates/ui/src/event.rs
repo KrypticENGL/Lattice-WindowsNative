@@ -129,4 +129,6 @@ pub enum CursorShape {
     Hand,
     SizeWE,
     SizeNS,
+    /// Four-way arrows: panning or dragging in the Visualizer.
+    Move,
 }
