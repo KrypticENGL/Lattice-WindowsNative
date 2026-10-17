@@ -133,6 +133,16 @@ fn read_level(dir: &Path) -> std::io::Result<Vec<(String, PathBuf, bool)>> {
     Ok(items)
 }
 
+fn entry_kind(name: &str, is_dir: bool) -> EntryKind {
+    if is_dir {
+        EntryKind::Dir
+    } else if is_object_file(name) {
+        EntryKind::Object(ObjectState::Unloaded)
+    } else {
+        EntryKind::File
+    }
+}
+
 /// `graph.c:21` from a source location (file name only, to keep rows short).
 fn short_location(file: &str, line: u32) -> String {
     let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
@@ -176,13 +186,7 @@ impl Explorer {
         let mut children = Vec::new();
         if let Ok(items) = &items {
             for (name, path, is_dir) in items {
-                let kind = if *is_dir {
-                    EntryKind::Dir
-                } else if is_object_file(name) {
-                    EntryKind::Object(ObjectState::Unloaded)
-                } else {
-                    EntryKind::File
-                };
+                let kind = entry_kind(name, *is_dir);
                 children.push(self.entries.len());
                 self.entries
                     .push(Entry::new(name.clone(), path.clone(), kind, depth));
@@ -190,6 +194,65 @@ impl Explorer {
         }
         self.entries[idx].children = Some(children);
         items.map(|_| ())
+    }
+
+    /// Re-reads loaded folders after changes on disk: `dirs`, or every
+    /// loaded folder when `None`. Entries still on disk keep their state
+    /// (expansion, loaded symbols); new ones are added and removed ones
+    /// dropped. Returns whether the tree changed.
+    pub fn refresh(&mut self, dirs: Option<&HashSet<PathBuf>>) -> bool {
+        let targets: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.kind == EntryKind::Dir
+                    && e.children.is_some()
+                    && dirs.is_none_or(|d| d.contains(&e.path))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let mut changed = false;
+        for idx in targets {
+            changed |= self.refresh_dir(idx);
+        }
+        if changed {
+            self.compact();
+            self.rebuild_rows();
+            self.clamp_scroll();
+        }
+        changed
+    }
+
+    /// Re-reads one loaded folder; unreachable old entries are left for
+    /// `compact`. A folder that can no longer be read is left as it is: its
+    /// parent's refresh drops it if it was removed.
+    fn refresh_dir(&mut self, idx: usize) -> bool {
+        let Ok(items) = read_level(&self.entries[idx].path) else {
+            return false;
+        };
+        let old = self.entries[idx].children.clone().unwrap_or_default();
+        let depth = self.entries[idx].depth + 1;
+        let mut children = Vec::with_capacity(items.len());
+        for (name, path, is_dir) in items {
+            let kind = entry_kind(&name, is_dir);
+            let existing = old.iter().copied().find(|&c| {
+                let e = &self.entries[c];
+                e.name == name && std::mem::discriminant(&e.kind) == std::mem::discriminant(&kind)
+            });
+            match existing {
+                Some(c) => children.push(c),
+                None => {
+                    children.push(self.entries.len());
+                    self.entries.push(Entry::new(name, path, kind, depth));
+                }
+            }
+        }
+        if children == old {
+            return false;
+        }
+        self.entries[idx].children = Some(children);
+        true
     }
 
     fn rebuild_rows(&mut self) {
@@ -786,6 +849,39 @@ mod tests {
         ex.rebuild_rows();
         assert_eq!(names(&ex), ["src", "inner", "main.rs", "A.md", "b.txt"]);
         assert_eq!(ex.parent_row(2), Some(0));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn refresh_follows_disk_and_keeps_state() {
+        let root = temp_dir("refresh");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "").unwrap();
+        std::fs::write(root.join("old.txt"), "").unwrap();
+
+        let mut ex = Explorer::default();
+        ex.set_root(&root).unwrap();
+        let src = ex.rows[0];
+        ex.load_children(src).unwrap();
+        ex.entries[src].expanded = true;
+        ex.rebuild_rows();
+        ex.selected = Some(ex.rows[1]);
+        assert_eq!(names(&ex), ["src", "a.rs", "old.txt"]);
+        assert!(!ex.refresh(None));
+
+        std::fs::write(root.join("src/b.rs"), "").unwrap();
+        std::fs::remove_file(root.join("old.txt")).unwrap();
+        std::fs::create_dir(root.join("docs")).unwrap();
+        let dirs = HashSet::from([root.clone(), root.join("src")]);
+        assert!(ex.refresh(Some(&dirs)));
+        // `src` stays open and `a.rs` stays selected.
+        assert_eq!(names(&ex), ["docs", "src", "a.rs", "b.rs"]);
+        assert_eq!(
+            ex.selected.map(|s| ex.entries[s].name.as_str()),
+            Some("a.rs")
+        );
+        assert_eq!(ex.entries.len(), 5);
 
         std::fs::remove_dir_all(&root).unwrap();
     }

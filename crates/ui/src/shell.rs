@@ -8,6 +8,7 @@ use crate::debug::{self, Debug, Phase, Update};
 use crate::editor::EditorArea;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::explorer::Explorer;
+use crate::folder_watch::{Changes, FolderWatcher};
 use crate::geom::{PointF, RectF, SizeF};
 use crate::objects::{LoadResult, ObjectEvent, ObjectService};
 use crate::panel::{Action, Cx, DebugAction, Panel};
@@ -206,6 +207,7 @@ struct Views {
     owner: Option<MouseOwner>,
     window_focused: bool,
     objects: ObjectService,
+    folders: FolderWatcher,
     debug: Debug,
 }
 
@@ -476,6 +478,9 @@ impl Views {
             Ok(()) => cx.log(format!("Opened folder {}", path.display())),
             Err(e) => cx.log_error(format!("Could not read folder: {e}")),
         }
+        if let Some(warning) = self.folders.set_root(path) {
+            cx.log_error(warning);
+        }
         self.visualizer
             .set_root(self.code.explorer.root_path().map(Path::to_path_buf));
         self.code.bottom.terminal.set_cwd(Some(path.to_path_buf()));
@@ -487,6 +492,19 @@ impl Views {
         }
         self.code.set_focus(Region::Explorer, cx);
         cx.repaint();
+    }
+
+    /// Brings the Explorer up to date with changes in the open folder.
+    fn drain_folders(&mut self, cx: &mut Cx) {
+        while let Some(changes) = self.folders.try_recv() {
+            let dirs = match &changes {
+                Changes::Dirs(dirs) => Some(dirs),
+                Changes::All => None,
+            };
+            if self.code.explorer.refresh(dirs) {
+                cx.repaint();
+            }
+        }
     }
 
     /// Shows finished object loads in the Explorer, the Visualizer and the
@@ -671,6 +689,7 @@ impl Shell {
         let waker = Waker::new(window);
         let (objects, objects_error) = ObjectService::new(waker.clone());
         let (visualizer, layout_error) = Visualizer::new(waker.clone());
+        let (folders, folders_error) = FolderWatcher::new(waker.clone());
         let mut shell = Self {
             window,
             gfx: Graphics::new(window, dpi)?,
@@ -686,6 +705,7 @@ impl Shell {
                 owner: None,
                 window_focused: true,
                 objects,
+                folders,
                 debug: Debug::new(waker.clone()),
             },
             waker,
@@ -698,7 +718,10 @@ impl Shell {
             "Lattice started (editor font: {})",
             shell.text.mono_family()
         ));
-        for e in [objects_error, layout_error].into_iter().flatten() {
+        for e in [objects_error, layout_error, folders_error]
+            .into_iter()
+            .flatten()
+        {
             cx.log_error(e);
         }
         if let Some(folder) = folder {
@@ -794,6 +817,7 @@ impl Shell {
         self.waker.reset();
         let mut cx = Cx::new(&self.text, self.window);
         self.views.code.bottom.terminal.pump(&mut cx);
+        self.views.drain_folders(&mut cx);
         self.views.drain_objects(&mut cx);
         self.views.drain_debug(&mut cx);
         let moved = self.views.visualizer.update() | self.views.visualizer.poll();

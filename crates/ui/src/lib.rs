@@ -11,6 +11,7 @@ mod editor;
 mod error;
 pub mod event;
 mod explorer;
+mod folder_watch;
 pub mod geom;
 mod objects;
 mod output;
