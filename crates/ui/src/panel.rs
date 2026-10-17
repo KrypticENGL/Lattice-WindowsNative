@@ -46,6 +46,9 @@ pub enum Action {
 pub enum DebugAction {
     /// Start the program, or continue it when stopped.
     Run,
+    /// Start or stop stepping through the program on its own (starting it
+    /// if it is not running).
+    Play,
     Pause,
     Step(debugger::Command),
     Stop,

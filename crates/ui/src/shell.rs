@@ -267,6 +267,7 @@ impl Views {
                 .program()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
             stopped: self.debug.stop_description(),
+            playing: self.debug.is_playing(),
         });
         // The Source panel follows the frame focused in the Data view.
         let target = self.panes.visualizer.code_target();
@@ -603,6 +604,7 @@ impl Views {
         if !mods.ctrl && !mods.alt {
             let action = match key {
                 Key::F(5) if mods.shift => Some(DebugAction::Stop),
+                Key::F(6) => Some(DebugAction::Play),
                 Key::F(5) => Some(DebugAction::Run),
                 Key::F(10) => Some(DebugAction::Step(debugger::Command::Next)),
                 Key::F(11) if mods.shift => Some(DebugAction::Step(debugger::Command::Finish)),
@@ -640,8 +642,23 @@ impl Views {
 
     fn debug_action(&mut self, a: DebugAction, cx: &mut Cx) {
         match a {
+            DebugAction::Play => {
+                if self.debug.is_playing() {
+                    self.debug.set_playing(false);
+                } else {
+                    if self.debug.phase() == Phase::Idle {
+                        self.debug_action(DebugAction::Run, cx);
+                    }
+                    if self.debug.is_active() {
+                        self.debug.set_playing(true);
+                    }
+                }
+            }
             DebugAction::Run => match self.debug.phase() {
-                Phase::Stopped => self.debug.command(debugger::Command::Continue, cx),
+                Phase::Stopped => {
+                    self.debug.set_playing(false);
+                    self.debug.command(debugger::Command::Continue, cx);
+                }
                 Phase::Idle => {
                     if self.debug.program().is_none() {
                         // `foo.exe` next to the open `foo.cpp`, else ask.
@@ -667,8 +684,14 @@ impl Views {
                 }
                 Phase::Starting | Phase::Running => {}
             },
-            DebugAction::Pause => self.debug.command(debugger::Command::Interrupt, cx),
-            DebugAction::Step(c) => self.debug.command(c, cx),
+            DebugAction::Pause => {
+                self.debug.set_playing(false);
+                self.debug.command(debugger::Command::Interrupt, cx);
+            }
+            DebugAction::Step(c) => {
+                self.debug.set_playing(false);
+                self.debug.command(c, cx);
+            }
             DebugAction::Stop => {
                 if self.debug.is_active() {
                     self.debug.stop(cx);
@@ -1093,6 +1116,7 @@ impl Shell {
         self.views.drain_folders(&mut cx);
         self.views.drain_objects(&mut cx);
         self.views.drain_debug(&mut cx);
+        self.views.debug.tick_play(&mut cx);
         let v = &mut self.views.panes.visualizer;
         let moved = v.update() | v.poll();
         if moved && self.views.visualizer_shown() {

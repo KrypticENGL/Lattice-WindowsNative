@@ -4,15 +4,23 @@
 //! The session itself (`crates/debugger`) runs GDB on its own threads and
 //! wakes the UI thread; [`Debug::drain`] turns its events into Output lines
 //! and [`Update`]s for the Visualizer and the editor.
+//!
+//! Play steps the program on its own: one step per [`PLAY_STEP`] after each
+//! stop's snapshot arrives, into the user's functions and back out of
+//! library code, until the program ends or the user pauses.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use debugger::{Command, DebugEvent, Session, Snapshot, StartConfig, StopReason};
 
 use crate::panel::Cx;
 use crate::sys::Waker;
+
+/// How long Play shows each line before the next step.
+pub const PLAY_STEP: Duration = Duration::from_millis(600);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Phase {
@@ -46,6 +54,13 @@ pub struct Debug {
     breakpoints: BTreeMap<String, (PathBuf, BTreeSet<u32>)>,
     stopped_at: Option<(PathBuf, u32)>,
     stopped_in: String,
+    /// Play is on.
+    playing: bool,
+    /// When Play takes its next step: set once the stop's snapshot is in.
+    play_at: Option<Instant>,
+    /// The toolchain's install prefix (gdb's `bin\..`); sources under it
+    /// are library code that Play steps out of.
+    toolchain: Option<PathBuf>,
 }
 
 impl Debug {
@@ -58,7 +73,53 @@ impl Debug {
             breakpoints: BTreeMap::new(),
             stopped_at: None,
             stopped_in: String::new(),
+            playing: false,
+            play_at: None,
+            toolchain: None,
         }
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    /// Turns Play on or off. On while stopped, the next step is due now.
+    pub fn set_playing(&mut self, on: bool) {
+        self.playing = on;
+        self.play_at = None;
+        if on && self.phase == Phase::Stopped {
+            self.schedule_play(Duration::ZERO);
+        }
+    }
+
+    fn schedule_play(&mut self, delay: Duration) {
+        self.play_at = Some(Instant::now() + delay);
+        let waker = self.waker.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            waker.wake();
+        });
+    }
+
+    /// Takes Play's next step if it is due. Called on every wake.
+    pub fn tick_play(&mut self, cx: &mut Cx) {
+        let due = self.play_at.is_some_and(|t| Instant::now() >= t);
+        if !(self.playing && due && self.phase == Phase::Stopped) {
+            return;
+        }
+        self.play_at = None;
+        let library = self
+            .stopped_at
+            .as_ref()
+            .is_none_or(|(file, _)| is_library(file, self.toolchain.as_deref()));
+        self.command(
+            if library {
+                Command::Finish
+            } else {
+                Command::Step
+            },
+            cx,
+        );
     }
 
     pub fn phase(&self) -> Phase {
@@ -158,6 +219,8 @@ impl Debug {
                 self.session = Some(s);
                 self.phase = Phase::Starting;
                 self.stopped_at = None;
+                self.play_at = None;
+                self.toolchain = gdb.parent().and_then(Path::parent).map(Path::to_path_buf);
             }
             Err(e) => cx.log_error(format!("Could not start the debugger: {e}")),
         }
@@ -187,6 +250,8 @@ impl Debug {
         }
         self.phase = Phase::Idle;
         self.stopped_at = None;
+        self.playing = false;
+        self.play_at = None;
         cx.repaint();
     }
 
@@ -240,8 +305,16 @@ impl Debug {
                         ));
                     }
                     out.push(Update::Snapshot(Box::new(snap)));
+                    if self.playing {
+                        self.schedule_play(PLAY_STEP);
+                    }
                 }
-                DebugEvent::Snapshot(Err(e)) => cx.log_error(format!("Data view: {e}")),
+                DebugEvent::Snapshot(Err(e)) => {
+                    cx.log_error(format!("Data view: {e}"));
+                    if self.playing {
+                        self.schedule_play(PLAY_STEP);
+                    }
+                }
                 DebugEvent::Exited(code) => {
                     match code {
                         Some(c) => cx.log(format!("Program exited with code {c}")),
@@ -250,7 +323,15 @@ impl Debug {
                     ended = true;
                 }
                 DebugEvent::Output(text) => cx.log(text),
-                DebugEvent::Error(msg) => cx.log_error(format!("GDB: {msg}")),
+                DebugEvent::Error(msg) => {
+                    cx.log_error(format!("GDB: {msg}"));
+                    // A refused step would leave Play waiting forever.
+                    if self.playing {
+                        self.playing = false;
+                        self.play_at = None;
+                        cx.log("Play stopped");
+                    }
+                }
                 DebugEvent::Ended => {
                     if self.phase != Phase::Idle {
                         cx.log("GDB exited");
@@ -265,6 +346,8 @@ impl Debug {
             }
             self.phase = Phase::Idle;
             self.stopped_at = None;
+            self.playing = false;
+            self.play_at = None;
             out.push(Update::Ended);
         }
         if !out.is_empty() {
@@ -283,6 +366,16 @@ pub fn path_key(p: &Path) -> String {
     } else {
         s
     }
+}
+
+/// Source that Play steps out of rather than into: missing files (no
+/// source to show) and anything under the toolchain, such as libstdc++'s
+/// headers.
+fn is_library(file: &Path, toolchain: Option<&Path>) -> bool {
+    if !file.is_file() {
+        return true;
+    }
+    toolchain.is_some_and(|t| path_key(file).starts_with(&(path_key(t) + "\\")))
 }
 
 /// The program for a source file: `foo.exe` next to `foo.c` / `foo.cpp`.
@@ -308,6 +401,23 @@ mod tests {
             );
         }
         assert_ne!(path_key(Path::new("a.cpp")), path_key(Path::new("b.cpp")));
+    }
+
+    #[test]
+    fn toolchain_sources_are_library_code() {
+        let dir = std::env::temp_dir().join(format!("lattice-lib-{}", std::process::id()));
+        let tc = dir.join("ucrt64");
+        let header = tc.join("include").join("vector");
+        let user = dir.join("ucrt64-app").join("main.cpp");
+        std::fs::create_dir_all(header.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::write(&header, "").unwrap();
+        std::fs::write(&user, "").unwrap();
+        assert!(is_library(&header, Some(&tc)));
+        assert!(!is_library(&user, Some(&tc)));
+        assert!(!is_library(&user, None));
+        assert!(is_library(&dir.join("gone.cpp"), Some(&tc)));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

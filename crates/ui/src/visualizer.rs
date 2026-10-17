@@ -57,6 +57,8 @@ pub struct DebugStatus {
     pub program: Option<String>,
     /// `func at file:line` while stopped.
     pub stopped: Option<String>,
+    /// Play is stepping through the program.
+    pub playing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +75,7 @@ enum Button {
     Stack,
     Program,
     Run,
+    Play,
     Pause,
     StepOver,
     StepInto,
@@ -89,9 +92,10 @@ impl Button {
         Self::Generated,
         Self::Locals,
     ];
-    const DATA: [Self; 10] = [
+    const DATA: [Self; 11] = [
         Self::Program,
         Self::Run,
+        Self::Play,
         Self::Pause,
         Self::StepOver,
         Self::StepInto,
@@ -122,6 +126,8 @@ impl Button {
                 Phase::Stopped => "Continue".into(),
                 _ => "Run".into(),
             },
+            Self::Play if debug.playing => "Playing\u{2026}".into(),
+            Self::Play => "Play".into(),
             Self::Pause => "Pause".into(),
             Self::StepOver => "Step over".into(),
             Self::StepInto => "Step into".into(),
@@ -144,6 +150,7 @@ impl Button {
     fn enabled(self, debug: &DebugStatus) -> bool {
         match self {
             Self::Run => matches!(debug.phase, Phase::Idle | Phase::Stopped),
+            Self::Play => debug.playing || matches!(debug.phase, Phase::Idle | Phase::Stopped),
             Self::Pause => debug.phase == Phase::Running,
             Self::StepOver | Self::StepInto | Self::StepOut => debug.phase == Phase::Stopped,
             Self::Stop => debug.phase != Phase::Idle,
@@ -492,6 +499,7 @@ impl Visualizer {
             Button::Locals => self.filter.locals,
             Button::Source => self.show_code,
             Button::Stack => self.show_stack,
+            Button::Play => self.debug.playing,
             _ => false,
         }
     }
@@ -505,6 +513,7 @@ impl Visualizer {
             Button::ModeData => self.set_mode(Mode::Data, cx),
             Button::Program => cx.act(Action::Debug(DebugAction::PickProgram)),
             Button::Run => cx.act(Action::Debug(DebugAction::Run)),
+            Button::Play => cx.act(Action::Debug(DebugAction::Play)),
             Button::Pause => cx.act(Action::Debug(DebugAction::Pause)),
             Button::StepOver => cx.act(Action::Debug(DebugAction::Step(debugger::Command::Next))),
             Button::StepInto => cx.act(Action::Debug(DebugAction::Step(debugger::Command::Step))),
@@ -622,6 +631,12 @@ impl Visualizer {
     fn status(&self) -> String {
         if self.mode == Mode::Data {
             let mut s = match (self.debug.phase, &self.debug.stopped) {
+                (Phase::Running | Phase::Stopped, _) if self.debug.playing => {
+                    match &self.debug.stopped {
+                        Some(at) => format!("playing \u{b7} {at}"),
+                        None => "playing\u{2026}".to_string(),
+                    }
+                }
                 (Phase::Idle, _) => "not running".to_string(),
                 (Phase::Starting, _) => "starting\u{2026}".to_string(),
                 (Phase::Running, _) => "running\u{2026}".to_string(),
@@ -821,7 +836,7 @@ impl Visualizer {
                     theme.text_dim,
                 ),
                 (
-                    "F5 run / continue \u{b7} F10 step over \u{b7} F11 step into \u{b7} Shift+F11 step out \u{b7} Shift+F5 stop",
+                    "F5 run / continue \u{b7} F6 play \u{b7} F10 step over \u{b7} F11 step into \u{b7} Shift+F11 step out \u{b7} Shift+F5 stop",
                     TextStyle::UiSmall,
                     theme.text_dim,
                 ),
@@ -936,6 +951,7 @@ impl Panel for Visualizer {
             // Run/Continue keeps one width so the buttons after it stay put.
             let label = match b {
                 Button::Run => "Continue".to_string(),
+                Button::Play => "Playing\u{2026}".to_string(),
                 _ => b.label(&self.debug),
             };
             let w = text.measure(TextStyle::Ui, &label) + 2.0 * BUTTON_PAD + extra;
