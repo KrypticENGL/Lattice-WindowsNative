@@ -84,6 +84,8 @@ pub struct DataView {
     follow: bool,
     hover: Option<usize>,
     focus_key: Option<String>,
+    /// Centre the focused box once the pending layout is built.
+    reveal: bool,
     gesture: Gesture,
     /// The program is running: the data shown is from the last stop.
     stale: bool,
@@ -106,6 +108,7 @@ impl DataView {
             follow: true,
             hover: None,
             focus_key: None,
+            reveal: false,
             gesture: Gesture::None,
             stale: false,
         }
@@ -197,6 +200,37 @@ impl DataView {
         self.focus_key.take().is_some()
     }
 
+    /// Focuses the box of `snapshot.frames[i]` and centres it, at a
+    /// readable zoom. Stepping then keeps the camera where it is.
+    pub fn reveal_frame(&mut self, i: usize) {
+        self.focus_key = Some(format!("frame:{i}"));
+        self.follow = false;
+        self.reveal = true;
+        if !self.dirty {
+            self.center_focus();
+        }
+    }
+
+    /// The frame whose box has the focus (an index into
+    /// `snapshot.frames`).
+    pub fn focused_frame(&self) -> Option<usize> {
+        self.focus_key
+            .as_deref()?
+            .strip_prefix("frame:")?
+            .parse()
+            .ok()
+    }
+
+    fn center_focus(&mut self) {
+        self.reveal = false;
+        let (Some(b), Some(l)) = (self.focus(), &self.layout) else {
+            return;
+        };
+        let at = outline(&l.boxes[b]).center();
+        let zoom = self.camera.zoom().max(READABLE_ZOOM);
+        self.camera.look_at(at, zoom);
+    }
+
     fn focus(&self) -> Option<usize> {
         let l = self.layout.as_ref()?;
         l.find(self.focus_key.as_deref()?)
@@ -229,6 +263,8 @@ impl DataView {
         }
         if self.follow {
             self.frame();
+        } else if self.reveal {
+            self.center_focus();
         }
     }
 
@@ -784,6 +820,37 @@ mod tests {
         assert_eq!(v.camera, moved, "stepping keeps the user's camera");
         v.fit();
         assert_eq!(v.camera, framed);
+    }
+
+    #[test]
+    fn revealing_a_frame_focuses_and_centres_it() {
+        let mut v = view();
+        v.set_snapshot(snap(1));
+        // Before the first paint the layout is pending; it is centred then.
+        v.reveal_frame(0);
+        v.paint(&mut Recorder::default(), &style());
+        assert_eq!(v.focused_frame(), Some(0));
+        let b = outline(&v.layout().unwrap().boxes[0]).center();
+        let on_screen = v.camera.to_screen(b);
+        let mid = Rect::new(0.0, 0.0, 1000.0, 700.0).center();
+        assert!((on_screen - mid).length() < 1e-3);
+        assert!(v.zoom() >= READABLE_ZOOM);
+
+        // A later stop keeps the camera and the focus.
+        let cam = v.camera;
+        v.set_snapshot(snap(2));
+        v.paint(&mut Recorder::default(), &style());
+        assert_eq!(v.camera, cam);
+        assert_eq!(v.focused_frame(), Some(0));
+
+        // Focusing an object box is not a frame.
+        let l = v.layout().unwrap();
+        let screen = v
+            .camera
+            .to_screen(l.boxes[l.find("a").unwrap()].rect.center());
+        v.pointer_down(screen, 1);
+        v.pointer_up(screen);
+        assert_eq!(v.focused_frame(), None);
     }
 
     #[test]

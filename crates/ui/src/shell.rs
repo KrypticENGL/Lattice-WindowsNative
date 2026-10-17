@@ -278,6 +278,8 @@ impl Views {
         );
         let debug = &self.debug;
         self.code.editor.set_marks(|p| debug.marks_for(p));
+        self.visualizer
+            .set_code_breakpoints(|p| debug.marks_for(p).0);
         match self.tab {
             TopTab::Code => self.code.paint(d, theme, self.window_focused),
             TopTab::Visualizer => self.visualizer.paint(d, theme, self.window_focused),

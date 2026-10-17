@@ -6,6 +6,8 @@
 //! Win32/COM calls live in the private `sys` module.
 
 mod bottom;
+mod callstack;
+mod codepane;
 mod debug;
 mod editor;
 mod error;
