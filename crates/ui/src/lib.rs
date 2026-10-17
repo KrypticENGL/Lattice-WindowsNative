@@ -18,6 +18,8 @@ pub mod geom;
 mod objects;
 mod output;
 mod panel;
+mod playbar;
+mod replay;
 mod shell;
 mod sys;
 mod terminal;

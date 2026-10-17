@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::callstack::CallStack;
 use crate::codepane::CodePane;
@@ -16,6 +17,7 @@ use crate::geom::{PointF, RectF, SizeF};
 use crate::objects::{LoadResult, ObjectEvent, ObjectService};
 use crate::output::Output;
 use crate::panel::{Action, Cx, DebugAction, Panel};
+use crate::replay::{self, Replay, ReplayAction};
 use crate::sys::dialog::{self, ComGuard};
 use crate::sys::gfx::{DrawCtx, Frame, Graphics};
 use crate::sys::text::{TextStyle, TextSystem};
@@ -170,6 +172,10 @@ struct Views {
     objects: ObjectService,
     folders: FolderWatcher,
     debug: Debug,
+    /// The last recorded run, played back in the Data view.
+    replay: Option<Replay>,
+    /// Times the replay's steps.
+    waker: Waker,
 }
 
 impl Views {
@@ -267,7 +273,8 @@ impl Views {
                 .program()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
             stopped: self.debug.stop_description(),
-            playing: self.debug.is_playing(),
+            recording: self.debug.recording(),
+            replay: self.replay.as_ref().map(Replay::status),
         });
         // The Source panel follows the frame focused in the Data view.
         let target = self.panes.visualizer.code_target();
@@ -382,7 +389,7 @@ impl Views {
         p.editor.set_marks(|path| debug.marks_for(path));
         let lines = p.source.path().map(|path| debug.marks_for(path).0);
         p.source.set_breakpoints(lines.unwrap_or_default());
-        let stale = debug.phase() != Phase::Stopped;
+        let stale = debug.phase() != Phase::Stopped && self.replay.is_none();
         p.source.set_stale(stale);
         p.stack.set_view(p.visualizer.focused_frame(), stale);
 
@@ -642,56 +649,20 @@ impl Views {
 
     fn debug_action(&mut self, a: DebugAction, cx: &mut Cx) {
         match a {
-            DebugAction::Play => {
-                if self.debug.is_playing() {
-                    self.debug.set_playing(false);
-                } else {
-                    if self.debug.phase() == Phase::Idle {
-                        self.debug_action(DebugAction::Run, cx);
-                    }
-                    if self.debug.is_active() {
-                        self.debug.set_playing(true);
-                    }
-                }
-            }
+            DebugAction::Play => self.replay_action(ReplayAction::Toggle, cx),
             DebugAction::Run => match self.debug.phase() {
-                Phase::Stopped => {
-                    self.debug.set_playing(false);
-                    self.debug.command(debugger::Command::Continue, cx);
-                }
+                Phase::Stopped => self.debug.command(debugger::Command::Continue, cx),
                 Phase::Idle => {
-                    if self.debug.program().is_none() {
-                        // `foo.exe` next to the open `foo.cpp`, else ask.
-                        let guess = self
-                            .panes
-                            .editor
-                            .caret_location()
-                            .and_then(|(p, _)| debug::program_for_source(&p));
-                        match guess {
-                            Some(p) => self.debug.set_program(p),
-                            None => {
-                                if !self.pick_program(cx) {
-                                    return;
-                                }
-                            }
-                        }
+                    if !self.ensure_program(cx) {
+                        return;
                     }
-                    self.panes.visualizer.clear_data();
-                    self.panes.visualizer.set_mode(Mode::Data, cx);
-                    self.panes.stack.clear();
-                    self.panes.source.clear();
+                    self.clear_data_view(cx);
                     self.debug.start(cx);
                 }
                 Phase::Starting | Phase::Running => {}
             },
-            DebugAction::Pause => {
-                self.debug.set_playing(false);
-                self.debug.command(debugger::Command::Interrupt, cx);
-            }
-            DebugAction::Step(c) => {
-                self.debug.set_playing(false);
-                self.debug.command(c, cx);
-            }
+            DebugAction::Pause => self.debug.command(debugger::Command::Interrupt, cx),
+            DebugAction::Step(c) => self.debug.command(c, cx),
             DebugAction::Stop => {
                 if self.debug.is_active() {
                     self.debug.stop(cx);
@@ -703,6 +674,93 @@ impl Views {
             }
         }
         cx.repaint();
+    }
+
+    /// Makes sure a program is chosen: `foo.exe` next to the open
+    /// `foo.cpp`, else ask. `false` if cancelled.
+    fn ensure_program(&mut self, cx: &mut Cx) -> bool {
+        if self.debug.program().is_some() {
+            return true;
+        }
+        let guess = self
+            .panes
+            .editor
+            .caret_location()
+            .and_then(|(p, _)| debug::program_for_source(&p));
+        match guess {
+            Some(p) => {
+                self.debug.set_program(p);
+                true
+            }
+            None => self.pick_program(cx),
+        }
+    }
+
+    /// Empties the Data view, Source and Call stack for a new run, and
+    /// drops the replay.
+    fn clear_data_view(&mut self, cx: &mut Cx) {
+        self.replay = None;
+        let p = &mut self.panes;
+        p.visualizer.clear_data();
+        p.visualizer.set_mode(Mode::Data, cx);
+        p.stack.clear();
+        p.source.clear();
+    }
+
+    /// Play bar commands. With no replay (or on Record), records the
+    /// program first; playback starts when the recording is done.
+    fn replay_action(&mut self, a: ReplayAction, cx: &mut Cx) {
+        if self.debug.recording().is_some() {
+            return;
+        }
+        let now = Instant::now();
+        match (&mut self.replay, a) {
+            (Some(r), a) if a != ReplayAction::Record => {
+                if r.apply(a, now) {
+                    self.show_replay_step();
+                }
+                self.schedule_replay(now);
+            }
+            _ => {
+                if !self.ensure_program(cx) {
+                    return;
+                }
+                self.clear_data_view(cx);
+                self.debug.record(cx);
+            }
+        }
+        cx.repaint();
+    }
+
+    /// Shows the replay's current step in the Data view, Source and Call
+    /// stack.
+    fn show_replay_step(&mut self) {
+        let Some(r) = &self.replay else {
+            return;
+        };
+        let snap = r.snapshot().clone();
+        let p = &mut self.panes;
+        p.stack.set_frames(&snap.frames);
+        p.visualizer.set_snapshot(snap);
+        p.source.show(p.visualizer.code_target());
+        p.source.stopped();
+    }
+
+    /// Wakes the UI thread when the replay's next step is due.
+    fn schedule_replay(&self, now: Instant) {
+        if let Some(d) = self.replay.as_ref().and_then(|r| r.next_due(now)) {
+            replay::wake_after(&self.waker, d);
+        }
+    }
+
+    /// Advances a playing replay whose step is due.
+    fn tick_replay(&mut self, cx: &mut Cx) {
+        let now = Instant::now();
+        if self.replay.as_mut().is_some_and(|r| r.tick(now)) {
+            self.show_replay_step();
+            self.schedule_replay(now);
+            cx.repaint();
+        }
     }
 
     /// Asks for the program to debug. `false` if cancelled.
@@ -745,6 +803,17 @@ impl Views {
                     p.source.stopped();
                 }
                 Update::Ended => self.panes.visualizer.set_data_stale(true),
+                Update::Recording => {}
+                Update::Recorded(steps) => {
+                    let now = Instant::now();
+                    self.replay = Replay::new(steps, now);
+                    if self.replay.is_some() {
+                        self.show_replay_step();
+                        self.schedule_replay(now);
+                    } else {
+                        cx.log_error("Nothing to replay: no line of the program was recorded");
+                    }
+                }
             }
         }
     }
@@ -924,6 +993,7 @@ impl Views {
                         }
                     }
                     Action::Debug(a) => self.debug_action(a, cx),
+                    Action::Replay(a) => self.replay_action(a, cx),
                     Action::ToggleBreakpoint { path, line } => {
                         self.debug.toggle_breakpoint(&path, line, cx);
                     }
@@ -1000,6 +1070,8 @@ impl Shell {
                 objects,
                 folders,
                 debug: Debug::new(waker.clone()),
+                replay: None,
+                waker: waker.clone(),
             },
             waker,
             cursor: CursorShape::Arrow,
@@ -1116,7 +1188,7 @@ impl Shell {
         self.views.drain_folders(&mut cx);
         self.views.drain_objects(&mut cx);
         self.views.drain_debug(&mut cx);
-        self.views.debug.tick_play(&mut cx);
+        self.views.tick_replay(&mut cx);
         let v = &mut self.views.panes.visualizer;
         let moved = v.update() | v.poll();
         if moved && self.views.visualizer_shown() {

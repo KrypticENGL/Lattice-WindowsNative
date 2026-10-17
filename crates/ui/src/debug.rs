@@ -5,22 +5,25 @@
 //! wakes the UI thread; [`Debug::drain`] turns its events into Output lines
 //! and [`Update`]s for the Visualizer and the editor.
 //!
-//! Play steps the program on its own: one step per [`PLAY_STEP`] after each
-//! stop's snapshot arrives, into the user's functions and back out of
-//! library code, until the program ends or the user pauses.
+//! [`Debug::record`] runs the whole program for a replay: from `main` it
+//! steps line by line as soon as each stop's snapshot is in, into the
+//! user's functions and back out of library code, keeping the snapshot of
+//! every line until the program exits. The exit itself is not a step, so
+//! the replay ends on the last line that ran.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use debugger::{Command, DebugEvent, Session, Snapshot, StartConfig, StopReason};
 
 use crate::panel::Cx;
 use crate::sys::Waker;
 
-/// How long Play shows each line before the next step.
-pub const PLAY_STEP: Duration = Duration::from_millis(600);
+/// A recording ends after this many steps.
+pub const MAX_STEPS: usize = 5000;
+/// ... or once its snapshots hold this many objects in all (memory).
+const MAX_RECORDED_OBJECTS: usize = 1_000_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Phase {
@@ -43,6 +46,22 @@ pub enum Update {
     Snapshot(Box<Snapshot>),
     /// The program or GDB ended.
     Ended,
+    /// A recording took another step.
+    Recording,
+    /// A recording finished: one snapshot per line, in order.
+    Recorded(Vec<Snapshot>),
+}
+
+/// A run being recorded for replay.
+#[derive(Default)]
+struct Recorder {
+    steps: Vec<Snapshot>,
+    objects: usize,
+    /// The last command was a step out of library code: its stop lands
+    /// mid-line in the caller and is not a step of its own.
+    finishing: bool,
+    /// The program stopped on a signal; that line is the last step.
+    signalled: bool,
 }
 
 pub struct Debug {
@@ -54,12 +73,11 @@ pub struct Debug {
     breakpoints: BTreeMap<String, (PathBuf, BTreeSet<u32>)>,
     stopped_at: Option<(PathBuf, u32)>,
     stopped_in: String,
-    /// Play is on.
-    playing: bool,
-    /// When Play takes its next step: set once the stop's snapshot is in.
-    play_at: Option<Instant>,
+    recorder: Option<Recorder>,
+    /// Updates produced outside [`Debug::drain`], returned by its next call.
+    pending: Vec<Update>,
     /// The toolchain's install prefix (gdb's `bin\..`); sources under it
-    /// are library code that Play steps out of.
+    /// are library code that a recording steps out of.
     toolchain: Option<PathBuf>,
 }
 
@@ -73,53 +91,10 @@ impl Debug {
             breakpoints: BTreeMap::new(),
             stopped_at: None,
             stopped_in: String::new(),
-            playing: false,
-            play_at: None,
+            recorder: None,
+            pending: Vec::new(),
             toolchain: None,
         }
-    }
-
-    pub fn is_playing(&self) -> bool {
-        self.playing
-    }
-
-    /// Turns Play on or off. On while stopped, the next step is due now.
-    pub fn set_playing(&mut self, on: bool) {
-        self.playing = on;
-        self.play_at = None;
-        if on && self.phase == Phase::Stopped {
-            self.schedule_play(Duration::ZERO);
-        }
-    }
-
-    fn schedule_play(&mut self, delay: Duration) {
-        self.play_at = Some(Instant::now() + delay);
-        let waker = self.waker.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(delay);
-            waker.wake();
-        });
-    }
-
-    /// Takes Play's next step if it is due. Called on every wake.
-    pub fn tick_play(&mut self, cx: &mut Cx) {
-        let due = self.play_at.is_some_and(|t| Instant::now() >= t);
-        if !(self.playing && due && self.phase == Phase::Stopped) {
-            return;
-        }
-        self.play_at = None;
-        let library = self
-            .stopped_at
-            .as_ref()
-            .is_none_or(|(file, _)| is_library(file, self.toolchain.as_deref()));
-        self.command(
-            if library {
-                Command::Finish
-            } else {
-                Command::Step
-            },
-            cx,
-        );
     }
 
     pub fn phase(&self) -> Phase {
@@ -132,6 +107,11 @@ impl Debug {
 
     pub fn set_program(&mut self, program: PathBuf) {
         self.program = Some(program);
+    }
+
+    /// Steps recorded so far, while recording.
+    pub fn recording(&self) -> Option<usize> {
+        self.recorder.as_ref().map(|r| r.steps.len())
     }
 
     /// `func` and `file:line` of the current stop.
@@ -155,7 +135,9 @@ impl Debug {
         let exec = self
             .stopped_at
             .as_ref()
-            .filter(|(f, _)| path_key(f) == key && self.phase == Phase::Stopped)
+            .filter(|(f, _)| {
+                path_key(f) == key && self.phase == Phase::Stopped && self.recorder.is_none()
+            })
             .map(|(_, l)| *l);
         (lines, exec)
     }
@@ -180,6 +162,35 @@ impl Debug {
 
     /// Starts the chosen program under GDB.
     pub fn start(&mut self, cx: &mut Cx) {
+        let breakpoints: Vec<(PathBuf, u32)> = self
+            .breakpoints
+            .values()
+            .flat_map(|(p, lines)| lines.iter().map(|&l| (p.clone(), l)))
+            .collect();
+        self.launch(breakpoints, cx);
+    }
+
+    /// Restarts the chosen program from `main` and records every line it
+    /// runs; [`Update::Recorded`] follows when it exits.
+    pub fn record(&mut self, cx: &mut Cx) {
+        if self.session.is_some() {
+            if let Some(s) = self.session.take() {
+                s.stop();
+            }
+            self.phase = Phase::Idle;
+            self.stopped_at = None;
+        }
+        self.recorder = None;
+        // No breakpoints: the session stops at `main`, and stepping from
+        // there passes every line anyway.
+        self.launch(Vec::new(), cx);
+        if self.session.is_some() {
+            self.recorder = Some(Recorder::default());
+            cx.log("Recording the program for replay\u{2026}");
+        }
+    }
+
+    fn launch(&mut self, breakpoints: Vec<(PathBuf, u32)>, cx: &mut Cx) {
         let Some(program) = self.program.clone() else {
             return;
         };
@@ -190,11 +201,6 @@ impl Debug {
             );
             return;
         };
-        let breakpoints: Vec<(PathBuf, u32)> = self
-            .breakpoints
-            .values()
-            .flat_map(|(p, lines)| lines.iter().map(|&l| (p.clone(), l)))
-            .collect();
         let stop_at = if breakpoints.is_empty() {
             "stopping at main".to_string()
         } else {
@@ -219,7 +225,6 @@ impl Debug {
                 self.session = Some(s);
                 self.phase = Phase::Starting;
                 self.stopped_at = None;
-                self.play_at = None;
                 self.toolchain = gdb.parent().and_then(Path::parent).map(Path::to_path_buf);
             }
             Err(e) => cx.log_error(format!("Could not start the debugger: {e}")),
@@ -232,9 +237,13 @@ impl Debug {
             Command::Interrupt => self.phase == Phase::Running,
             _ => self.phase == Phase::Stopped,
         };
-        if !allowed {
+        if !allowed || self.recorder.is_some() {
             return;
         }
+        self.send(c, cx);
+    }
+
+    fn send(&self, c: Command, cx: &mut Cx) {
         if let Some(s) = &self.session {
             if let Err(e) = s.send(c) {
                 cx.log_error(format!("Debugger: {e}"));
@@ -242,16 +251,19 @@ impl Debug {
         }
     }
 
-    /// Kills the program and GDB.
+    /// Kills the program and GDB. A recording keeps the steps it has.
     pub fn stop(&mut self, cx: &mut Cx) {
+        if self.recorder.is_some() {
+            self.finish_recording("Recording stopped", cx);
+            self.waker.wake();
+            return;
+        }
         if let Some(s) = self.session.take() {
             s.stop();
             cx.log("Debugging stopped");
         }
         self.phase = Phase::Idle;
         self.stopped_at = None;
-        self.playing = false;
-        self.play_at = None;
         cx.repaint();
     }
 
@@ -259,18 +271,70 @@ impl Debug {
         self.session.is_some()
     }
 
+    /// Ends the session and queues [`Update::Recorded`].
+    fn finish_recording(&mut self, why: &str, cx: &mut Cx) {
+        let Some(rec) = self.recorder.take() else {
+            return;
+        };
+        if let Some(s) = self.session.take() {
+            s.stop();
+        }
+        self.phase = Phase::Idle;
+        self.stopped_at = None;
+        cx.log(format!("{why}: {} steps recorded", rec.steps.len()));
+        self.pending.push(Update::Recorded(rec.steps));
+        cx.repaint();
+    }
+
+    /// A recording's stop: keeps the line's snapshot and takes the next
+    /// step. Returns why the recording must end, if it must.
+    fn record_stop(&mut self, snap: Option<Snapshot>, cx: &mut Cx) -> Option<&'static str> {
+        let toolchain = self.toolchain.clone();
+        let rec = self.recorder.as_mut()?;
+        let library = snap.as_ref().is_some_and(|s| {
+            s.frames
+                .last()
+                .is_none_or(|f| is_library(Path::new(&f.file), toolchain.as_deref()))
+        });
+        if let Some(snap) = snap.filter(|_| !library && !rec.finishing) {
+            rec.objects += snap.objects.len();
+            rec.steps.push(snap);
+        }
+        rec.finishing = library;
+        if rec.signalled {
+            return Some("Recording ended at the signal");
+        }
+        if rec.steps.len() >= MAX_STEPS {
+            return Some("Recording reached its step limit");
+        }
+        if rec.objects >= MAX_RECORDED_OBJECTS {
+            return Some("Recording reached its memory limit");
+        }
+        let next = if library {
+            Command::Finish
+        } else {
+            Command::Step
+        };
+        self.send(next, cx);
+        None
+    }
+
     /// Handles the session's events.
     pub fn drain(&mut self, cx: &mut Cx) -> Vec<Update> {
+        let mut out = std::mem::take(&mut self.pending);
         let Some(s) = &self.session else {
-            return Vec::new();
+            return out;
         };
-        let mut out = Vec::new();
+        let events = s.poll();
         let mut ended = false;
-        for e in s.poll() {
+        for e in events {
+            let recording = self.recorder.is_some();
             match e {
                 DebugEvent::Running => {
                     self.phase = Phase::Running;
-                    out.push(Update::Running);
+                    if !recording {
+                        out.push(Update::Running);
+                    }
                 }
                 DebugEvent::Stopped {
                     reason,
@@ -281,10 +345,15 @@ impl Debug {
                     self.phase = Phase::Stopped;
                     if let StopReason::Signal(sig) = &reason {
                         cx.log_error(format!("Program received {sig} in {func}"));
+                        if let Some(rec) = &mut self.recorder {
+                            rec.signalled = true;
+                        }
                     }
                     self.stopped_in = func;
                     self.stopped_at = file.clone().zip(line);
-                    out.push(Update::Stopped { file, line });
+                    if !recording {
+                        out.push(Update::Stopped { file, line });
+                    }
                 }
                 DebugEvent::Snapshot(Ok(snap)) => {
                     // A pause reports no location; use the innermost frame.
@@ -292,27 +361,35 @@ impl Debug {
                         if let Some(f) = snap.frames.last() {
                             self.stopped_in = f.func.clone();
                             self.stopped_at = Some((PathBuf::from(&f.file), f.line));
-                            out.push(Update::Stopped {
-                                file: Some(PathBuf::from(&f.file)),
-                                line: Some(f.line),
-                            });
+                            if !recording {
+                                out.push(Update::Stopped {
+                                    file: Some(PathBuf::from(&f.file)),
+                                    line: Some(f.line),
+                                });
+                            }
                         }
                     }
-                    if snap.truncated {
+                    if snap.truncated && !recording {
                         cx.log(format!(
                             "Data view: showing the first {} objects; the rest are not followed",
                             snap.objects.len()
                         ));
                     }
-                    out.push(Update::Snapshot(Box::new(snap)));
-                    if self.playing {
-                        self.schedule_play(PLAY_STEP);
+                    if recording {
+                        if let Some(why) = self.record_stop(Some(snap), cx) {
+                            self.finish_recording(why, cx);
+                            break;
+                        }
+                        out.push(Update::Recording);
+                    } else {
+                        out.push(Update::Snapshot(Box::new(snap)));
                     }
                 }
                 DebugEvent::Snapshot(Err(e)) => {
                     cx.log_error(format!("Data view: {e}"));
-                    if self.playing {
-                        self.schedule_play(PLAY_STEP);
+                    if let Some(why) = self.record_stop(None, cx) {
+                        self.finish_recording(why, cx);
+                        break;
                     }
                 }
                 DebugEvent::Exited(code) => {
@@ -325,31 +402,31 @@ impl Debug {
                 DebugEvent::Output(text) => cx.log(text),
                 DebugEvent::Error(msg) => {
                     cx.log_error(format!("GDB: {msg}"));
-                    // A refused step would leave Play waiting forever.
-                    if self.playing {
-                        self.playing = false;
-                        self.play_at = None;
-                        cx.log("Play stopped");
+                    // A refused step would leave the recording waiting.
+                    if recording {
+                        self.finish_recording("Recording ended early", cx);
+                        break;
                     }
                 }
                 DebugEvent::Ended => {
-                    if self.phase != Phase::Idle {
+                    if self.phase != Phase::Idle && !recording {
                         cx.log("GDB exited");
                     }
                     ended = true;
                 }
             }
         }
-        if ended {
+        if ended && self.recorder.is_some() {
+            self.finish_recording("Program finished", cx);
+        } else if ended {
             if let Some(s) = self.session.take() {
                 s.stop();
             }
             self.phase = Phase::Idle;
             self.stopped_at = None;
-            self.playing = false;
-            self.play_at = None;
             out.push(Update::Ended);
         }
+        out.append(&mut self.pending);
         if !out.is_empty() {
             cx.repaint();
         }
@@ -368,7 +445,7 @@ pub fn path_key(p: &Path) -> String {
     }
 }
 
-/// Source that Play steps out of rather than into: missing files (no
+/// Source that a recording steps out of rather than into: missing files (no
 /// source to show) and anything under the toolchain, such as libstdc++'s
 /// headers.
 fn is_library(file: &Path, toolchain: Option<&Path>) -> bool {

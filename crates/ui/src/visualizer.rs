@@ -9,7 +9,9 @@
 //! - **Data**: the live data of a program stopped under GDB, drawn by shape
 //!   (trees as trees, arrays as cells). The toolbar runs and steps the
 //!   program; clicking a box shows its type. The Source and Call stack
-//!   panels (docked separately) follow the frame focused here.
+//!   panels (docked separately) follow the frame focused here. **Play**
+//!   records the whole run and replays it with a play bar under the
+//!   canvas.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,6 +28,8 @@ use crate::dock::PaneId;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::geom::{PointF, RectF};
 use crate::panel::{Action, Cx, DebugAction, Panel};
+use crate::playbar::{BarState, PlayBar, PLAYBAR_H};
+use crate::replay::{ReplayAction, ReplayStatus};
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::{TextStyle, TextSystem};
 use crate::sys::Waker;
@@ -57,8 +61,21 @@ pub struct DebugStatus {
     pub program: Option<String>,
     /// `func at file:line` while stopped.
     pub stopped: Option<String>,
-    /// Play is stepping through the program.
-    pub playing: bool,
+    /// Steps recorded so far, while recording a run for replay.
+    pub recording: Option<usize>,
+    /// The recorded run being replayed.
+    pub replay: Option<ReplayStatus>,
+}
+
+impl DebugStatus {
+    /// What the play bar shows, if it shows.
+    fn bar(&self) -> Option<BarState> {
+        match (self.recording, self.replay) {
+            (Some(n), _) => Some(BarState::Recording(n)),
+            (None, Some(s)) => Some(BarState::Replay(s)),
+            (None, None) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,7 +143,7 @@ impl Button {
                 Phase::Stopped => "Continue".into(),
                 _ => "Run".into(),
             },
-            Self::Play if debug.playing => "Playing\u{2026}".into(),
+            Self::Play if debug.recording.is_some() => "Recording\u{2026}".into(),
             Self::Play => "Play".into(),
             Self::Pause => "Pause".into(),
             Self::StepOver => "Step over".into(),
@@ -150,7 +167,9 @@ impl Button {
     fn enabled(self, debug: &DebugStatus) -> bool {
         match self {
             Self::Run => matches!(debug.phase, Phase::Idle | Phase::Stopped),
-            Self::Play => debug.playing || matches!(debug.phase, Phase::Idle | Phase::Stopped),
+            Self::Play => {
+                debug.recording.is_none() && matches!(debug.phase, Phase::Idle | Phase::Stopped)
+            }
             Self::Pause => debug.phase == Phase::Running,
             Self::StepOver | Self::StepInto | Self::StepOut => debug.phase == Phase::Stopped,
             Self::Stop => debug.phase != Phase::Idle,
@@ -184,6 +203,8 @@ pub struct Visualizer {
     canvas: RectF,
     buttons: Vec<(Button, RectF)>,
     hover_button: Option<Button>,
+    /// Under the canvas while recording or replaying (Data mode).
+    bar: PlayBar,
     view: GraphView,
     graphs: BTreeMap<PathBuf, Arc<CodeGraph>>,
     filter: Filter,
@@ -217,6 +238,7 @@ impl Visualizer {
             canvas: RectF::default(),
             buttons: Vec::new(),
             hover_button: None,
+            bar: PlayBar::default(),
             view,
             graphs: BTreeMap::new(),
             filter: Filter::default(),
@@ -499,7 +521,9 @@ impl Visualizer {
             Button::Locals => self.filter.locals,
             Button::Source => self.show_code,
             Button::Stack => self.show_stack,
-            Button::Play => self.debug.playing,
+            Button::Play => {
+                self.debug.recording.is_some() || self.debug.replay.is_some_and(|r| r.playing)
+            }
             _ => false,
         }
     }
@@ -593,6 +617,22 @@ impl Visualizer {
             if mods.ctrl || mods.alt {
                 return false;
             }
+            if let Some(s) = self.debug.replay.filter(|_| self.debug.recording.is_none()) {
+                // Media player keys while a replay is loaded.
+                let a = match key {
+                    Key::Left => Some(ReplayAction::Step(-1)),
+                    Key::Right => Some(ReplayAction::Step(1)),
+                    Key::Space => Some(ReplayAction::Toggle),
+                    Key::Home => Some(ReplayAction::Seek(0)),
+                    Key::End => Some(ReplayAction::Seek(s.len - 1)),
+                    _ => None,
+                };
+                if let Some(a) = a {
+                    cx.act(Action::Replay(a));
+                    cx.repaint();
+                    return true;
+                }
+            }
             match key {
                 Key::Letter('F') => self.data.fit(),
                 Key::Escape => {
@@ -630,13 +670,21 @@ impl Visualizer {
 
     fn status(&self) -> String {
         if self.mode == Mode::Data {
+            let replay_at = self.data.snapshot().and_then(|s| s.frames.last()).map(|f| {
+                let file = Path::new(&f.file)
+                    .file_name()
+                    .map_or_else(|| f.file.clone(), |n| n.to_string_lossy().into_owned());
+                format!("{} at {file}:{}", f.func, f.line)
+            });
             let mut s = match (self.debug.phase, &self.debug.stopped) {
-                (Phase::Running | Phase::Stopped, _) if self.debug.playing => {
-                    match &self.debug.stopped {
-                        Some(at) => format!("playing \u{b7} {at}"),
-                        None => "playing\u{2026}".to_string(),
-                    }
-                }
+                _ if self.debug.recording.is_some() => format!(
+                    "recording\u{2026} {} steps",
+                    self.debug.recording.unwrap_or(0)
+                ),
+                (Phase::Idle, _) if self.debug.replay.is_some() => match &replay_at {
+                    Some(at) => format!("replay \u{b7} {at}"),
+                    None => "replay".to_string(),
+                },
                 (Phase::Idle, _) => "not running".to_string(),
                 (Phase::Starting, _) => "starting\u{2026}".to_string(),
                 (Phase::Running, _) => "running\u{2026}".to_string(),
@@ -822,7 +870,23 @@ impl Visualizer {
     }
 
     fn paint_data_empty(&self, d: &mut DrawCtx, theme: &Theme) {
+        let recorded;
         let lines: Vec<(&str, TextStyle, Color)> = match self.debug.phase {
+            _ if self.debug.recording.is_some() => {
+                recorded = format!(
+                    "{} lines so far. The replay starts when the program ends.",
+                    self.debug.recording.unwrap_or(0)
+                );
+                vec![
+                    ("Recording the program\u{2026}", TextStyle::UiBold, theme.text),
+                    (recorded.as_str(), TextStyle::Ui, theme.text_dim),
+                    (
+                        "It runs line by line under GDB; Stop ends it early and replays what it has.",
+                        TextStyle::Ui,
+                        theme.text_dim,
+                    ),
+                ]
+            }
             Phase::Idle => vec![
                 ("No program running", TextStyle::UiBold, theme.text),
                 (
@@ -836,7 +900,7 @@ impl Visualizer {
                     theme.text_dim,
                 ),
                 (
-                    "F5 run / continue \u{b7} F6 play \u{b7} F10 step over \u{b7} F11 step into \u{b7} Shift+F11 step out \u{b7} Shift+F5 stop",
+                    "F5 run / continue \u{b7} F6 record and replay \u{b7} F10 step over \u{b7} F11 step into \u{b7} Shift+F11 step out \u{b7} Shift+F5 stop",
                     TextStyle::UiSmall,
                     theme.text_dim,
                 ),
@@ -924,8 +988,14 @@ impl Visualizer {
 impl Panel for Visualizer {
     fn layout(&mut self, rect: RectF, text: &TextSystem) {
         self.rect = rect;
-        let (toolbar, canvas) = rect.split_top(TOOLBAR_H);
+        let (toolbar, mut canvas) = rect.split_top(TOOLBAR_H);
         self.toolbar = toolbar;
+        if let Some(state) = self.debug.bar().filter(|_| self.mode == Mode::Data) {
+            let h = PLAYBAR_H.min(canvas.h);
+            let bar = RectF::new(canvas.x, canvas.bottom() - h, canvas.w, h);
+            canvas.h -= h;
+            self.bar.layout(bar, state, text);
+        }
         self.canvas = canvas;
         self.buttons.clear();
         let y = toolbar.y + (toolbar.h - 1.0 - BUTTON_H) / 2.0;
@@ -951,7 +1021,7 @@ impl Panel for Visualizer {
             // Run/Continue keeps one width so the buttons after it stay put.
             let label = match b {
                 Button::Run => "Continue".to_string(),
-                Button::Play => "Playing\u{2026}".to_string(),
+                Button::Play => "Recording\u{2026}".to_string(),
                 _ => b.label(&self.debug),
             };
             let w = text.measure(TextStyle::Ui, &label) + 2.0 * BUTTON_PAD + extra;
@@ -974,6 +1044,9 @@ impl Panel for Visualizer {
                 let data = &mut self.data;
                 d.clip(self.canvas, |d| data.paint(d, &style));
             }
+            if let Some(state) = self.debug.bar() {
+                self.bar.paint(d, theme, state);
+            }
             self.paint_toolbar(d, theme);
             return;
         }
@@ -993,6 +1066,18 @@ impl Panel for Visualizer {
 
     fn on_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
         let at = |p: PointF| Vec2::new(p.x, p.y);
+        if let Some(state) = self.debug.bar().filter(|_| self.mode == Mode::Data) {
+            if !self.canvas_capture && self.bar.on_event(e, state, cx) {
+                self.leave_canvas(cx);
+                if self.hover_button.take().is_some() {
+                    cx.repaint();
+                }
+                return true;
+            }
+            if matches!(e, Event::MouseMove { .. } | Event::MouseLeave) && self.bar.leave() {
+                cx.repaint();
+            }
+        }
         match *e {
             Event::KeyDown { key, mods } => return self.on_key(key, mods, cx),
             Event::Char(ch @ ('+' | '=' | '-')) => {

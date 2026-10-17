@@ -10,12 +10,12 @@ use std::time::{Duration, Instant};
 use windows::core::Interface;
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HMODULE};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
-    D2D_RECT_F, D2D_SIZE_U,
+    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
+    D2D1_FIGURE_END_CLOSED, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1DeviceContext, ID2D1DeviceContext3, ID2D1Factory1,
-    ID2D1SolidColorBrush, ID2D1SpriteBatch, D2D1_ANTIALIAS_MODE_ALIASED,
+    ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1SpriteBatch, D2D1_ANTIALIAS_MODE_ALIASED,
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
     D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS, D2D1_DRAW_TEXT_OPTIONS_CLIP,
@@ -93,6 +93,9 @@ struct SpriteScratch {
 pub struct Graphics {
     window: NativeWindow,
     factory: ID2D1Factory1,
+    /// The triangle (0,0) (1,0) (0,1); [`DrawCtx::fill_triangle`] maps it
+    /// onto any triangle with a transform. Device-independent.
+    triangle: ID2D1PathGeometry,
     device: Option<DeviceResources>,
     dpi: f32,
     size_px: (u32, u32),
@@ -107,9 +110,11 @@ impl Graphics {
         let factory: ID2D1Factory1 =
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }
                 .map_err(|e| win_err("D2D1CreateFactory", e))?;
+        let triangle = unit_triangle(&factory).map_err(|e| win_err("CreatePathGeometry", e))?;
         Ok(Self {
             window,
             factory,
+            triangle,
             device: None,
             dpi: dpi as f32,
             size_px: (0, 0),
@@ -233,6 +238,7 @@ impl Graphics {
             sprites: dev.sprites.as_ref(),
             scratch: &mut self.scratch,
             antialias: true,
+            triangle: &self.triangle,
         };
         paint(&mut ctx);
         // SAFETY: matches the BeginDraw above.
@@ -442,6 +448,7 @@ pub struct DrawCtx<'a> {
     scratch: &'a mut SpriteScratch,
     /// Current antialias mode, restored after sprite draws.
     antialias: bool,
+    triangle: &'a ID2D1PathGeometry,
 }
 
 impl<'a> DrawCtx<'a> {
@@ -500,6 +507,30 @@ impl<'a> DrawCtx<'a> {
                 width,
                 None,
             );
+        }
+    }
+
+    /// A filled triangle.
+    pub fn fill_triangle(&mut self, a: PointF, b: PointF, c: PointF, color: Color) {
+        self.set_color(color);
+        let mut base = Matrix3x2::identity();
+        // SAFETY: plain getter on the live context; `base` is a local.
+        unsafe { self.dc.GetTransform(&mut base) };
+        // Maps the unit triangle's corners onto a, b, c.
+        let map = Matrix3x2 {
+            M11: b.x - a.x,
+            M12: b.y - a.y,
+            M21: c.x - a.x,
+            M22: c.y - a.y,
+            M31: a.x,
+            M32: a.y,
+        };
+        // SAFETY: drawing inside BeginDraw/EndDraw with a live brush and a
+        // geometry from the same factory; the transform is restored.
+        unsafe {
+            self.dc.SetTransform(&(map * base));
+            self.dc.FillGeometry(self.triangle, self.brush, None);
+            self.dc.SetTransform(&base);
         }
     }
 
@@ -569,6 +600,21 @@ impl<'a> DrawCtx<'a> {
         f(self);
         // SAFETY: matches the push above.
         unsafe { self.dc.PopAxisAlignedClip() };
+    }
+}
+
+fn unit_triangle(factory: &ID2D1Factory1) -> windows::core::Result<ID2D1PathGeometry> {
+    // SAFETY: a geometry and its sink from a live factory, used on this
+    // thread; the figure is begun, ended and the sink closed in order.
+    unsafe {
+        let g: ID2D1PathGeometry = factory.CreatePathGeometry()?.cast()?;
+        let sink = g.Open()?;
+        sink.BeginFigure(Vector2 { X: 0.0, Y: 0.0 }, D2D1_FIGURE_BEGIN_FILLED);
+        sink.AddLine(Vector2 { X: 1.0, Y: 0.0 });
+        sink.AddLine(Vector2 { X: 0.0, Y: 1.0 });
+        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+        sink.Close()?;
+        Ok(g)
     }
 }
 

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::dock::PaneId;
 use crate::event::{CursorShape, Event};
 use crate::geom::RectF;
+use crate::replay::ReplayAction;
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::TextSystem;
 use crate::sys::NativeWindow;
@@ -40,14 +41,16 @@ pub enum Action {
     RevealFrame(usize),
     /// Show a hidden panel, or hide a shown one.
     TogglePane(PaneId),
+    /// A play bar command.
+    Replay(ReplayAction),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DebugAction {
     /// Start the program, or continue it when stopped.
     Run,
-    /// Start or stop stepping through the program on its own (starting it
-    /// if it is not running).
+    /// Play or pause the replay, recording the program first if there is
+    /// none.
     Play,
     Pause,
     Step(debugger::Command),
