@@ -157,6 +157,10 @@ impl<C: Clone> MenuBar<C> {
         }
     }
 
+    pub fn close(&mut self) {
+        self.open = None;
+    }
+
     pub fn is_open(&self) -> bool {
         self.open.is_some()
     }
@@ -374,8 +378,8 @@ impl<C: Clone> MenuBar<C> {
         self.titles.iter().any(|(_, r)| r.contains(p))
     }
 
+    /// The titles; the title bar paints the background.
     pub fn paint_bar(&self, d: &mut DrawCtx, theme: &Theme) {
-        d.fill_rect(self.bar, theme.chrome_bg);
         let open = self.open.as_ref().map(|o| o.title);
         for (i, (title, r)) in self.titles.iter().enumerate() {
             let lit = open == Some(i);

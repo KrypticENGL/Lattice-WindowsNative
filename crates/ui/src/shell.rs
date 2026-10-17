@@ -1,5 +1,6 @@
-//! Root of the UI: the menu bar, the top strip (Code/Visualizer
-//! workspaces), each workspace's dock area, focus and input routing.
+//! Root of the UI: the title bar with its menus, the top strip
+//! (Code/Visualizer workspaces), each workspace's dock area, focus and input
+//! routing.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use crate::editor::EditorArea;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::explorer::Explorer;
 use crate::folder_watch::{Changes, FolderWatcher};
-use crate::geom::{RectF, SizeF};
+use crate::geom::{PointF, RectF, SizeF};
 use crate::menubar::{Entry, Mark, MenuBar, Outcome};
 use crate::objects::{LoadResult, ObjectEvent, ObjectService};
 use crate::output::Output;
@@ -25,11 +26,11 @@ use crate::sys::text::{TextStyle, TextSystem};
 use crate::sys::{NativeWindow, Waker};
 use crate::terminal::Terminal;
 use crate::theme::Theme;
+use crate::titlebar::{TitleBar, WindowHit, TITLE_BAR_H};
 use crate::visualizer::{DebugStatus, Mode, Visualizer};
 use crate::Error;
 use renderer::GraphMode;
 
-const MENU_BAR_H: f32 = 28.0;
 const TOP_STRIP_H: f32 = 34.0;
 const TOP_TAB_PAD: f32 = 16.0;
 
@@ -166,9 +167,8 @@ struct Views {
     strip: RectF,
     tab_rects: [RectF; 2],
     tab_hover: Option<usize>,
+    title_bar: TitleBar,
     menu_bar: MenuBar<MenuCmd>,
-    /// The bar's row, right of the titles: the open folder.
-    menu_row: RectF,
     /// Where the menu titles end.
     menu_end: f32,
     areas: [DockArea; 2],
@@ -288,9 +288,9 @@ impl Views {
         self.panes.source.show(target);
 
         let full = RectF::new(0.0, 0.0, size.w, size.h);
-        let (bar, rest) = full.split_top(MENU_BAR_H);
-        self.menu_row = bar;
-        self.menu_end = self.menu_bar.layout(bar, text);
+        let (bar, rest) = full.split_top(TITLE_BAR_H);
+        let menus = self.title_bar.layout(bar);
+        self.menu_end = self.menu_bar.layout(menus, text);
         if self.menu_bar.is_open() {
             let menus = self.menus();
             self.menu_bar.refresh(text, |i| menus[i].clone());
@@ -366,19 +366,12 @@ impl Views {
     }
 
     fn paint(&mut self, d: &mut DrawCtx, theme: &Theme) {
+        let title = match self.panes.explorer.root_path() {
+            Some(root) => format!("{} \u{2014} Lattice", root.display()),
+            None => "Lattice".to_string(),
+        };
+        self.title_bar.paint(d, theme, &title, self.menu_end);
         self.menu_bar.paint_bar(d, theme);
-        if let Some(root) = self.panes.explorer.root_path() {
-            let label = root.display().to_string();
-            let row = self.menu_row;
-            let w = d.text_system().measure(TextStyle::UiSmall, &label);
-            let x = (row.right() - w - 12.0).max(self.menu_end + 16.0);
-            d.text(
-                TextStyle::UiSmall,
-                &label,
-                RectF::new(x, row.y, row.right() - x - 8.0, row.h),
-                theme.text_dim,
-            );
-        }
         d.fill_rect(self.strip, theme.chrome_bg);
         for t in TopTab::ALL {
             let i = t.index();
@@ -422,6 +415,15 @@ impl Views {
         let i = self.tab.index();
         self.areas[i].paint(d, theme, &mut self.panes, self.window_focused);
         self.menu_bar.paint_menus(d, theme);
+    }
+
+    /// What the window procedure should treat `p` as: menu titles are
+    /// the UI's, the rest of the title bar drags the window.
+    fn hit_test(&self, p: PointF) -> WindowHit {
+        match self.title_bar.hit(p) {
+            WindowHit::Caption if self.menu_bar.over_title(p) => WindowHit::Client,
+            hit => hit,
+        }
     }
 
     /// The Visualizer canvas is on screen.
@@ -995,7 +997,7 @@ impl Shell {
                 tab_rects: [RectF::default(); 2],
                 tab_hover: None,
                 menu_bar: MenuBar::new(&MENUS),
-                menu_row: RectF::default(),
+                title_bar: TitleBar::default(),
                 menu_end: 0.0,
                 areas: TopTab::ALL.map(|t| DockArea::new(default_tree(t))),
                 closed: HashMap::new(),
@@ -1143,6 +1145,40 @@ impl Shell {
         Response {
             repaint: cx.needs_repaint(),
         }
+    }
+
+    /// What the window procedure should treat a client point (in DIPs) as.
+    pub fn hit_test(&self, p: PointF) -> WindowHit {
+        self.views.hit_test(p)
+    }
+
+    /// The caption button under the pointer and the one held down.
+    pub fn set_caption_state(
+        &mut self,
+        hover: Option<WindowHit>,
+        pressed: Option<WindowHit>,
+    ) -> Response {
+        let t = &mut self.views.title_bar;
+        let changed = (t.hover, t.pressed) != (hover, pressed);
+        t.hover = hover;
+        t.pressed = pressed;
+        Response { repaint: changed }
+    }
+
+    /// The window was maximized or restored (the maximize glyph follows).
+    pub fn set_maximized(&mut self, maximized: bool) -> Response {
+        let t = &mut self.views.title_bar;
+        let changed = t.maximized != maximized;
+        t.maximized = maximized;
+        Response { repaint: changed }
+    }
+
+    /// A press on the title bar outside the UI (dragging, caption buttons)
+    /// closes any open menu.
+    pub fn close_menus(&mut self) -> Response {
+        let open = self.views.menu_bar.is_open();
+        self.views.menu_bar.close();
+        Response { repaint: open }
     }
 
     /// Asks about unsaved files. `false` means the user cancelled closing.

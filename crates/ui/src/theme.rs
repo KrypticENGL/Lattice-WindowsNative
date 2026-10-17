@@ -54,6 +54,8 @@ pub struct Theme {
     pub button_text: Color,
     pub dirty: Color,
     pub error: Color,
+    /// The close button under the pointer.
+    pub caption_close: Color,
     /// Visualizer canvas and graph colours.
     pub graph_bg: Color,
     pub graph_function: Color,
@@ -122,6 +124,7 @@ impl Theme {
             button_text: Color::hex(0x1A1F12),
             dirty: Color::hex(0xE2C08D),
             error: Color::hex(0xF14C4C),
+            caption_close: Color::hex(0xC42B1C),
             // Graph: lime functions on a near-black, faintly green canvas;
             // the other kinds use hues that stay apart from the accent.
             graph_bg: Color::hex(0x141613),

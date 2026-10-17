@@ -26,8 +26,10 @@ mod shell;
 mod sys;
 mod terminal;
 pub mod theme;
+mod titlebar;
 mod visualizer;
 
 pub use error::Error;
 pub use shell::{Response, Shell};
 pub use sys::{NativeWindow, WAKE_MESSAGE};
+pub use titlebar::WindowHit;

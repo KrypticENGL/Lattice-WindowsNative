@@ -114,8 +114,14 @@ it. `app` hands the window to `ui` as an opaque `ui::NativeWindow`.
 - DPI: the process is per-monitor v2. Mouse coordinates are converted from
   pixels to DIPs once, here. `WM_DPICHANGED` applies the suggested rect and
   updates the Direct2D DPI.
-- The title bar is dark, and DWM Mica is applied to the frame. The client
-  area is opaque, so Mica shows only in the title bar.
+- The title bar is drawn by the UI, as in VS Code: logo, menus, title and
+  caption buttons in one row. `WM_NCCALCSIZE` gives the system caption's
+  room to the client (the side and bottom frames still resize; the top
+  band is a hit-test zone). `WM_NCHITTEST` asks `Shell::hit_test` which
+  parts drag the window and which are caption buttons, so snapping, the
+  system menu (right-click or Alt+Space) and Windows 11 snap layouts keep
+  working. The frame keeps DWM's dark mode; Mica is still requested but no
+  longer visible, since nothing of the system caption is left.
 
 **Rendering** (`ui/src/sys/gfx.rs`, `ui/src/sys/text.rs`):
 - One D3D11 device, one D2D device context, and one DXGI flip-discard swap
@@ -136,10 +142,12 @@ it. `app` hands the window to `ui` as an opaque `ui::NativeWindow`.
   loss.
 
 **Panels** (`ui/src/`):
-- `shell.rs` owns every panel and routes input. The menu bar and the top
+- `shell.rs` owns every panel and routes input. The title bar and the top
   strip are shared; below them is the active workspace's dock area, so the
   two workspaces never share layout or input.
-- `menubar.rs` is the menu bar: titles, dropdowns and one level of
+- `titlebar.rs` draws the title bar (logo, title, caption buttons) and
+  answers the window's hit test.
+- `menubar.rs` is the menu bar inside it: titles, dropdowns and one level of
   submenu. It holds no app state; the shell describes the rows (Panels,
   Visualizers) and runs the command picked.
 - `dock/` is the docking: `tree.rs` is the layout (splits holding shares

@@ -5,6 +5,13 @@
 //! The UI lives in `WindowState::shell` behind a `RefCell`; it is borrowed
 //! only for the duration of one call, and a busy borrow (re-entry from a
 //! modal dialog inside the shell) falls back to default handling.
+//!
+//! The window has no system caption: `WM_NCCALCSIZE` gives the caption's
+//! room to the client, where the UI draws its own title bar (logo, menus,
+//! caption buttons). `WM_NCHITTEST` asks the UI which parts drag the window
+//! and which are caption buttons, so snapping, the system menu and the
+//! Windows 11 snap layouts keep working; presses on the buttons arrive as
+//! non-client messages and are handled here.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -13,7 +20,7 @@ use std::path::PathBuf;
 
 use ui::event::{CursorShape, Event, Key, Modifiers, MouseButton};
 use ui::geom::PointF;
-use ui::{NativeWindow, Response, Shell, WAKE_MESSAGE};
+use ui::{NativeWindow, Response, Shell, WindowHit, WAKE_MESSAGE};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -21,12 +28,14 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
+use windows::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, GetDpiForWindow, GetSystemMetricsForDpi,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
-    VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F24,
-    VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_OEM_3, VK_PRIOR, VK_RETURN, VK_RIGHT,
-    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TME_NONCLIENT,
+    TRACKMOUSEEVENT, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+    VK_F1, VK_F10, VK_F24, VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_OEM_3, VK_PRIOR,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
@@ -39,6 +48,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
     WM_SIZE, WM_SYSKEYDOWN, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    IsZoomed, HTCAPTION, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+    NCCALCSIZE_PARAMS, SIZE_MAXIMIZED, SIZE_MINIMIZED, SM_CXPADDEDBORDER, SM_CYFRAME, SW_MAXIMIZE,
+    SW_MINIMIZE, SW_RESTORE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
+    WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE,
 };
 
 use super::dpi::{self, BASE_DPI};
@@ -72,6 +87,10 @@ struct WindowState {
     /// A wake arrived while the shell was busy; re-post it afterwards.
     pending_wake: Cell<bool>,
     tracking_leave: Cell<bool>,
+    tracking_nc_leave: Cell<bool>,
+    /// The caption button under the pointer, and the one pressed.
+    caption_hover: Cell<Option<WindowHit>>,
+    caption_pressed: Cell<Option<WindowHit>>,
 }
 
 /// Passed through `lpCreateParams`. `WM_NCCREATE` takes the state out; if
@@ -383,9 +402,59 @@ fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
         WM_SIZE => {
             let width = u32::from(loword(lparam.0 as usize));
             let height = u32::from(hiword(lparam.0 as usize));
+            let kind = wparam.0 as u32;
+            if kind != SIZE_MINIMIZED {
+                let response = with_shell(hwnd, |s| s.set_maximized(kind == SIZE_MAXIMIZED));
+                apply(hwnd, response);
+            }
             let response = with_shell(hwnd, |s| s.resize(width, height));
             apply(hwnd, response);
             Some(LRESULT(0))
+        }
+        WM_NCCALCSIZE if wparam.0 != 0 => Some(calc_client(hwnd, msg, wparam, lparam)),
+        WM_NCHITTEST => Some(hit_test(hwnd, msg, wparam, lparam)),
+        WM_NCMOUSEMOVE => {
+            if !state.tracking_nc_leave.get() {
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE | TME_NONCLIENT,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                // SAFETY: `track` is valid for the call; `hwnd` is ours.
+                if unsafe { TrackMouseEvent(&mut track) }.is_ok() {
+                    state.tracking_nc_leave.set(true);
+                }
+            }
+            set_caption(
+                hwnd,
+                state,
+                caption_button(wparam),
+                state.caption_pressed.get(),
+            );
+            // Off the buttons (the caption), the system handles the move.
+            caption_button(wparam).map(|_| LRESULT(0))
+        }
+        WM_NCMOUSELEAVE => {
+            state.tracking_nc_leave.set(false);
+            set_caption(hwnd, state, None, None);
+            Some(LRESULT(0))
+        }
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK => {
+            let response = with_shell(hwnd, Shell::close_menus);
+            apply(hwnd, response);
+            let button = caption_button(wparam)?;
+            set_caption(hwnd, state, Some(button), Some(button));
+            Some(LRESULT(0))
+        }
+        WM_NCLBUTTONUP => {
+            let pressed = state.caption_pressed.get();
+            let button = caption_button(wparam);
+            set_caption(hwnd, state, button, None);
+            if let (Some(b), true) = (button, pressed == button) {
+                press_caption_button(hwnd, b);
+            }
+            button.map(|_| LRESULT(0))
         }
         WM_GETMINMAXINFO => {
             set_min_track_size(hwnd, lparam);
@@ -555,6 +624,121 @@ fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
         }
         _ => None,
     }
+}
+
+/// Gives the caption's room to the client. The side and bottom frames stay
+/// (they resize the window); the top resize band is handled in
+/// [`hit_test`]. Maximized, the frame hangs off the monitor, so the client
+/// starts below it.
+fn calc_client(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: for WM_NCCALCSIZE with a non-zero wParam, `lparam` points to
+    // an NCCALCSIZE_PARAMS the system owns for the duration of the message.
+    let params = unsafe { &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS) };
+    let top = params.rgrc[0].top;
+    let result = default_proc(hwnd, msg, wparam, lparam);
+    params.rgrc[0].top = top;
+    // SAFETY: plain query on our live window.
+    if unsafe { IsZoomed(hwnd) }.as_bool() {
+        params.rgrc[0].top += frame_thickness(hwnd);
+    }
+    result
+}
+
+/// Height of the resize band along the top edge, in pixels.
+fn frame_thickness(hwnd: HWND) -> i32 {
+    let dpi = window_dpi(hwnd);
+    // SAFETY: plain metric queries.
+    unsafe {
+        GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+    }
+}
+
+fn hit_test(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let hit = default_proc(hwnd, msg, wparam, lparam);
+    if hit.0 != HTCLIENT as isize {
+        return hit;
+    }
+    let raw = lparam.0 as usize;
+    let mut p = POINT {
+        x: i32::from(loword(raw) as i16),
+        y: i32::from(hiword(raw) as i16),
+    };
+    // SAFETY: `p` is a valid in/out pointer; `hwnd` is live.
+    let _ = unsafe { ScreenToClient(hwnd, &mut p) };
+    // SAFETY: plain query on our live window.
+    let maximized = unsafe { IsZoomed(hwnd) }.as_bool();
+    let band = frame_thickness(hwnd);
+    if !maximized && p.y < band {
+        let (width, _) = client_size(hwnd);
+        let code = if p.x < 2 * band {
+            HTTOPLEFT
+        } else if p.x >= width as i32 - 2 * band {
+            HTTOPRIGHT
+        } else {
+            HTTOP
+        };
+        return LRESULT(code as isize);
+    }
+    let point = scale_to_dips(hwnd, p.x, p.y);
+    let what = window_state(hwnd)
+        .and_then(|state| {
+            let shell = state.shell.try_borrow().ok()?;
+            Some(shell.as_ref()?.hit_test(point))
+        })
+        .unwrap_or(WindowHit::Client);
+    let code = match what {
+        WindowHit::Client => HTCLIENT,
+        WindowHit::Caption => HTCAPTION,
+        WindowHit::Minimize => HTMINBUTTON,
+        WindowHit::Maximize => HTMAXBUTTON,
+        WindowHit::Close => HTCLOSE,
+    };
+    LRESULT(code as isize)
+}
+
+/// The caption button a non-client message's hit-test code names.
+fn caption_button(wparam: WPARAM) -> Option<WindowHit> {
+    match wparam.0 as u32 {
+        HTMINBUTTON => Some(WindowHit::Minimize),
+        HTMAXBUTTON => Some(WindowHit::Maximize),
+        HTCLOSE => Some(WindowHit::Close),
+        _ => None,
+    }
+}
+
+fn set_caption(
+    hwnd: HWND,
+    state: &WindowState,
+    hover: Option<WindowHit>,
+    pressed: Option<WindowHit>,
+) {
+    if (state.caption_hover.get(), state.caption_pressed.get()) == (hover, pressed) {
+        return;
+    }
+    state.caption_hover.set(hover);
+    state.caption_pressed.set(pressed);
+    let response = with_shell(hwnd, |s| s.set_caption_state(hover, pressed));
+    apply(hwnd, response);
+}
+
+fn press_caption_button(hwnd: HWND, button: WindowHit) {
+    // SAFETY: plain query on our live window.
+    let maximized = unsafe { IsZoomed(hwnd) }.as_bool();
+    let show = match button {
+        WindowHit::Minimize => SW_MINIMIZE,
+        WindowHit::Maximize if maximized => SW_RESTORE,
+        WindowHit::Maximize => SW_MAXIMIZE,
+        WindowHit::Close => {
+            // Through WM_CLOSE, which asks about unsaved files.
+            // SAFETY: posting to our own live window from its thread.
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            return;
+        }
+        WindowHit::Client | WindowHit::Caption => return,
+    };
+    // SAFETY: `hwnd` is our live window. The return value is the previous
+    // visibility, not an error.
+    let _ = unsafe { ShowWindow(hwnd, show) };
 }
 
 fn loword(v: usize) -> u16 {
