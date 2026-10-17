@@ -2,7 +2,6 @@
 
 use std::path::PathBuf;
 
-use crate::dock::PaneId;
 use crate::event::{CursorShape, Event};
 use crate::geom::RectF;
 use crate::replay::ReplayAction;
@@ -39,8 +38,6 @@ pub enum Action {
     },
     /// Focus and centre a frame's box in the Data view (call stack click).
     RevealFrame(usize),
-    /// Show a hidden panel, or hide a shown one.
-    TogglePane(PaneId),
     /// A play bar command.
     Replay(ReplayAction),
 }

@@ -24,7 +24,6 @@ use renderer::{Cursor, Filter, GraphModel, GraphView, NodeClass, Rgba, Style, Ve
 
 use crate::codepane::Target;
 use crate::debug::Phase;
-use crate::dock::PaneId;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::geom::{PointF, RectF};
 use crate::panel::{Action, Cx, DebugAction, Panel};
@@ -88,8 +87,6 @@ enum Button {
     Library,
     Generated,
     Locals,
-    Source,
-    Stack,
     Program,
     Run,
     Play,
@@ -109,7 +106,7 @@ impl Button {
         Self::Generated,
         Self::Locals,
     ];
-    const DATA: [Self; 11] = [
+    const DATA: [Self; 9] = [
         Self::Program,
         Self::Run,
         Self::Play,
@@ -119,8 +116,6 @@ impl Button {
         Self::StepOut,
         Self::Stop,
         Self::Fit,
-        Self::Source,
-        Self::Stack,
     ];
 
     fn label(self, debug: &DebugStatus) -> String {
@@ -133,8 +128,6 @@ impl Button {
             Self::Library => "Library".into(),
             Self::Generated => "Generated".into(),
             Self::Locals => "Locals".into(),
-            Self::Source => "Source".into(),
-            Self::Stack => "Call stack".into(),
             Self::Program => match &debug.program {
                 Some(p) => format!("Program: {p}"),
                 None => "Choose program\u{2026}".into(),
@@ -154,10 +147,7 @@ impl Button {
     }
 
     fn is_toggle(self) -> bool {
-        matches!(
-            self,
-            Self::Library | Self::Generated | Self::Locals | Self::Source | Self::Stack
-        )
+        matches!(self, Self::Library | Self::Generated | Self::Locals)
     }
 
     fn is_mode(self) -> bool {
@@ -193,10 +183,6 @@ struct Bench {
 pub struct Visualizer {
     mode: Mode,
     data: DataView,
-    /// Whether the Source and Call stack panels are docked (their toolbar
-    /// toggles show it).
-    show_code: bool,
-    show_stack: bool,
     debug: DebugStatus,
     rect: RectF,
     toolbar: RectF,
@@ -230,8 +216,6 @@ impl Visualizer {
         let v = Self {
             mode: Mode::Graph,
             data: DataView::new(),
-            show_code: true,
-            show_stack: true,
             debug: DebugStatus::default(),
             rect: RectF::default(),
             toolbar: RectF::default(),
@@ -282,12 +266,6 @@ impl Visualizer {
     /// Focuses and centres a frame's box (a call stack click).
     pub fn reveal_frame(&mut self, i: usize) {
         self.data.reveal_frame(i);
-    }
-
-    /// Whether the Source and Call stack panels are docked.
-    pub fn set_panes_shown(&mut self, source: bool, stack: bool) {
-        self.show_code = source;
-        self.show_stack = stack;
     }
 
     /// The program is running (or ended): the data shown is from the last
@@ -519,8 +497,6 @@ impl Visualizer {
             Button::Library => self.filter.library,
             Button::Generated => self.filter.generated,
             Button::Locals => self.filter.locals,
-            Button::Source => self.show_code,
-            Button::Stack => self.show_stack,
             Button::Play => {
                 self.debug.recording.is_some() || self.debug.replay.is_some_and(|r| r.playing)
             }
@@ -550,11 +526,8 @@ impl Visualizer {
             Button::Library => self.filter.library ^= true,
             Button::Generated => self.filter.generated ^= true,
             Button::Locals => self.filter.locals ^= true,
-            Button::Source => cx.act(Action::TogglePane(PaneId::Source)),
-            Button::Stack => cx.act(Action::TogglePane(PaneId::CallStack)),
         }
-        let panes = matches!(b, Button::Source | Button::Stack);
-        if b.is_toggle() && !panes && !self.synthetic {
+        if b.is_toggle() && !self.synthetic {
             self.dirty = true;
             self.update();
         }
@@ -1011,10 +984,7 @@ impl Panel for Visualizer {
             Mode::Data => &Button::DATA,
         };
         for &b in rest {
-            if matches!(
-                b,
-                Button::Library | Button::Run | Button::Stop | Button::Source
-            ) {
+            if matches!(b, Button::Library | Button::Run | Button::Stop) {
                 x += 14.0; // separates groups
             }
             let extra = if b.is_toggle() { 12.0 } else { 0.0 };

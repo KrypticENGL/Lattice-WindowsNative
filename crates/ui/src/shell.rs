@@ -262,10 +262,7 @@ impl Views {
     }
 
     fn layout(&mut self, size: SizeF, text: &TextSystem) {
-        let docked = |p| self.workspace_of(p).is_some();
-        let (source, stack) = (docked(PaneId::Source), docked(PaneId::CallStack));
         let v = &mut self.panes.visualizer;
-        v.set_panes_shown(source, stack);
         v.set_debug_status(DebugStatus {
             phase: self.debug.phase(),
             program: self
@@ -1010,7 +1007,6 @@ impl Views {
                         self.panes.visualizer.reveal_frame(i);
                         cx.repaint();
                     }
-                    Action::TogglePane(pane) => self.toggle_pane(pane, cx),
                 }
             }
         }
