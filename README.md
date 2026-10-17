@@ -4,7 +4,8 @@ A native Windows IDE with a code-graph visualizer, written in Rust directly
 against Win32 via the [`windows`](https://crates.io/crates/windows) crate (no
 GUI framework).
 
-**Status:** Stage 4, the visualizer. The app has two top-level tabs:
+**Status:** Stage 5 in progress (dockable panels). The app has two
+top-level workspaces, and every panel in them can be docked anywhere:
 - **Code:** the Solution Explorer, a tabbed editor, an Output panel and a
   ConPTY terminal. Object files (`.obj`, `.o`) expand in the Explorer into
   their functions, variables and externals, read by `crates/engine`, and
@@ -63,11 +64,13 @@ cargo test --workspace
 | Debug a program (Data mode) | Build it with `g++ -g` (or `gcc -g`). Set breakpoints with `F9` on the caret line, or click the editor's gutter. `F5` runs it: the program is `foo.exe` next to the open `foo.cpp`, or the one chosen with **Program**. With no breakpoints it stops at `main`. It gets its own console window for input and output |
 | Step | `F5` continue, `F10` step over, `F11` step into, `Shift+F11` step out, `Shift+F5` stop, or the toolbar buttons; **Pause** interrupts a running program. In the Code tab the editor follows each stop |
 | Read the data | Frames are on the left, outermost first. Pointers are dots with arrows to what they point at; back pointers (`prev`, `parent`, cycles, shared nodes) are grey curves. A value that changed in the last step is tinted lime. Click a box to focus it: its type, size and address and each field's type appear, and unrelated boxes dim. Double-click a frame to open its source line. Drag to pan, wheel to zoom, `F` or **Fit** to frame everything |
-| Source and call stack (Data mode) | A column left of the canvas (drag its edge to resize). **Source** shows the file of the stopped line, marked with a lime chevron like the editor, and scrolls to it at every stop; the gutter toggles breakpoints, a double-click opens the line in the editor, Shift+wheel scrolls sideways. Below it, the call stack lists the frames innermost first with `file:line` and arguments. Click a frame to focus and centre its box; the source pane then shows its call site. **Source** and **Call stack** in the toolbar hide or show each pane |
+| Source and call stack (Data mode) | Two panels, left of the canvas by default. **Source** shows the file of the stopped line, marked with a lime chevron like the editor, and scrolls to it at every stop; the gutter toggles breakpoints, a double-click opens the line in the editor, Shift+wheel scrolls sideways. Below it, the call stack lists the frames innermost first with `file:line` and arguments. Click a frame to focus and centre its box; the Source panel then shows its call site. **Source** and **Call stack** in the toolbar close or reopen each panel |
+| Dock panels | Drag a panel by its tab. Dropping on a side of another panel docks it there, on its tab strip or middle joins its tabs, and on an outer edge of the workspace docks it along that whole edge; a lime overlay shows where. Drag onto the **Code** / **Visualizer** title to move a panel to the other workspace. `Esc` cancels a drag |
+| Close and reopen panels | The `×` on a tab (or a middle-click) closes it; **Panels** in the top strip lists every panel and reopens a closed one where it was. The editor and the Visualizer canvas can move but not close |
 | Benchmark | `Ctrl+Shift+G` loads a synthetic 10,000-node graph; `Ctrl+Shift+B` measures frame times and prints them to Output (see [`crates/renderer/DESIGN.md`](crates/renderer/DESIGN.md)) |
 | Editor | Type to edit. `Ctrl+S` save, `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+Z` redo, `Ctrl+A/C/X/V`, `Ctrl+W` close tab, `Ctrl+Tab` next tab. Shift+arrows or a mouse drag selects; double-click selects a word |
-| Terminal | Click **TERMINAL** or press `` Ctrl+` ``. `Ctrl+V` pastes; the mouse wheel scrolls the history. Press `Enter` to restart the shell after it exits |
-| Resize panes | Drag the divider between Explorer and editor, or between editor and the bottom panel |
+| Terminal | Click its tab or press `` Ctrl+` `` (reopens it if closed). `Ctrl+V` pastes; the mouse wheel scrolls the history. Press `Enter` to restart the shell after it exits |
+| Resize panels | Drag any divider between panels |
 | Debug only | `Ctrl+Shift+F12` simulates GPU device loss to exercise recovery |
 
 Locals and types come from debug info. Compile with `-g` (gcc/clang) or
@@ -128,11 +131,14 @@ it. `app` hands the window to `ui` as an opaque `ui::NativeWindow`.
   loss.
 
 **Panels** (`ui/src/`):
-- `shell.rs` handles focus and input routing. The top strip is shared;
-  everything below it belongs to the active tab, so the Visualizer never
-  shares layout or input with the Code tab.
-- `split.rs` holds the splitters. The editor-to-bottom splitter keeps the
-  bottom pane's size when the window resizes.
+- `shell.rs` owns every panel and routes input. The top strip is shared;
+  below it is the active workspace's dock area, so the two workspaces never
+  share layout or input.
+- `dock/` is the docking: `tree.rs` is the layout (splits holding shares
+  of their space, leaves that are tab groups) with insert, remove, restore
+  and divider drags, pure and unit-tested; `mod.rs` lays a tree out, draws
+  tab strips, dividers and the drop overlay, and turns tab drags into
+  drops.
 - `explorer.rs` is a lazily loaded tree with directories first; `.git` is
   hidden.
 - `editor/` contains the line buffer with byte-column positions, undo

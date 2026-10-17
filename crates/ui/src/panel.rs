@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use crate::dock::PaneId;
 use crate::event::{CursorShape, Event};
 use crate::geom::RectF;
 use crate::sys::gfx::DrawCtx;
@@ -35,6 +36,10 @@ pub enum Action {
         error: bool,
         text: String,
     },
+    /// Focus and centre a frame's box in the Data view (call stack click).
+    RevealFrame(usize),
+    /// Show a hidden panel, or hide a shown one.
+    TogglePane(PaneId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

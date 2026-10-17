@@ -11,6 +11,7 @@ use std::time::SystemTime;
 
 use crate::event::{Event, MouseButton};
 use crate::geom::{PointF, RectF};
+use crate::panel::{Action, Cx, Panel};
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::{TextStyle, TextSystem};
 use crate::theme::Theme;
@@ -64,6 +65,8 @@ pub struct CodePane {
     hscroll: f32,
     /// Scroll the target line into the middle at the next layout.
     recenter: bool,
+    /// The program is running: the line is from the last stop.
+    stale: bool,
 }
 
 impl CodePane {
@@ -116,8 +119,8 @@ impl CodePane {
         self.breakpoints = lines;
     }
 
-    pub fn rect(&self) -> RectF {
-        self.rect
+    pub fn set_stale(&mut self, stale: bool) {
+        self.stale = stale;
     }
 
     fn load(&mut self) {
@@ -140,7 +143,7 @@ impl CodePane {
         }
     }
 
-    pub fn layout(&mut self, rect: RectF, text: &TextSystem) {
+    fn place(&mut self, rect: RectF, text: &TextSystem) {
         self.rect = rect;
         self.body = rect.split_top(HEADER_H).1;
         let mono = text.line_height(TextStyle::Mono);
@@ -184,7 +187,7 @@ impl CodePane {
 
     /// Handles an event over the pane. Returns whether to repaint and
     /// what the host should do.
-    pub fn on_event(&mut self, e: &Event) -> (bool, Option<CodeAction>) {
+    fn handle(&mut self, e: &Event) -> (bool, Option<CodeAction>) {
         match *e {
             Event::MouseDown {
                 pos,
@@ -221,7 +224,8 @@ impl CodePane {
         }
     }
 
-    pub fn paint(&self, d: &mut DrawCtx, theme: &Theme, stale: bool) {
+    fn draw(&self, d: &mut DrawCtx, theme: &Theme) {
+        let stale = self.stale;
         let r = self.rect;
         d.fill_rect(r, theme.editor_bg);
         let a = if stale { STALE } else { 1.0 };
@@ -334,6 +338,31 @@ impl CodePane {
     }
 }
 
+impl Panel for CodePane {
+    fn layout(&mut self, rect: RectF, text: &TextSystem) {
+        self.place(rect, text);
+    }
+
+    fn paint(&mut self, d: &mut DrawCtx, theme: &Theme, _focused: bool) {
+        self.draw(d, theme);
+    }
+
+    fn on_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
+        let (repaint, action) = self.handle(e);
+        if repaint {
+            cx.repaint();
+        }
+        match action {
+            Some(CodeAction::ToggleBreakpoint(path, line)) => {
+                cx.act(Action::ToggleBreakpoint { path, line });
+            }
+            Some(CodeAction::Open(path, line)) => cx.act(Action::OpenSource { path, line }),
+            None => {}
+        }
+        true
+    }
+}
+
 fn modified(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
@@ -435,15 +464,15 @@ mod tests {
         settle(&mut p);
         let row3 = HEADER_H + 2.5 * 20.0;
         assert_eq!(
-            p.on_event(&click(10.0, row3, 1)),
+            p.handle(&click(10.0, row3, 1)),
             (true, Some(CodeAction::ToggleBreakpoint("m.cpp".into(), 3)))
         );
-        assert_eq!(p.on_event(&click(200.0, row3, 1)), (false, None));
+        assert_eq!(p.handle(&click(200.0, row3, 1)), (false, None));
         assert_eq!(
-            p.on_event(&click(200.0, row3, 2)),
+            p.handle(&click(200.0, row3, 2)),
             (true, Some(CodeAction::Open("m.cpp".into(), 3)))
         );
-        assert_eq!(p.on_event(&click(200.0, 5.0, 2)), (false, None), "header");
+        assert_eq!(p.handle(&click(200.0, 5.0, 2)), (false, None), "header");
     }
 
     #[test]

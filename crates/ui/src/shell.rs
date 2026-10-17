@@ -1,28 +1,35 @@
-//! Root of the UI: the top-level Code/Visualizer tabs, the Code tab layout
-//! (Explorer │ Editor ─ Output/Terminal), focus and input routing.
+//! Root of the UI: the top strip (Code/Visualizer workspaces and the
+//! Panels menu), each workspace's dock area, focus and input routing.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::bottom::{BottomArea, BottomTab};
+use crate::callstack::CallStack;
+use crate::codepane::CodePane;
 use crate::debug::{self, Debug, Phase, Update};
+use crate::dock::{Axis, DockArea, Drop, Node, PaneHost, PaneId, Request, Spot, TabDrag, Zone};
 use crate::editor::EditorArea;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::explorer::Explorer;
 use crate::folder_watch::{Changes, FolderWatcher};
 use crate::geom::{PointF, RectF, SizeF};
 use crate::objects::{LoadResult, ObjectEvent, ObjectService};
+use crate::output::Output;
 use crate::panel::{Action, Cx, DebugAction, Panel};
-use crate::split::{Anchor, Axis, Splitter};
 use crate::sys::dialog::{self, ComGuard};
 use crate::sys::gfx::{DrawCtx, Frame, Graphics};
 use crate::sys::text::{TextStyle, TextSystem};
 use crate::sys::{NativeWindow, Waker};
+use crate::terminal::Terminal;
 use crate::theme::Theme;
 use crate::visualizer::{DebugStatus, Mode, Visualizer};
 use crate::Error;
 
 const TOP_STRIP_H: f32 = 34.0;
 const TOP_TAB_PAD: f32 = 16.0;
+const MENU_W: f32 = 230.0;
+const MENU_ROW_H: f32 = 26.0;
+const MENU_PAD: f32 = 4.0;
 
 /// What the app should do after a call into the shell.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -31,168 +38,113 @@ pub struct Response {
     pub repaint: bool,
 }
 
+/// The two workspaces, each with its own dock layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TopTab {
     Code,
     Visualizer,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Region {
-    Explorer,
-    Editor,
-    Bottom,
+impl TopTab {
+    const ALL: [Self; 2] = [Self::Code, Self::Visualizer];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Code => "Code",
+            Self::Visualizer => "Visualizer",
+        }
+    }
 }
 
 /// Who receives mouse events between a press and its release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MouseOwner {
-    Region(Region),
-    Splitter(Axis),
     TopStrip,
+    Dock,
 }
 
-struct CodeView {
-    vsplit: Splitter,
-    hsplit: Splitter,
+/// Every panel, wherever it is docked.
+struct Panes {
     explorer: Explorer,
     editor: EditorArea,
-    bottom: BottomArea,
-    focus: Region,
-    hover: Option<Region>,
-    rects: [RectF; 3],
+    output: Output,
+    terminal: Terminal,
+    visualizer: Visualizer,
+    source: CodePane,
+    stack: CallStack,
 }
 
-impl CodeView {
-    fn new(waker: Waker) -> Self {
-        Self {
-            vsplit: Splitter::new(Axis::Horizontal, Anchor::Start, 260.0, 160.0, 300.0),
-            hsplit: Splitter::new(Axis::Vertical, Anchor::End, 240.0, 90.0, 120.0),
-            explorer: Explorer::default(),
-            editor: EditorArea::default(),
-            bottom: BottomArea::new(waker),
-            focus: Region::Explorer,
-            hover: None,
-            rects: [RectF::default(); 3],
+impl PaneHost for Panes {
+    fn pane(&mut self, id: PaneId) -> &mut dyn Panel {
+        match id {
+            PaneId::Explorer => &mut self.explorer,
+            PaneId::Editor => &mut self.editor,
+            PaneId::Output => &mut self.output,
+            PaneId::Terminal => &mut self.terminal,
+            PaneId::Visualizer => &mut self.visualizer,
+            PaneId::Source => &mut self.source,
+            PaneId::CallStack => &mut self.stack,
         }
     }
+}
 
-    fn panel(&mut self, r: Region) -> &mut dyn Panel {
-        match r {
-            Region::Explorer => &mut self.explorer,
-            Region::Editor => &mut self.editor,
-            Region::Bottom => &mut self.bottom,
-        }
+/// The layouts a fresh install starts with.
+fn default_tree(tab: TopTab) -> Node {
+    use PaneId::*;
+    match tab {
+        TopTab::Code => Node::split(
+            Axis::Horizontal,
+            vec![
+                (Node::tabs(&[Explorer]), 0.2),
+                (
+                    Node::split(
+                        Axis::Vertical,
+                        vec![
+                            (Node::tabs(&[Editor]), 0.7),
+                            (Node::tabs(&[Output, Terminal]), 0.3),
+                        ],
+                    ),
+                    0.8,
+                ),
+            ],
+        ),
+        TopTab::Visualizer => Node::split(
+            Axis::Horizontal,
+            vec![
+                (
+                    Node::split(
+                        Axis::Vertical,
+                        vec![
+                            (Node::tabs(&[Source]), 0.65),
+                            (Node::tabs(&[CallStack]), 0.35),
+                        ],
+                    ),
+                    0.3,
+                ),
+                (Node::tabs(&[Visualizer]), 0.7),
+            ],
+        ),
     }
+}
 
-    fn region_at(&self, p: PointF) -> Option<Region> {
-        [Region::Explorer, Region::Editor, Region::Bottom]
-            .into_iter()
-            .zip(self.rects)
-            .find(|(_, r)| r.contains(p))
-            .map(|(region, _)| region)
-    }
-
-    fn splitter(&mut self, axis: Axis) -> &mut Splitter {
-        match axis {
-            Axis::Horizontal => &mut self.vsplit,
-            Axis::Vertical => &mut self.hsplit,
-        }
-    }
-
-    fn layout(&mut self, r: RectF, text: &TextSystem) {
-        let (left, right) = self.vsplit.layout(r);
-        let (top, bottom) = self.hsplit.layout(right);
-        self.rects = [left, top, bottom];
-        self.explorer.layout(left, text);
-        self.editor.layout(top, text);
-        self.bottom.layout(bottom, text);
-    }
-
-    fn paint(&mut self, d: &mut DrawCtx, theme: &Theme, window_focused: bool) {
-        let focus = self.focus;
-        let f = |r: Region| window_focused && focus == r;
-        self.explorer.paint(d, theme, f(Region::Explorer));
-        self.editor.paint(d, theme, f(Region::Editor));
-        self.bottom.paint(d, theme, f(Region::Bottom));
-        self.vsplit.paint(d, theme);
-        self.hsplit.paint(d, theme);
-    }
-
-    fn set_focus(&mut self, r: Region, cx: &mut Cx) {
-        if self.focus != r {
-            self.focus = r;
-            cx.repaint();
-        }
-    }
-
-    fn on_event(&mut self, e: &Event, owner: &mut Option<MouseOwner>, cx: &mut Cx) {
-        match *e {
-            Event::KeyDown { .. } | Event::Char(_) => {
-                let focus = self.focus;
-                self.panel(focus).on_event(e, cx);
-            }
-            Event::MouseDown { pos, .. } => {
-                for axis in [Axis::Horizontal, Axis::Vertical] {
-                    if self.splitter(axis).on_event(e, cx) {
-                        *owner = Some(MouseOwner::Splitter(axis));
-                        return;
-                    }
-                }
-                if let Some(r) = self.region_at(pos) {
-                    self.set_focus(r, cx);
-                    *owner = Some(MouseOwner::Region(r));
-                    self.panel(r).on_event(e, cx);
-                }
-            }
-            Event::MouseMove { pos, .. } => match *owner {
-                Some(MouseOwner::Splitter(axis)) => {
-                    self.splitter(axis).on_event(e, cx);
-                }
-                Some(MouseOwner::Region(r)) => {
-                    self.panel(r).on_event(e, cx);
-                }
-                _ => {
-                    let on_splitter = self.vsplit.on_event(e, cx) | self.hsplit.on_event(e, cx);
-                    let region = if on_splitter {
-                        None
-                    } else {
-                        self.region_at(pos)
-                    };
-                    if region != self.hover {
-                        if let Some(old) = self.hover {
-                            self.panel(old).on_event(&Event::MouseLeave, cx);
-                        }
-                        self.hover = region;
-                    }
-                    if let Some(r) = region {
-                        self.panel(r).on_event(e, cx);
-                    }
-                }
-            },
-            Event::MouseUp { .. } => match owner.take() {
-                Some(MouseOwner::Splitter(axis)) => {
-                    self.splitter(axis).on_event(e, cx);
-                }
-                Some(MouseOwner::Region(r)) => {
-                    self.panel(r).on_event(e, cx);
-                }
-                _ => {}
-            },
-            Event::Wheel { pos, .. } => {
-                if let Some(r) = self.region_at(pos) {
-                    self.panel(r).on_event(e, cx);
-                }
-            }
-            Event::MouseLeave => {
-                self.vsplit.on_event(e, cx);
-                self.hsplit.on_event(e, cx);
-                if let Some(old) = self.hover.take() {
-                    self.panel(old).on_event(e, cx);
-                }
-            }
-            Event::Focus(_) => cx.repaint(),
-        }
+/// Where a panel goes when shown with no remembered spot.
+fn default_spot(pane: PaneId) -> (TopTab, Spot) {
+    use PaneId::*;
+    let spot = |anchor, zone, share| Spot {
+        anchor,
+        zone,
+        share,
+    };
+    match pane {
+        Explorer => (TopTab::Code, spot(None, Zone::Left, 0.2)),
+        Editor => (TopTab::Code, spot(None, Zone::Center, 1.0)),
+        Output | Terminal => (TopTab::Code, spot(Some(Editor), Zone::Bottom, 0.3)),
+        Visualizer => (TopTab::Visualizer, spot(None, Zone::Center, 1.0)),
+        Source | CallStack => (TopTab::Visualizer, spot(Some(Visualizer), Zone::Left, 0.3)),
     }
 }
 
@@ -202,8 +154,17 @@ struct Views {
     strip: RectF,
     tab_rects: [RectF; 2],
     tab_hover: Option<usize>,
-    code: CodeView,
-    visualizer: Visualizer,
+    panels_button: RectF,
+    panels_hover: bool,
+    /// The Panels menu, when open: one row per panel.
+    menu: Option<Vec<(PaneId, RectF)>>,
+    menu_hover: Option<PaneId>,
+    areas: [DockArea; 2],
+    /// Where each closed panel was, so showing it puts it back.
+    closed: HashMap<PaneId, (TopTab, Spot)>,
+    /// A tab being pressed or dragged, in either workspace.
+    drag: Option<TabDrag>,
+    panes: Panes,
     owner: Option<MouseOwner>,
     window_focused: bool,
     objects: ObjectService,
@@ -212,8 +173,94 @@ struct Views {
 }
 
 impl Views {
+    fn area(&mut self) -> &mut DockArea {
+        &mut self.areas[self.tab.index()]
+    }
+
+    fn workspace_of(&self, pane: PaneId) -> Option<TopTab> {
+        TopTab::ALL
+            .into_iter()
+            .find(|t| self.areas[t.index()].contains(pane))
+    }
+
+    /// Docks a closed panel where it was (or its default spot).
+    fn show_pane(&mut self, pane: PaneId) {
+        if self.workspace_of(pane).is_some() {
+            return;
+        }
+        let (tab, spot) = self
+            .closed
+            .remove(&pane)
+            .unwrap_or_else(|| default_spot(pane));
+        self.areas[tab.index()].tree.restore(pane, spot);
+    }
+
+    fn hide_pane(&mut self, pane: PaneId, cx: &mut Cx) {
+        if !pane.closable() {
+            return;
+        }
+        let Some(tab) = self.workspace_of(pane) else {
+            return;
+        };
+        let area = &mut self.areas[tab.index()];
+        area.leave(&mut self.panes, cx);
+        if let Some(spot) = area.tree.remove(pane) {
+            self.closed.insert(pane, (tab, spot));
+        }
+        cx.repaint();
+    }
+
+    fn toggle_pane(&mut self, pane: PaneId, cx: &mut Cx) {
+        if self.workspace_of(pane).is_some() && pane.closable() {
+            self.hide_pane(pane, cx);
+        } else {
+            self.reveal_pane(pane, cx);
+        }
+    }
+
+    /// Shows a panel (docking it if closed), switches to its workspace and
+    /// gives it the keyboard.
+    fn reveal_pane(&mut self, pane: PaneId, cx: &mut Cx) {
+        self.show_pane(pane);
+        if let Some(tab) = self.workspace_of(pane) {
+            self.switch_tab(tab, cx);
+            self.areas[tab.index()].reveal(pane, cx);
+        }
+    }
+
+    /// Gives a panel the keyboard if it is in the current workspace.
+    fn focus_if_here(&mut self, pane: PaneId, cx: &mut Cx) {
+        if self.area().contains(pane) {
+            self.area().reveal(pane, cx);
+        }
+    }
+
+    fn apply_request(&mut self, r: Request, cx: &mut Cx) {
+        match r {
+            Request::Close(pane) => self.hide_pane(pane, cx),
+            Request::Move { pane, to } => {
+                // Out of whichever workspace it was in, into the current one.
+                if let Some(from) = self.workspace_of(pane) {
+                    self.areas[from.index()].tree.remove(pane);
+                }
+                let (anchor, zone) = match to {
+                    Drop::Group { anchor, zone } => (Some(anchor), zone),
+                    Drop::Edge(zone) => (None, zone),
+                };
+                let area = self.area();
+                area.tree.insert(pane, anchor, zone);
+                area.reveal(pane, cx);
+            }
+        }
+        cx.repaint();
+    }
+
     fn layout(&mut self, size: SizeF, text: &TextSystem) {
-        self.visualizer.set_debug_status(DebugStatus {
+        let docked = |p| self.workspace_of(p).is_some();
+        let (source, stack) = (docked(PaneId::Source), docked(PaneId::CallStack));
+        let v = &mut self.panes.visualizer;
+        v.set_panes_shown(source, stack);
+        v.set_debug_status(DebugStatus {
             phase: self.debug.phase(),
             program: self
                 .debug
@@ -221,24 +268,61 @@ impl Views {
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
             stopped: self.debug.stop_description(),
         });
+        // The Source panel follows the frame focused in the Data view.
+        let target = self.panes.visualizer.code_target();
+        self.panes.source.show(target);
+
         let full = RectF::new(0.0, 0.0, size.w, size.h);
         let (strip, body) = full.split_top(TOP_STRIP_H);
         self.strip = strip;
         let mut x = strip.x + 8.0;
-        for (i, label) in ["Code", "Visualizer"].into_iter().enumerate() {
-            let w = text.measure(TextStyle::Ui, label) + 2.0 * TOP_TAB_PAD;
-            self.tab_rects[i] = RectF::new(x, strip.y, w, strip.h);
+        for t in TopTab::ALL {
+            let w = text.measure(TextStyle::Ui, t.title()) + 2.0 * TOP_TAB_PAD;
+            self.tab_rects[t.index()] = RectF::new(x, strip.y, w, strip.h);
             x += w;
         }
-        self.code.layout(body, text);
-        self.visualizer.layout(body, text);
+        let w = text.measure(TextStyle::UiSmall, "Panels \u{25be}") + 2.0 * 10.0;
+        self.panels_button = RectF::new(x + 12.0, strip.y + 5.0, w, strip.h - 10.0);
+        if self.menu.is_some() {
+            self.menu = Some(self.menu_rows());
+        }
+        for area in &mut self.areas {
+            area.layout(body, text, &mut self.panes);
+        }
+    }
+
+    fn menu_rows(&self) -> Vec<(PaneId, RectF)> {
+        let b = self.panels_button;
+        PaneId::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let y = self.strip.bottom() + 2.0 + MENU_PAD + i as f32 * MENU_ROW_H;
+                (
+                    p,
+                    RectF::new(b.x + MENU_PAD, y, MENU_W - 2.0 * MENU_PAD, MENU_ROW_H),
+                )
+            })
+            .collect()
+    }
+
+    fn menu_rect(&self) -> Option<RectF> {
+        let rows = self.menu.as_ref()?;
+        let last = rows.last()?.1;
+        Some(RectF::new(
+            self.panels_button.x,
+            self.strip.bottom() + 2.0,
+            MENU_W,
+            last.bottom() + MENU_PAD - self.strip.bottom() - 2.0,
+        ))
     }
 
     fn paint(&mut self, d: &mut DrawCtx, theme: &Theme) {
         d.fill_rect(self.strip, theme.chrome_bg);
-        for (i, label) in ["Code", "Visualizer"].into_iter().enumerate() {
+        for t in TopTab::ALL {
+            let i = t.index();
             let r = self.tab_rects[i];
-            let active = i == self.tab_index();
+            let active = t == self.tab;
             if !active && self.tab_hover == Some(i) {
                 d.fill_rect(r, theme.hover_bg);
             }
@@ -249,7 +333,7 @@ impl Views {
             };
             d.text(
                 TextStyle::Ui,
-                label,
+                t.title(),
                 RectF::new(r.x + TOP_TAB_PAD, r.y, r.w - TOP_TAB_PAD, r.h),
                 color,
             );
@@ -260,11 +344,26 @@ impl Views {
                 );
             }
         }
-        if let Some(root) = self.code.explorer.root_path() {
+        let b = self.panels_button;
+        if self.panels_hover || self.menu.is_some() {
+            d.fill_round_rect(b, 4.0, theme.hover_bg);
+        }
+        let label_color = if self.menu.is_some() {
+            theme.text
+        } else {
+            theme.text_dim
+        };
+        d.text(
+            TextStyle::UiSmall,
+            "Panels \u{25be}",
+            RectF::new(b.x + 10.0, b.y, b.w - 10.0, b.h),
+            label_color,
+        );
+        if let Some(root) = self.panes.explorer.root_path() {
             let label = root.display().to_string();
             let w = d.text_system().measure(TextStyle::UiSmall, &label);
-            let after_tabs = self.tab_rects[1].right() + 16.0;
-            let x = (self.strip.right() - w - 12.0).max(after_tabs);
+            let after = b.right() + 16.0;
+            let x = (self.strip.right() - w - 12.0).max(after);
             d.text(
                 TextStyle::UiSmall,
                 &label,
@@ -276,28 +375,130 @@ impl Views {
             RectF::new(self.strip.x, self.strip.bottom() - 1.0, self.strip.w, 1.0),
             theme.border,
         );
+
         let debug = &self.debug;
-        self.code.editor.set_marks(|p| debug.marks_for(p));
-        self.visualizer
-            .set_code_breakpoints(|p| debug.marks_for(p).0);
-        match self.tab {
-            TopTab::Code => self.code.paint(d, theme, self.window_focused),
-            TopTab::Visualizer => self.visualizer.paint(d, theme, self.window_focused),
+        let p = &mut self.panes;
+        p.editor.set_marks(|path| debug.marks_for(path));
+        let lines = p.source.path().map(|path| debug.marks_for(path).0);
+        p.source.set_breakpoints(lines.unwrap_or_default());
+        let stale = debug.phase() != Phase::Stopped;
+        p.source.set_stale(stale);
+        p.stack.set_view(p.visualizer.focused_frame(), stale);
+
+        let i = self.tab.index();
+        self.areas[i].paint(d, theme, &mut self.panes, self.window_focused);
+        self.paint_menu(d, theme);
+    }
+
+    fn paint_menu(&self, d: &mut DrawCtx, theme: &Theme) {
+        let (Some(rows), Some(r)) = (&self.menu, self.menu_rect()) else {
+            return;
+        };
+        d.fill_round_rect(r, 6.0, theme.panel_bg);
+        d.stroke_rect(r, theme.border, 1.0);
+        for &(pane, row) in rows {
+            let ws = self.workspace_of(pane);
+            if self.menu_hover == Some(pane) {
+                d.fill_round_rect(row, 4.0, theme.hover_bg);
+            }
+            // A lime dot when shown, a ring when closed.
+            let c = PointF::new(row.x + 12.0, row.y + row.h / 2.0);
+            if ws.is_some() {
+                d.fill_round_rect(
+                    RectF::new(c.x - 3.5, c.y - 3.5, 7.0, 7.0),
+                    3.5,
+                    theme.accent,
+                );
+            } else {
+                d.stroke_rect(
+                    RectF::new(c.x - 3.0, c.y - 3.0, 6.0, 6.0),
+                    theme.text_dim,
+                    1.0,
+                );
+            }
+            let text = if ws.is_some() {
+                theme.text
+            } else {
+                theme.text_dim
+            };
+            d.text(
+                TextStyle::Ui,
+                pane.title(),
+                RectF::new(row.x + 26.0, row.y, row.w - 26.0, row.h),
+                text,
+            );
+            let hint = ws.map_or("closed", TopTab::title);
+            let w = d.text_system().measure(TextStyle::UiSmall, hint);
+            d.text(
+                TextStyle::UiSmall,
+                hint,
+                RectF::new(row.right() - w - 8.0, row.y, w + 4.0, row.h),
+                theme.text_dim,
+            );
         }
     }
 
-    fn tab_index(&self) -> usize {
-        match self.tab {
-            TopTab::Code => 0,
-            TopTab::Visualizer => 1,
-        }
+    /// The Visualizer canvas is on screen.
+    fn visualizer_shown(&self) -> bool {
+        self.areas[self.tab.index()].is_shown(PaneId::Visualizer)
     }
 
     fn switch_tab(&mut self, tab: TopTab, cx: &mut Cx) {
         if self.tab != tab {
+            let old = self.tab.index();
+            self.areas[old].leave(&mut self.panes, cx);
+            self.areas[old].clear_preview();
             self.tab = tab;
-            self.owner = None;
             cx.repaint();
+        }
+    }
+
+    /// The Panels menu: returns whether it took the event.
+    fn menu_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
+        if self.menu.is_none() {
+            return false;
+        }
+        let row_at = |p: PointF| -> Option<PaneId> {
+            let rows = self.menu.as_ref()?;
+            rows.iter().find(|(_, r)| r.contains(p)).map(|&(id, _)| id)
+        };
+        match *e {
+            Event::MouseDown { pos, .. } => {
+                match row_at(pos) {
+                    Some(pane) => self.toggle_pane(pane, cx),
+                    None => {
+                        self.menu = None;
+                        // A click on the button itself only closes it.
+                        if self.panels_button.contains(pos) {
+                            self.owner = Some(MouseOwner::TopStrip);
+                        } else {
+                            return false;
+                        }
+                    }
+                }
+                cx.repaint();
+                true
+            }
+            Event::MouseMove { pos, .. } => {
+                let hover = row_at(pos);
+                if hover != self.menu_hover {
+                    self.menu_hover = hover;
+                    cx.repaint();
+                }
+                if self.menu_rect().is_some_and(|r| r.contains(pos)) {
+                    self.areas[self.tab.index()].leave(&mut self.panes, cx);
+                    return true;
+                }
+                false
+            }
+            Event::KeyDown {
+                key: Key::Escape, ..
+            } => {
+                self.menu = None;
+                cx.repaint();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -307,11 +508,26 @@ impl Views {
             cx.repaint();
             return;
         }
+        if let (
+            Event::KeyDown {
+                key: Key::Escape, ..
+            },
+            Some(_),
+        ) = (e, self.drag)
+        {
+            self.drag = None;
+            self.area().clear_preview();
+            cx.repaint();
+            return;
+        }
+        if self.menu_event(e, cx) {
+            return;
+        }
         if self.global_key(e, cx) {
             return;
         }
-        // The top strip is shared chrome; everything below belongs to the
-        // active tab only.
+        // The top strip is shared chrome; below it is the current
+        // workspace's dock area.
         match *e {
             Event::MouseDown {
                 pos,
@@ -319,38 +535,62 @@ impl Views {
                 ..
             } if self.strip.contains(pos) => {
                 self.owner = Some(MouseOwner::TopStrip);
-                if self.tab_rects[0].contains(pos) {
-                    self.switch_tab(TopTab::Code, cx);
-                } else if self.tab_rects[1].contains(pos) {
-                    self.switch_tab(TopTab::Visualizer, cx);
-                }
-                return;
-            }
-            Event::MouseMove { pos, .. } if self.owner.is_none() => {
-                let hover = self.tab_rects.iter().position(|r| r.contains(pos));
-                if hover != self.tab_hover {
-                    self.tab_hover = hover;
+                if let Some(i) = self.tab_rects.iter().position(|r| r.contains(pos)) {
+                    self.switch_tab(TopTab::ALL[i], cx);
+                } else if self.panels_button.contains(pos) {
+                    self.menu = Some(self.menu_rows());
+                    self.menu_hover = None;
                     cx.repaint();
                 }
-                if hover.is_some() {
-                    cx.cursor = CursorShape::Hand;
+                return;
+            }
+            Event::MouseDown { pos, .. } if self.strip.contains(pos) => return,
+            Event::MouseDown { .. } => self.owner = Some(MouseOwner::Dock),
+            Event::MouseMove { pos, .. } => {
+                let over_strip = self.strip.contains(pos);
+                if self.drag.is_some_and(|d| d.active) {
+                    // Dragging a tab onto the other workspace's title
+                    // switches to it, so the panel can be dropped there.
+                    if let Some(i) = self.tab_rects.iter().position(|r| r.contains(pos)) {
+                        self.switch_tab(TopTab::ALL[i], cx);
+                    }
+                } else if self.owner.is_none() {
+                    let hover = self.tab_rects.iter().position(|r| r.contains(pos));
+                    let panels = self.panels_button.contains(pos);
+                    if hover != self.tab_hover || panels != self.panels_hover {
+                        self.tab_hover = hover;
+                        self.panels_hover = panels;
+                        cx.repaint();
+                    }
+                    if hover.is_some() || panels {
+                        cx.cursor = CursorShape::Hand;
+                    }
+                    if over_strip {
+                        self.areas[self.tab.index()].leave(&mut self.panes, cx);
+                        return;
+                    }
+                }
+                if self.owner == Some(MouseOwner::TopStrip) {
+                    return;
                 }
             }
-            Event::MouseLeave if self.tab_hover.is_some() => {
-                self.tab_hover = None;
-                cx.repaint();
+            Event::MouseLeave => {
+                let had = self.tab_hover.take().is_some();
+                if had | std::mem::take(&mut self.panels_hover) {
+                    cx.repaint();
+                }
             }
-            Event::MouseUp { .. } if self.owner == Some(MouseOwner::TopStrip) => {
-                self.owner = None;
-                return;
+            Event::MouseUp { .. } => {
+                let strip = self.owner.take() == Some(MouseOwner::TopStrip);
+                if strip && self.drag.is_none() {
+                    return;
+                }
             }
             _ => {}
         }
-        match self.tab {
-            TopTab::Code => self.code.on_event(e, &mut self.owner, cx),
-            TopTab::Visualizer => {
-                self.visualizer.on_event(e, cx);
-            }
+        let i = self.tab.index();
+        if let Some(r) = self.areas[i].on_event(e, &mut self.panes, &mut self.drag, cx) {
+            self.apply_request(r, cx);
         }
     }
 
@@ -368,7 +608,7 @@ impl Views {
                 Key::F(11) if mods.shift => Some(DebugAction::Step(debugger::Command::Finish)),
                 Key::F(11) => Some(DebugAction::Step(debugger::Command::Step)),
                 Key::F(9) => {
-                    if let Some((path, line)) = self.code.editor.caret_location() {
+                    if let Some((path, line)) = self.panes.editor.caret_location() {
                         self.debug.toggle_breakpoint(&path, line, cx);
                     }
                     return true;
@@ -388,9 +628,10 @@ impl Views {
             Key::Digit(1) => self.switch_tab(TopTab::Code, cx),
             Key::Digit(2) => self.switch_tab(TopTab::Visualizer, cx),
             Key::Backquote => {
-                self.switch_tab(TopTab::Code, cx);
-                self.code.bottom.show(BottomTab::Terminal, cx);
-                self.code.set_focus(Region::Bottom, cx);
+                self.reveal_pane(PaneId::Terminal, cx);
+                if !self.panes.terminal.is_running() {
+                    self.panes.terminal.start(cx);
+                }
             }
             _ => return false,
         }
@@ -405,7 +646,7 @@ impl Views {
                     if self.debug.program().is_none() {
                         // `foo.exe` next to the open `foo.cpp`, else ask.
                         let guess = self
-                            .code
+                            .panes
                             .editor
                             .caret_location()
                             .and_then(|(p, _)| debug::program_for_source(&p));
@@ -418,8 +659,10 @@ impl Views {
                             }
                         }
                     }
-                    self.visualizer.clear_data();
-                    self.visualizer.set_mode(Mode::Data, cx);
+                    self.panes.visualizer.clear_data();
+                    self.panes.visualizer.set_mode(Mode::Data, cx);
+                    self.panes.stack.clear();
+                    self.panes.source.clear();
                     self.debug.start(cx);
                 }
                 Phase::Starting | Phase::Running => {}
@@ -429,7 +672,7 @@ impl Views {
             DebugAction::Stop => {
                 if self.debug.is_active() {
                     self.debug.stop(cx);
-                    self.visualizer.set_data_stale(true);
+                    self.panes.visualizer.set_data_stale(true);
                 }
             }
             DebugAction::PickProgram => {
@@ -460,39 +703,46 @@ impl Views {
     fn drain_debug(&mut self, cx: &mut Cx) {
         for u in self.debug.drain(cx) {
             match u {
-                Update::Running => self.visualizer.set_data_stale(true),
+                Update::Running => self.panes.visualizer.set_data_stale(true),
                 Update::Stopped { file, line } => {
-                    // In the Code tab, follow the stop like any debugger.
-                    if let (TopTab::Code, Some(file), Some(line)) = (self.tab, file, line) {
+                    // With the editor in view, follow the stop like any
+                    // debugger.
+                    let here = self.areas[self.tab.index()].contains(PaneId::Editor);
+                    if let (true, Some(file), Some(line)) = (here, file, line) {
                         if file.is_file() {
-                            self.code.editor.open_at(&file, line, cx);
+                            self.panes.editor.open_at(&file, line, cx);
                         }
                     }
                 }
-                Update::Snapshot(snap) => self.visualizer.set_snapshot(*snap),
-                Update::Ended => self.visualizer.set_data_stale(true),
+                Update::Snapshot(snap) => {
+                    let p = &mut self.panes;
+                    p.stack.set_frames(&snap.frames);
+                    p.visualizer.set_snapshot(*snap);
+                    p.source.show(p.visualizer.code_target());
+                    p.source.stopped();
+                }
+                Update::Ended => self.panes.visualizer.set_data_stale(true),
             }
         }
     }
 
     fn open_folder(&mut self, path: &Path, cx: &mut Cx) {
-        match self.code.explorer.set_root(path) {
+        match self.panes.explorer.set_root(path) {
             Ok(()) => cx.log(format!("Opened folder {}", path.display())),
             Err(e) => cx.log_error(format!("Could not read folder: {e}")),
         }
         if let Some(warning) = self.folders.set_root(path) {
             cx.log_error(warning);
         }
-        self.visualizer
-            .set_root(self.code.explorer.root_path().map(Path::to_path_buf));
-        self.code.bottom.terminal.set_cwd(Some(path.to_path_buf()));
-        if self.code.bottom.terminal.is_running() {
-            self.code
-                .bottom
-                .terminal
+        let p = &mut self.panes;
+        p.visualizer
+            .set_root(p.explorer.root_path().map(Path::to_path_buf));
+        p.terminal.set_cwd(Some(path.to_path_buf()));
+        if p.terminal.is_running() {
+            p.terminal
                 .run_command(&format!("cd \"{}\"", path.display()), cx);
         }
-        self.code.set_focus(Region::Explorer, cx);
+        self.focus_if_here(PaneId::Explorer, cx);
         cx.repaint();
     }
 
@@ -503,7 +753,7 @@ impl Views {
                 Changes::Dirs(dirs) => Some(dirs),
                 Changes::All => None,
             };
-            if self.code.explorer.refresh(dirs) {
+            if self.panes.explorer.refresh(dirs) {
                 cx.repaint();
             }
         }
@@ -527,7 +777,7 @@ impl Views {
                     failed,
                     elapsed,
                 } => {
-                    self.visualizer.set_folder_loading(false);
+                    self.panes.visualizer.set_folder_loading(false);
                     let failed = if failed > 0 {
                         format!(", {failed} failed to load")
                     } else {
@@ -546,11 +796,11 @@ impl Views {
                 |n| n.to_string_lossy().into_owned(),
             );
             let shown = self
-                .code
+                .panes
                 .explorer
                 .apply_object(&path, graph.as_deref().map_err(|e| e.reason.as_str()));
             if let Ok(g) = &graph {
-                self.visualizer.add_graph(g.clone());
+                self.panes.visualizer.add_graph(g.clone());
             }
             if quiet {
                 if shown {
@@ -619,9 +869,9 @@ impl Views {
             for action in actions {
                 match action {
                     Action::OpenFile(path) => {
-                        self.code.editor.open(&path, cx);
-                        if self.code.editor.has_documents() {
-                            self.code.set_focus(Region::Editor, cx);
+                        self.panes.editor.open(&path, cx);
+                        if self.panes.editor.has_documents() {
+                            self.reveal_pane(PaneId::Editor, cx);
                         }
                     }
                     Action::LoadObject(path) => {
@@ -629,14 +879,14 @@ impl Views {
                             cx.log_error(warning);
                         }
                     }
-                    Action::LoadFolderObjects => match self.code.explorer.root_path() {
+                    Action::LoadFolderObjects => match self.panes.explorer.root_path() {
                         Some(root) => {
                             let root = root.to_path_buf();
                             cx.log(format!(
                                 "Loading every object file under {}…",
                                 root.display()
                             ));
-                            self.visualizer.set_folder_loading(true);
+                            self.panes.visualizer.set_folder_loading(true);
                             if let Some(warning) = self.objects.load_folder(&root) {
                                 cx.log_error(warning);
                             }
@@ -645,10 +895,9 @@ impl Views {
                         None => cx.log_error("Open a folder first (Ctrl+O), then add its objects"),
                     },
                     Action::OpenSource { path, line } => {
-                        self.switch_tab(TopTab::Code, cx);
-                        self.code.editor.open_at(&path, line, cx);
-                        if self.code.editor.has_documents() {
-                            self.code.set_focus(Region::Editor, cx);
+                        self.panes.editor.open_at(&path, line, cx);
+                        if self.panes.editor.has_documents() {
+                            self.reveal_pane(PaneId::Editor, cx);
                         }
                     }
                     Action::Debug(a) => self.debug_action(a, cx),
@@ -661,9 +910,14 @@ impl Views {
                         Err(e) => cx.log_error(format!("Folder picker failed: {e}")),
                     },
                     Action::Log { error, text } => {
-                        self.code.bottom.output.push(error, &text);
+                        self.panes.output.push(error, &text);
                         cx.repaint();
                     }
+                    Action::RevealFrame(i) => {
+                        self.panes.visualizer.reveal_frame(i);
+                        cx.repaint();
+                    }
+                    Action::TogglePane(pane) => self.toggle_pane(pane, cx),
                 }
             }
         }
@@ -702,8 +956,22 @@ impl Shell {
                 strip: RectF::default(),
                 tab_rects: [RectF::default(); 2],
                 tab_hover: None,
-                code: CodeView::new(waker.clone()),
-                visualizer,
+                panels_button: RectF::default(),
+                panels_hover: false,
+                menu: None,
+                menu_hover: None,
+                areas: TopTab::ALL.map(|t| DockArea::new(default_tree(t))),
+                closed: HashMap::new(),
+                drag: None,
+                panes: Panes {
+                    explorer: Explorer::default(),
+                    editor: EditorArea::default(),
+                    output: Output::new(),
+                    terminal: Terminal::new(waker.clone()),
+                    visualizer,
+                    source: CodePane::default(),
+                    stack: CallStack::default(),
+                },
                 owner: None,
                 window_focused: true,
                 objects,
@@ -735,7 +1003,7 @@ impl Shell {
 
     /// Appends a line to the Output panel.
     pub fn log(&mut self, error: bool, text: &str) -> Response {
-        self.views.code.bottom.output.push(error, text);
+        self.views.panes.output.push(error, text);
         Response { repaint: true }
     }
 
@@ -755,7 +1023,7 @@ impl Shell {
             self.views.layout(size, &self.text);
             if !self.terminal_started {
                 self.terminal_started = true;
-                self.views.code.bottom.terminal.start(&mut cx);
+                self.views.panes.terminal.start(&mut cx);
             }
         }
         self.views.process_actions(&mut cx);
@@ -764,7 +1032,7 @@ impl Shell {
 
     pub fn set_dpi(&mut self, dpi: u32) {
         self.gfx.set_dpi(dpi);
-        self.views.code.editor.clear_caches();
+        self.views.panes.editor.clear_caches();
     }
 
     pub fn on_event(&mut self, e: Event) -> Response {
@@ -800,16 +1068,19 @@ impl Shell {
     /// every object file under the open folder instead.
     pub fn benchmark(&mut self, synthetic: Option<usize>) -> Response {
         let mut cx = Cx::new(&self.text, self.window);
-        self.views.switch_tab(TopTab::Visualizer, &mut cx);
+        self.views.reveal_pane(PaneId::Visualizer, &mut cx);
         let synthetic = match synthetic {
-            None if self.views.code.explorer.root_path().is_some() => {
+            None if self.views.panes.explorer.root_path().is_some() => {
                 cx.act(Action::LoadFolderObjects);
                 None
             }
             None => Some(crate::visualizer::SYNTHETIC_NODES),
             n => n,
         };
-        self.views.visualizer.queue_benchmark(synthetic, &mut cx);
+        self.views
+            .panes
+            .visualizer
+            .queue_benchmark(synthetic, &mut cx);
         self.views.process_actions(&mut cx);
         Response { repaint: true }
     }
@@ -818,15 +1089,16 @@ impl Shell {
     pub fn on_wake(&mut self) -> Response {
         self.waker.reset();
         let mut cx = Cx::new(&self.text, self.window);
-        self.views.code.bottom.terminal.pump(&mut cx);
+        self.views.panes.terminal.pump(&mut cx);
         self.views.drain_folders(&mut cx);
         self.views.drain_objects(&mut cx);
         self.views.drain_debug(&mut cx);
-        let moved = self.views.visualizer.update() | self.views.visualizer.poll();
-        if moved && self.views.tab == TopTab::Visualizer {
+        let v = &mut self.views.panes.visualizer;
+        let moved = v.update() | v.poll();
+        if moved && self.views.visualizer_shown() {
             cx.repaint();
         }
-        self.views.visualizer.start_queued_benchmark(&mut cx);
+        self.views.panes.visualizer.start_queued_benchmark(&mut cx);
         self.views.process_actions(&mut cx);
         Response {
             repaint: cx.needs_repaint(),
@@ -836,7 +1108,7 @@ impl Shell {
     /// Asks about unsaved files. `false` means the user cancelled closing.
     pub fn query_close(&mut self) -> bool {
         let mut cx = Cx::new(&self.text, self.window);
-        let ok = self.views.code.editor.query_close(&mut cx);
+        let ok = self.views.panes.editor.query_close(&mut cx);
         self.views.process_actions(&mut cx);
         ok
     }
@@ -851,29 +1123,27 @@ impl Shell {
             .render(&self.text, theme.chrome_bg, |d| views.paint(d, theme));
         match frame {
             Ok(Frame::Presented) => {
-                let visualizer = self.views.tab == TopTab::Visualizer;
+                let visualizer = self.views.visualizer_shown();
                 if visualizer {
                     let draw = self.gfx.last_draw_time();
-                    for line in self.views.visualizer.frame_done(draw) {
-                        self.views.code.bottom.output.push(false, &line);
+                    for line in self.views.panes.visualizer.frame_done(draw) {
+                        self.views.panes.output.push(false, &line);
                     }
                 }
                 Response {
-                    repaint: visualizer && self.views.visualizer.wants_frame(),
+                    repaint: visualizer && self.views.panes.visualizer.wants_frame(),
                 }
             }
             Ok(Frame::DeviceLost) => {
                 self.views
-                    .code
-                    .bottom
+                    .panes
                     .output
                     .push(false, "GPU device lost; recreating device resources");
                 Response { repaint: true }
             }
             Err(e) => {
                 self.views
-                    .code
-                    .bottom
+                    .panes
                     .output
                     .push(true, &format!("Render failed: {e}"));
                 Response::default()

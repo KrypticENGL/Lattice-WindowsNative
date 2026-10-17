@@ -8,9 +8,8 @@
 //!   stay lit) and opens a node's source (double-click).
 //! - **Data**: the live data of a program stopped under GDB, drawn by shape
 //!   (trees as trees, arrays as cells). The toolbar runs and steps the
-//!   program; clicking a box shows its type. A column on the left holds
-//!   the source of the stopped line and the call stack (frames innermost
-//!   first); clicking a frame centres its box and shows its line.
+//!   program; clicking a box shows its type. The Source and Call stack
+//!   panels (docked separately) follow the frame focused here.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,13 +20,12 @@ use engine::CodeGraph;
 use renderer::data::{DataStyle, DataView};
 use renderer::{Cursor, Filter, GraphModel, GraphView, NodeClass, Rgba, Style, Vec2};
 
-use crate::callstack::{CallStack, StackAction};
-use crate::codepane::{CodeAction, CodePane, Target};
+use crate::codepane::Target;
 use crate::debug::Phase;
+use crate::dock::PaneId;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::geom::{PointF, RectF};
 use crate::panel::{Action, Cx, DebugAction, Panel};
-use crate::split::{Anchor, Axis, Splitter};
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::{TextStyle, TextSystem};
 use crate::sys::Waker;
@@ -169,20 +167,14 @@ struct Bench {
 pub struct Visualizer {
     mode: Mode,
     data: DataView,
-    stack: CallStack,
-    show_stack: bool,
-    code: CodePane,
+    /// Whether the Source and Call stack panels are docked (their toolbar
+    /// toggles show it).
     show_code: bool,
-    /// Data mode: the source/stack column | the canvas.
-    column_split: Splitter,
-    /// Inside the column: source over call stack.
-    side_split: Splitter,
+    show_stack: bool,
     debug: DebugStatus,
     rect: RectF,
     toolbar: RectF,
     canvas: RectF,
-    /// The Data canvas: `canvas` less the column when it shows.
-    data_canvas: RectF,
     buttons: Vec<(Button, RectF)>,
     hover_button: Option<Button>,
     view: GraphView,
@@ -210,17 +202,12 @@ impl Visualizer {
         let v = Self {
             mode: Mode::Graph,
             data: DataView::new(),
-            stack: CallStack::default(),
-            show_stack: true,
-            code: CodePane::default(),
             show_code: true,
-            column_split: Splitter::new(Axis::Horizontal, Anchor::Start, 440.0, 220.0, 300.0),
-            side_split: Splitter::new(Axis::Vertical, Anchor::End, 200.0, 90.0, 120.0),
+            show_stack: true,
             debug: DebugStatus::default(),
             rect: RectF::default(),
             toolbar: RectF::default(),
             canvas: RectF::default(),
-            data_canvas: RectF::default(),
             buttons: Vec::new(),
             hover_button: None,
             view,
@@ -255,10 +242,23 @@ impl Visualizer {
 
     /// A new stop's data.
     pub fn set_snapshot(&mut self, snap: debugger::Snapshot) {
-        self.stack.set_frames(&snap.frames);
         self.data.set_snapshot(snap);
-        self.code.show(self.code_target());
-        self.code.stopped();
+    }
+
+    /// The frame whose box has the focus.
+    pub fn focused_frame(&self) -> Option<usize> {
+        self.data.focused_frame()
+    }
+
+    /// Focuses and centres a frame's box (a call stack click).
+    pub fn reveal_frame(&mut self, i: usize) {
+        self.data.reveal_frame(i);
+    }
+
+    /// Whether the Source and Call stack panels are docked.
+    pub fn set_panes_shown(&mut self, source: bool, stack: bool) {
+        self.show_code = source;
+        self.show_stack = stack;
     }
 
     /// The program is running (or ended): the data shown is from the last
@@ -269,18 +269,11 @@ impl Visualizer {
 
     pub fn clear_data(&mut self) {
         self.data.clear();
-        self.stack.clear();
-        self.code.clear();
     }
 
-    /// Breakpoint lines (1-based) for the file in the source pane.
-    pub fn set_code_breakpoints(&mut self, lines_for: impl FnOnce(&Path) -> Vec<u32>) {
-        let lines = self.code.path().map(lines_for).unwrap_or_default();
-        self.code.set_breakpoints(lines);
-    }
-
-    /// The frame focused on the canvas, else the innermost one.
-    fn code_target(&self) -> Option<Target> {
+    /// The line the Source panel shows: the frame focused on the canvas,
+    /// else the innermost one.
+    pub fn code_target(&self) -> Option<Target> {
         let frames = &self.data.snapshot()?.frames;
         let innermost = frames.len().checked_sub(1)?;
         let i = self
@@ -524,8 +517,8 @@ impl Visualizer {
             Button::Library => self.filter.library ^= true,
             Button::Generated => self.filter.generated ^= true,
             Button::Locals => self.filter.locals ^= true,
-            Button::Source => self.show_code ^= true,
-            Button::Stack => self.show_stack ^= true,
+            Button::Source => cx.act(Action::TogglePane(PaneId::Source)),
+            Button::Stack => cx.act(Action::TogglePane(PaneId::CallStack)),
         }
         let panes = matches!(b, Button::Source | Button::Stack);
         if b.is_toggle() && !panes && !self.synthetic {
@@ -561,78 +554,6 @@ impl Visualizer {
         if let Some((file, line)) = r.open {
             open_frame_source(&file, line, cx);
         }
-    }
-
-    fn apply_stack(&mut self, action: StackAction, cx: &mut Cx) {
-        match action {
-            StackAction::Reveal(i) => self.data.reveal_frame(i),
-            StackAction::Open(file, line) => open_frame_source(&file, line, cx),
-        }
-        cx.repaint();
-    }
-
-    fn apply_code(&mut self, action: CodeAction, cx: &mut Cx) {
-        match action {
-            CodeAction::ToggleBreakpoint(path, line) => {
-                cx.act(Action::ToggleBreakpoint { path, line });
-            }
-            CodeAction::Open(path, line) => cx.act(Action::OpenSource { path, line }),
-        }
-        cx.repaint();
-    }
-
-    /// The canvas the current mode draws into.
-    fn active_canvas(&self) -> RectF {
-        match self.mode {
-            Mode::Graph => self.canvas,
-            Mode::Data => self.data_canvas,
-        }
-    }
-
-    /// The Data mode's source/stack column is laid out.
-    fn column_shown(&self) -> bool {
-        self.show_code || self.show_stack
-    }
-
-    /// Routes Data mode input over the column: its splitters, the source
-    /// pane and the call stack. Returns `true` if the event was theirs.
-    fn column_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
-        let both = self.show_code && self.show_stack;
-        if self.column_split.on_event(e, cx) || (both && self.side_split.on_event(e, cx)) {
-            self.leave_canvas(cx);
-            return true;
-        }
-        let pos = e.pos();
-        let in_code = self.show_code && pos.is_some_and(|p| self.code.rect().contains(p));
-        let in_stack = self.show_stack && pos.is_some_and(|p| self.stack.rect().contains(p));
-        if !in_stack && self.stack.leave() {
-            cx.repaint();
-        }
-        if !(in_code || in_stack) {
-            return false;
-        }
-        self.leave_canvas(cx);
-        if self.hover_button.take().is_some() {
-            cx.repaint();
-        }
-        if in_code {
-            let (repaint, action) = self.code.on_event(e);
-            if repaint {
-                cx.repaint();
-            }
-            if let Some(action) = action {
-                self.apply_code(action, cx);
-            }
-        } else {
-            let (repaint, action) = self.stack.on_event(e);
-            if repaint {
-                cx.repaint();
-            }
-            if let Some(action) = action {
-                self.apply_stack(action, cx);
-            }
-        }
-        true
     }
 
     fn open_source(&mut self, i: u32, cx: &mut Cx) {
@@ -914,7 +835,7 @@ impl Visualizer {
                 ),
             ],
         };
-        let r = self.data_canvas;
+        let r = self.canvas;
         let mut y = r.y + r.h / 2.0 - 48.0;
         for (text, style, color) in lines {
             let w = d.text_system().measure(style, text).min(r.w - 32.0);
@@ -1021,27 +942,8 @@ impl Panel for Visualizer {
             self.buttons.push((b, RectF::new(x, y, w, BUTTON_H)));
             x += w + BUTTON_GAP;
         }
-        // The split does not depend on the mode, so switching modes leaves
-        // the Data camera alone.
-        self.data_canvas = if self.column_shown() {
-            let (column, rest) = self.column_split.layout(canvas);
-            match (self.show_code, self.show_stack) {
-                (true, true) => {
-                    let (code, stack) = self.side_split.layout(column);
-                    self.code.layout(code, text);
-                    self.stack.layout(stack);
-                }
-                (true, false) => self.code.layout(column, text),
-                _ => self.stack.layout(column),
-            }
-            rest
-        } else {
-            canvas
-        };
-        self.data.set_viewport(to_rect(self.data_canvas));
+        self.data.set_viewport(to_rect(canvas));
         self.view.set_viewport(to_rect(canvas));
-        // Follows the frame focused on the canvas or in the call stack.
-        self.code.show(self.code_target());
     }
 
     fn paint(&mut self, d: &mut DrawCtx, theme: &Theme, _focused: bool) {
@@ -1054,20 +956,7 @@ impl Panel for Visualizer {
             } else {
                 let style = data_style(theme);
                 let data = &mut self.data;
-                d.clip(self.data_canvas, |d| data.paint(d, &style));
-            }
-            let stale = self.debug.phase != Phase::Stopped;
-            if self.show_code {
-                self.code.paint(d, theme, stale);
-            }
-            if self.show_stack {
-                self.stack.paint(d, theme, self.data.focused_frame(), stale);
-            }
-            if self.show_code && self.show_stack {
-                self.side_split.paint(d, theme);
-            }
-            if self.column_shown() {
-                self.column_split.paint(d, theme);
+                d.clip(self.canvas, |d| data.paint(d, &style));
             }
             self.paint_toolbar(d, theme);
             return;
@@ -1088,13 +977,6 @@ impl Panel for Visualizer {
 
     fn on_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
         let at = |p: PointF| Vec2::new(p.x, p.y);
-        if self.mode == Mode::Data
-            && self.column_shown()
-            && !self.canvas_capture
-            && self.column_event(e, cx)
-        {
-            return true;
-        }
         match *e {
             Event::KeyDown { key, mods } => return self.on_key(key, mods, cx),
             Event::Char(ch @ ('+' | '=' | '-')) => {
@@ -1114,7 +996,7 @@ impl Panel for Visualizer {
             } => {
                 if let Some(b) = self.button_at(pos) {
                     self.press(b, cx);
-                } else if self.active_canvas().contains(pos) {
+                } else if self.canvas.contains(pos) {
                     self.canvas_capture = true;
                     if self.mode == Mode::Data {
                         let r = self.data.pointer_down(at(pos), clicks);
@@ -1126,7 +1008,7 @@ impl Panel for Visualizer {
                 }
             }
             Event::MouseMove { pos, left_down, .. } => {
-                if self.canvas_capture || self.active_canvas().contains(pos) {
+                if self.canvas_capture || self.canvas.contains(pos) {
                     let down = left_down && self.canvas_capture;
                     if self.mode == Mode::Data {
                         let r = self.data.pointer_move(at(pos), down);
@@ -1169,7 +1051,7 @@ impl Panel for Visualizer {
                 lines,
                 horizontal: false,
                 ..
-            } if self.active_canvas().contains(pos) => {
+            } if self.canvas.contains(pos) => {
                 if self.mode == Mode::Data {
                     let r = self.data.wheel(at(pos), lines);
                     self.apply_data(r, cx);
@@ -1212,7 +1094,7 @@ fn resolve_source(file: &str, object: &Path, root: Option<&Path>) -> Option<Path
 }
 
 /// Opens a GDB frame's source (absolute paths from DWARF).
-fn open_frame_source(file: &str, line: u32, cx: &mut Cx) {
+pub(crate) fn open_frame_source(file: &str, line: u32, cx: &mut Cx) {
     let path = PathBuf::from(file);
     if path.is_file() {
         cx.act(Action::OpenSource { path, line });

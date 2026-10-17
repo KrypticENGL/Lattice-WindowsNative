@@ -6,10 +6,11 @@ use debugger::{Cell, Frame};
 
 use crate::event::{Event, MouseButton};
 use crate::geom::{PointF, RectF};
+use crate::panel::{Action, Cx, Panel};
 use crate::sys::gfx::DrawCtx;
-use crate::sys::text::TextStyle;
+use crate::sys::text::{TextStyle, TextSystem};
 use crate::theme::Theme;
-use crate::visualizer::rgba;
+use crate::visualizer::{open_frame_source, rgba};
 
 const HEADER_H: f32 = 30.0;
 const ROW_H: f32 = 40.0;
@@ -49,6 +50,10 @@ pub struct CallStack {
     rows: Vec<Row>,
     scroll: f32,
     hover: Option<usize>,
+    /// The frame focused on the canvas.
+    selected: Option<usize>,
+    /// The program is running: the stack is from the last stop.
+    stale: bool,
 }
 
 impl CallStack {
@@ -86,11 +91,13 @@ impl CallStack {
         };
     }
 
-    pub fn rect(&self) -> RectF {
-        self.rect
+    /// What to highlight, and whether to dim (set before each paint).
+    pub fn set_view(&mut self, selected: Option<usize>, stale: bool) {
+        self.selected = selected;
+        self.stale = stale;
     }
 
-    pub fn layout(&mut self, rect: RectF) {
+    fn place(&mut self, rect: RectF) {
         self.rect = rect;
         self.list = rect.split_top(HEADER_H).1;
         self.clamp_scroll();
@@ -110,13 +117,13 @@ impl CallStack {
     }
 
     /// Clears the hover. Returns `true` if there was one.
-    pub fn leave(&mut self) -> bool {
+    fn leave(&mut self) -> bool {
         self.hover.take().is_some()
     }
 
     /// Handles an event over the panel. Returns whether to repaint and
     /// what the host should do.
-    pub fn on_event(&mut self, e: &Event) -> (bool, Option<StackAction>) {
+    fn handle(&mut self, e: &Event) -> (bool, Option<StackAction>) {
         match *e {
             Event::MouseDown {
                 pos,
@@ -150,9 +157,8 @@ impl CallStack {
         }
     }
 
-    /// `selected` is the frame focused on the canvas; `stale` dims the
-    /// text while the program runs.
-    pub fn paint(&self, d: &mut DrawCtx, theme: &Theme, selected: Option<usize>, stale: bool) {
+    fn draw(&self, d: &mut DrawCtx, theme: &Theme) {
+        let (selected, stale) = (self.selected, self.stale);
         let r = self.rect;
         d.fill_rect(r, theme.panel_bg);
         let a = if stale { STALE } else { 1.0 };
@@ -232,6 +238,32 @@ impl CallStack {
     }
 }
 
+impl Panel for CallStack {
+    fn layout(&mut self, rect: RectF, _text: &TextSystem) {
+        self.place(rect);
+    }
+
+    fn paint(&mut self, d: &mut DrawCtx, theme: &Theme, _focused: bool) {
+        self.draw(d, theme);
+    }
+
+    fn on_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
+        let (repaint, action) = match e {
+            Event::MouseLeave => (self.leave(), None),
+            _ => self.handle(e),
+        };
+        if repaint {
+            cx.repaint();
+        }
+        match action {
+            Some(StackAction::Reveal(i)) => cx.act(Action::RevealFrame(i)),
+            Some(StackAction::Open(file, line)) => open_frame_source(&file, line, cx),
+            None => {}
+        }
+        true
+    }
+}
+
 fn value_text(c: &Cell) -> &str {
     match c {
         Cell::Scalar { v } | Cell::Pointer { v, .. } => v,
@@ -269,7 +301,7 @@ mod tests {
 
     fn stack() -> CallStack {
         let mut s = CallStack::default();
-        s.layout(RectF::new(0.0, 0.0, WIDTH, 400.0));
+        s.place(RectF::new(0.0, 0.0, WIDTH, 400.0));
         s.set_frames(&frames());
         s
     }
@@ -306,22 +338,22 @@ mod tests {
         let mut s = stack();
         let second = HEADER_H + ROW_H * 1.5;
         assert_eq!(
-            s.on_event(&click(second, 1)),
+            s.handle(&click(second, 1)),
             (true, Some(StackAction::Reveal(1)))
         );
         assert_eq!(
-            s.on_event(&click(second, 2)),
+            s.handle(&click(second, 2)),
             (true, Some(StackAction::Open(r"C:\src\bst.cpp".into(), 34)))
         );
         // Below the last row and on the header: nothing.
-        assert_eq!(s.on_event(&click(HEADER_H + ROW_H * 3.5, 1)), (false, None));
-        assert_eq!(s.on_event(&click(5.0, 1)), (false, None));
+        assert_eq!(s.handle(&click(HEADER_H + ROW_H * 3.5, 1)), (false, None));
+        assert_eq!(s.handle(&click(5.0, 1)), (false, None));
     }
 
     #[test]
     fn scrolling_is_clamped_to_the_rows() {
         let mut s = CallStack::default();
-        s.layout(RectF::new(0.0, 0.0, WIDTH, HEADER_H + ROW_H * 2.0));
+        s.place(RectF::new(0.0, 0.0, WIDTH, HEADER_H + ROW_H * 2.0));
         s.set_frames(&frames());
         let wheel = |lines| Event::Wheel {
             pos: PointF::new(10.0, 50.0),
@@ -329,8 +361,8 @@ mod tests {
             horizontal: false,
             mods: Modifiers::default(),
         };
-        assert_eq!(s.on_event(&wheel(1.0)), (false, None), "already at the top");
-        assert!(s.on_event(&wheel(-5.0)).0);
+        assert_eq!(s.handle(&wheel(1.0)), (false, None), "already at the top");
+        assert!(s.handle(&wheel(-5.0)).0);
         assert_eq!(s.scroll, ROW_H, "one row past the panel");
         // A shorter stack at the next stop pulls the scroll back.
         s.set_frames(&frames()[..1]);

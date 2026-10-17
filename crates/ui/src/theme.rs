@@ -83,6 +83,8 @@ pub struct Theme {
     pub breakpoint: Color,
     /// The line the debugger is stopped on.
     pub exec_line_bg: Color,
+    /// Where a dragged panel would dock.
+    pub dock_drop: Color,
     pub term_fg: Color,
     pub term_bg: Color,
     /// ANSI colours 0–15 (normal then bright).
@@ -144,6 +146,7 @@ impl Theme {
             data_changed: Color::hex(0xA3E635).with_alpha(0.22),
             breakpoint: Color::hex(0xE5484D),
             exec_line_bg: Color::hex(0xA3E635).with_alpha(0.13),
+            dock_drop: Color::hex(0xA3E635).with_alpha(0.18),
             term_fg: Color::hex(0xCCCCCC),
             term_bg: Color::hex(0x181818),
             term_palette: [
