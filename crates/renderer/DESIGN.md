@@ -47,7 +47,12 @@ A flat graph of every symbol was unreadable past a few objects, so
   canvas, closed by `Esc`, `×` or a click outside.
 
 `Program::build` reads files, so it runs only when the set of objects (or
-the open folder) changes, not on navigation or filter changes.
+the open folder) changes, not on navigation or mode changes.
+
+`GraphMode` (menu bar, Visualizers › Call graph › Mode) picks the `Filter`:
+**Abstracted** hides library code, compiler-generated symbols and
+externals (functions no loaded object defines); **Verbose** shows them.
+The details window lists callers and callees in both modes.
 
 The work is split across two crates:
 
@@ -55,7 +60,7 @@ The work is split across two crates:
 |---|---|
 | `crates/renderer` (this crate, `forbid(unsafe_code)`, no Windows dependency) | the graph model and object merging, the layout simulation and its thread, the camera, the spatial grid, input handling, culling, level of detail, and the label and info-card logic. It draws through the `Canvas` trait |
 | `crates/ui/src/sys/gfx.rs` | `impl renderer::Canvas for DrawCtx`, which runs on the app's single Direct2D device context and batches the drawing through `ID2D1SpriteBatch` |
-| `crates/ui/src/visualizer.rs` | the panel: toolbar, filters, status line, empty state, folder loading, jump to source, and the benchmark |
+| `crates/ui/src/visualizer.rs` | the panel: toolbar, graph mode, status line, empty state, folder loading, jump to source, and the benchmark |
 
 Keeping the renderer free of Win32 code means all of its logic is unit
 tested headlessly (model merge, layout convergence, camera maths, hit
@@ -186,8 +191,8 @@ The UI keeps rendering at full rate meanwhile.
   on disk; conditional includes all count, and macro includes
   (`#include FOO`) are skipped.
 - Layout quality is that of a plain force simulation. A very large file
-  level can still be dense; the filters (Library, Generated) and
-  selection highlighting are the tools for reading it.
+  level can still be dense; Abstracted mode and selection highlighting
+  are the tools for reading it.
 
 ## Data mode
 

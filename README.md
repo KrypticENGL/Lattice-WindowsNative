@@ -63,15 +63,15 @@ cargo test --workspace
 | Go back up | Click a segment of the breadcrumb over the canvas (`Files › shapes.cpp › Square`), or press `Backspace` (`Esc` too, when nothing is selected). Each level keeps its layout when you come back |
 | Details | At a class or function level, click any node: a fixed window in the middle of the canvas shows what it is, where it is declared, its size and type, its members or locals, and what calls or uses it. Click the level's subject (or the last breadcrumb segment) for its own details, files included. **Open source** jumps to it; `Esc`, `×` or a click outside closes it. Double-click a node to open its source directly |
 | Move around the graph | Drag empty space to pan, wheel to zoom, drag a node to move it. Hover a node for its name. **Fit** (or `F`) frames everything. The arrow keys pan and `+` / `-` zoom. `Space` re-runs the layout |
-| Filter the graph | **Library** (standard library and toolchain headers) and **Generated** (compiler-generated symbols) are off by default; toggling them keeps existing nodes where they are |
+| Call graph mode | **Visualizers › Call graph › Mode** in the menu bar. **Abstracted** (the default) shows only code you wrote: no standard library or toolchain headers, no compiler-generated symbols, and no calls into code that no loaded object defines (`printf`, iostream operators). **Verbose** shows all of it. Switching keeps existing nodes where they are |
 | Switch Visualizer mode | **Call graph** / **Data** at the left of the Visualizer toolbar. Each mode keeps its own view |
 | Debug a program (Data mode) | Build it with `g++ -g` (or `gcc -g`). Set breakpoints with `F9` on the caret line, or click the editor's gutter. `F5` runs it: the program is `foo.exe` next to the open `foo.cpp`, or the one chosen with **Program**. With no breakpoints it stops at `main`. It gets its own console window for input and output |
 | Step | `F5` continue, `F10` step over, `F11` step into, `Shift+F11` step out, `Shift+F5` stop, or the toolbar buttons; **Pause** interrupts a running program. In the Code tab the editor follows each stop |
 | Record and replay | **Play** (or `F6`) runs the whole program under GDB once, from `main`, and records the data at every line: into your functions, straight back out of library code (sources under the GDB toolchain, or with no source). Then it replays the run with a play bar under the canvas, like a media player: previous / play-pause / next, the current step, a track to click or drag, the number of steps, speed (0.5× to 4×) and **Record again**. The last step is the last line that ran before the program exited, and playback stops there. With the canvas focused, `←` `→` step, `Space` plays or pauses, `Home` / `End` jump. **Stop** ends a recording early and replays what it has; **Run** goes back to live debugging |
 | Read the data | Frames are on the left, outermost first. Pointers are dots with arrows to what they point at; back pointers (`prev`, `parent`, cycles, shared nodes) are grey curves. A value that changed in the last step is tinted lime. Click a box to focus it: its type, size and address and each field's type appear, and unrelated boxes dim. Double-click a frame to open its source line. Drag to pan, wheel to zoom, `F` or **Fit** to frame everything |
-| Source and call stack (Data mode) | Two panels, left of the canvas by default. **Source** shows the file of the stopped line, marked with a lime chevron like the editor, and scrolls to it at every stop; the gutter toggles breakpoints, a double-click opens the line in the editor, Shift+wheel scrolls sideways. Below it, the call stack lists the frames innermost first with `file:line` and arguments. Click a frame to focus and centre its box; the Source panel then shows its call site. Close either with its tab's `×` and reopen it from **Panels** |
+| Source and call stack (Data mode) | Two panels, left of the canvas by default. **Source** shows the file of the stopped line, marked with a lime chevron like the editor, and scrolls to it at every stop; the gutter toggles breakpoints, a double-click opens the line in the editor, Shift+wheel scrolls sideways. Below it, the call stack lists the frames innermost first with `file:line` and arguments. Click a frame to focus and centre its box; the Source panel then shows its call site. Close either with its tab's `×` and reopen it from **Panels** in the menu bar |
 | Dock panels | Drag a panel by its tab. Dropping on a side of another panel docks it there, on its tab strip or middle joins its tabs, and on an outer edge of the workspace docks it along that whole edge; a lime overlay shows where. Drag onto the **Code** / **Visualizer** title to move a panel to the other workspace. `Esc` cancels a drag |
-| Close and reopen panels | The `×` on a tab (or a middle-click) closes it; **Panels** in the top strip lists every panel and reopens a closed one where it was. The editor and the Visualizer canvas can move but not close |
+| Close and reopen panels | The `×` on a tab (or a middle-click) closes it; **Panels** in the menu bar lists every panel and reopens a closed one where it was. The editor and the Visualizer canvas can move but not close |
 | Benchmark | `Ctrl+Shift+G` loads a synthetic 10,000-node graph; `Ctrl+Shift+B` measures frame times and prints them to Output (see [`crates/renderer/DESIGN.md`](crates/renderer/DESIGN.md)) |
 | Editor | Type to edit. `Ctrl+S` save, `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+Z` redo, `Ctrl+A/C/X/V`, `Ctrl+W` close tab, `Ctrl+Tab` next tab. Shift+arrows or a mouse drag selects; double-click selects a word |
 | Terminal | Click its tab or press `` Ctrl+` `` (reopens it if closed). `Ctrl+V` pastes; the mouse wheel scrolls the history. Press `Enter` to restart the shell after it exits |
@@ -136,9 +136,12 @@ it. `app` hands the window to `ui` as an opaque `ui::NativeWindow`.
   loss.
 
 **Panels** (`ui/src/`):
-- `shell.rs` owns every panel and routes input. The top strip is shared;
-  below it is the active workspace's dock area, so the two workspaces never
-  share layout or input.
+- `shell.rs` owns every panel and routes input. The menu bar and the top
+  strip are shared; below them is the active workspace's dock area, so the
+  two workspaces never share layout or input.
+- `menubar.rs` is the menu bar: titles, dropdowns and one level of
+  submenu. It holds no app state; the shell describes the rows (Panels,
+  Visualizers) and runs the command picked.
 - `dock/` is the docking: `tree.rs` is the layout (splits holding shares
   of their space, leaves that are tab groups) with insert, remove, restore
   and divider drags, pure and unit-tested; `mod.rs` lays a tree out, draws

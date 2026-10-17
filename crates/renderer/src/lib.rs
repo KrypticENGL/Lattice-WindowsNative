@@ -24,5 +24,5 @@ pub use canvas::{Canvas, Rgba, Style};
 pub use geom::{Affine, Rect, Vec2};
 pub use layout::{LayoutWorker, Simulation, Snapshot};
 pub use model::{EdgeClass, GraphModel, ModelEdge, ModelNode, NodeClass};
-pub use program::{Details, Entity, Filter, Level, Program};
+pub use program::{Details, Entity, Filter, GraphMode, Level, Program};
 pub use view::{Cursor, GraphView, Response, NODE_RADIUS};

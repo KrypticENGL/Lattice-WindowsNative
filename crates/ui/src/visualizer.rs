@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use engine::{CodeGraph, NodeId};
 use renderer::data::{DataStyle, DataView};
 use renderer::{
-    Cursor, Entity, Filter, GraphModel, GraphView, Level, NodeClass, Program, Rgba, Style, Vec2,
+    Cursor, Entity, GraphMode, GraphModel, GraphView, Level, NodeClass, Program, Rgba, Style, Vec2,
 };
 
 use crate::codepane::Target;
@@ -92,8 +92,6 @@ enum Button {
     AddFolder,
     Fit,
     Clear,
-    Library,
-    Generated,
     Program,
     Run,
     Play,
@@ -105,13 +103,7 @@ enum Button {
 }
 
 impl Button {
-    const GRAPH: [Self; 5] = [
-        Self::AddFolder,
-        Self::Fit,
-        Self::Clear,
-        Self::Library,
-        Self::Generated,
-    ];
+    const GRAPH: [Self; 3] = [Self::AddFolder, Self::Fit, Self::Clear];
     const DATA: [Self; 9] = [
         Self::Program,
         Self::Run,
@@ -131,8 +123,6 @@ impl Button {
             Self::AddFolder => "Add folder objects".into(),
             Self::Fit => "Fit".into(),
             Self::Clear => "Clear".into(),
-            Self::Library => "Library".into(),
-            Self::Generated => "Generated".into(),
             Self::Program => match &debug.program {
                 Some(p) => format!("Program: {p}"),
                 None => "Choose program\u{2026}".into(),
@@ -149,10 +139,6 @@ impl Button {
             Self::StepOut => "Step out".into(),
             Self::Stop => "Stop".into(),
         }
-    }
-
-    fn is_toggle(self) -> bool {
-        matches!(self, Self::Library | Self::Generated)
     }
 
     fn is_mode(self) -> bool {
@@ -212,7 +198,7 @@ pub struct Visualizer {
     /// A click just opened a level; the second click of a double-click
     /// must not act on the new level.
     swallow_double: bool,
-    filter: Filter,
+    graph_mode: GraphMode,
     dirty: bool,
     folder_loading: bool,
     last_build: Option<Instant>,
@@ -251,7 +237,7 @@ impl Visualizer {
             hover_crumb: None,
             modal: None,
             swallow_double: false,
-            filter: Filter::default(),
+            graph_mode: GraphMode::default(),
             dirty: false,
             folder_loading: false,
             last_build: None,
@@ -263,6 +249,23 @@ impl Visualizer {
             bench_queued: false,
         };
         (v, error)
+    }
+
+    pub fn graph_mode(&self) -> GraphMode {
+        self.graph_mode
+    }
+
+    /// Abstracted (user code only) or Verbose (everything) call graph.
+    pub fn set_graph_mode(&mut self, mode: GraphMode, cx: &mut Cx) {
+        if mode == self.graph_mode {
+            return;
+        }
+        self.graph_mode = mode;
+        if !self.synthetic {
+            self.view
+                .set_model(self.program.model(self.level, mode.filter()));
+        }
+        cx.repaint();
     }
 
     pub fn set_mode(&mut self, mode: Mode, cx: &mut Cx) {
@@ -367,7 +370,7 @@ impl Visualizer {
             self.go(Level::Files);
         } else {
             self.view
-                .set_model(self.program.model(self.level, self.filter));
+                .set_model(self.program.model(self.level, self.graph_mode.filter()));
         }
         true
     }
@@ -380,7 +383,7 @@ impl Visualizer {
         self.hover_crumb = None;
         let seeds = self.saved.get(&level).cloned().unwrap_or_default();
         self.view
-            .switch_model(self.program.model(level, self.filter), &seeds);
+            .switch_model(self.program.model(level, self.graph_mode.filter()), &seeds);
     }
 
     fn go_up(&mut self) -> bool {
@@ -578,8 +581,6 @@ impl Visualizer {
 
     fn toggled(&self, b: Button) -> bool {
         match b {
-            Button::Library => self.filter.library,
-            Button::Generated => self.filter.generated,
             Button::Play => {
                 self.debug.recording.is_some() || self.debug.replay.is_some_and(|r| r.playing)
             }
@@ -606,12 +607,6 @@ impl Visualizer {
             Button::Fit if self.mode == Mode::Data => self.data.fit(),
             Button::Fit => self.view.fit_and_follow(),
             Button::Clear => self.clear(cx),
-            Button::Library => self.filter.library ^= true,
-            Button::Generated => self.filter.generated ^= true,
-        }
-        if b.is_toggle() && !self.synthetic {
-            self.view
-                .set_model(self.program.model(self.level, self.filter));
         }
         cx.repaint();
     }
@@ -851,7 +846,7 @@ impl Visualizer {
                 Some(theme.border),
             ),
         };
-        let radius = if b.is_toggle() { r.h / 2.0 } else { 5.0 };
+        let radius = 5.0;
         if let Some(fill) = fill {
             let fill = if hover && primary {
                 theme.accent.with_alpha(0.85)
@@ -863,23 +858,10 @@ impl Visualizer {
         if let Some(border) = border {
             renderer::Canvas::stroke_rect(d, to_rect(r), radius, rgba(border), 1.0);
         }
-        let mut x = r.x + BUTTON_PAD;
-        if b.is_toggle() {
-            // A small state dot: filled lime when on, hollow when off.
-            let c = renderer::Vec2::new(x + 3.0, r.y + r.h / 2.0);
-            if on {
-                renderer::Canvas::fill_discs(d, &[c], 3.5, rgba(theme.accent));
-            } else {
-                renderer::Canvas::stroke_circle(d, c, 3.0, rgba(theme.text_dim), 1.0);
-            }
-            x += 12.0;
-        }
         let label = b.label(&self.debug);
-        if !b.is_toggle() {
-            // Centred: Run/Continue is sized for its longer label.
-            let w = d.text_system().measure(TextStyle::Ui, &label);
-            x = r.x + (r.w - w) / 2.0;
-        }
+        // Centred: Run/Continue is sized for its longer label.
+        let w = d.text_system().measure(TextStyle::Ui, &label);
+        let x = r.x + (r.w - w) / 2.0;
         d.text(
             TextStyle::Ui,
             &label,
@@ -1000,7 +982,8 @@ impl Visualizer {
             (
                 "Nothing to show".to_string(),
                 format!(
-                    "All {} nodes here are hidden. Turn on Library or Generated.",
+                    "All {} nodes here are hidden in Abstracted mode. Switch to Verbose \
+                     under Visualizers \u{203a} Call graph \u{203a} Mode.",
                     self.view.model().hidden
                 ),
             )
@@ -1207,17 +1190,16 @@ impl Panel for Visualizer {
             Mode::Data => &Button::DATA,
         };
         for &b in rest {
-            if matches!(b, Button::Library | Button::Run | Button::Stop) {
+            if matches!(b, Button::Run | Button::Stop) {
                 x += 14.0; // separates groups
             }
-            let extra = if b.is_toggle() { 12.0 } else { 0.0 };
             // Run/Continue keeps one width so the buttons after it stay put.
             let label = match b {
                 Button::Run => "Continue".to_string(),
                 Button::Play => "Recording\u{2026}".to_string(),
                 _ => b.label(&self.debug),
             };
-            let w = text.measure(TextStyle::Ui, &label) + 2.0 * BUTTON_PAD + extra;
+            let w = text.measure(TextStyle::Ui, &label) + 2.0 * BUTTON_PAD;
             self.buttons.push((b, RectF::new(x, y, w, BUTTON_H)));
             x += w + BUTTON_GAP;
         }

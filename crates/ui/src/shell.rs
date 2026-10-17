@@ -1,5 +1,5 @@
-//! Root of the UI: the top strip (Code/Visualizer workspaces and the
-//! Panels menu), each workspace's dock area, focus and input routing.
+//! Root of the UI: the menu bar, the top strip (Code/Visualizer
+//! workspaces), each workspace's dock area, focus and input routing.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,8 @@ use crate::editor::EditorArea;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::explorer::Explorer;
 use crate::folder_watch::{Changes, FolderWatcher};
-use crate::geom::{PointF, RectF, SizeF};
+use crate::geom::{RectF, SizeF};
+use crate::menubar::{Entry, Mark, MenuBar, Outcome};
 use crate::objects::{LoadResult, ObjectEvent, ObjectService};
 use crate::output::Output;
 use crate::panel::{Action, Cx, DebugAction, Panel};
@@ -26,12 +27,21 @@ use crate::terminal::Terminal;
 use crate::theme::Theme;
 use crate::visualizer::{DebugStatus, Mode, Visualizer};
 use crate::Error;
+use renderer::GraphMode;
 
+const MENU_BAR_H: f32 = 28.0;
 const TOP_STRIP_H: f32 = 34.0;
 const TOP_TAB_PAD: f32 = 16.0;
-const MENU_W: f32 = 230.0;
-const MENU_ROW_H: f32 = 26.0;
-const MENU_PAD: f32 = 4.0;
+
+/// What a menu row does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuCmd {
+    TogglePane(PaneId),
+    GraphMode(GraphMode),
+}
+
+/// The menu bar's titles, in order.
+const MENUS: [&str; 2] = ["Panels", "Visualizers"];
 
 /// What the app should do after a call into the shell.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -156,11 +166,11 @@ struct Views {
     strip: RectF,
     tab_rects: [RectF; 2],
     tab_hover: Option<usize>,
-    panels_button: RectF,
-    panels_hover: bool,
-    /// The Panels menu, when open: one row per panel.
-    menu: Option<Vec<(PaneId, RectF)>>,
-    menu_hover: Option<PaneId>,
+    menu_bar: MenuBar<MenuCmd>,
+    /// The bar's row, right of the titles: the open folder.
+    menu_row: RectF,
+    /// Where the menu titles end.
+    menu_end: f32,
     areas: [DockArea; 2],
     /// Where each closed panel was, so showing it puts it back.
     closed: HashMap<PaneId, (TopTab, Spot)>,
@@ -278,7 +288,14 @@ impl Views {
         self.panes.source.show(target);
 
         let full = RectF::new(0.0, 0.0, size.w, size.h);
-        let (strip, body) = full.split_top(TOP_STRIP_H);
+        let (bar, rest) = full.split_top(MENU_BAR_H);
+        self.menu_row = bar;
+        self.menu_end = self.menu_bar.layout(bar, text);
+        if self.menu_bar.is_open() {
+            let menus = self.menus();
+            self.menu_bar.refresh(text, |i| menus[i].clone());
+        }
+        let (strip, body) = rest.split_top(TOP_STRIP_H);
         self.strip = strip;
         let mut x = strip.x + 8.0;
         for t in TopTab::ALL {
@@ -286,43 +303,82 @@ impl Views {
             self.tab_rects[t.index()] = RectF::new(x, strip.y, w, strip.h);
             x += w;
         }
-        let w = text.measure(TextStyle::UiSmall, "Panels \u{25be}") + 2.0 * 10.0;
-        self.panels_button = RectF::new(x + 12.0, strip.y + 5.0, w, strip.h - 10.0);
-        if self.menu.is_some() {
-            self.menu = Some(self.menu_rows());
-        }
         for area in &mut self.areas {
             area.layout(body, text, &mut self.panes);
         }
     }
 
-    fn menu_rows(&self) -> Vec<(PaneId, RectF)> {
-        let b = self.panels_button;
-        PaneId::ALL
+    /// Each menu's rows, with the current state.
+    fn menus(&self) -> [Vec<Entry<MenuCmd>>; 2] {
+        let panels = PaneId::ALL
             .into_iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let y = self.strip.bottom() + 2.0 + MENU_PAD + i as f32 * MENU_ROW_H;
-                (
-                    p,
-                    RectF::new(b.x + MENU_PAD, y, MENU_W - 2.0 * MENU_PAD, MENU_ROW_H),
-                )
+            .map(|p| {
+                let ws = self.workspace_of(p);
+                Entry::Item {
+                    cmd: MenuCmd::TogglePane(p),
+                    label: p.title().into(),
+                    mark: Mark::Dot(ws.is_some()),
+                    hint: Some(ws.map_or("closed", TopTab::title).into()),
+                    enabled: true,
+                }
             })
-            .collect()
+            .collect();
+        let current = self.panes.visualizer.graph_mode();
+        let modes = GraphMode::ALL
+            .into_iter()
+            .map(|m| Entry::Item {
+                cmd: MenuCmd::GraphMode(m),
+                label: m.title().into(),
+                mark: Mark::Radio(m == current),
+                hint: Some(
+                    match m {
+                        GraphMode::Abstracted => "your code only",
+                        GraphMode::Verbose => "everything",
+                    }
+                    .into(),
+                ),
+                enabled: true,
+            })
+            .collect();
+        let visualizers = vec![
+            Entry::Header("Call graph".into()),
+            Entry::Submenu {
+                label: "Mode".into(),
+                hint: Some(current.title().into()),
+                entries: modes,
+            },
+            Entry::Separator,
+            Entry::Header("Data visualizer".into()),
+            Entry::Note("No settings yet".into()),
+        ];
+        [panels, visualizers]
     }
 
-    fn menu_rect(&self) -> Option<RectF> {
-        let rows = self.menu.as_ref()?;
-        let last = rows.last()?.1;
-        Some(RectF::new(
-            self.panels_button.x,
-            self.strip.bottom() + 2.0,
-            MENU_W,
-            last.bottom() + MENU_PAD - self.strip.bottom() - 2.0,
-        ))
+    fn run_menu(&mut self, cmd: MenuCmd, cx: &mut Cx) {
+        match cmd {
+            MenuCmd::TogglePane(p) => self.toggle_pane(p, cx),
+            MenuCmd::GraphMode(m) => {
+                self.panes.visualizer.set_graph_mode(m, cx);
+                cx.log(format!("Call graph mode: {}", m.title()));
+            }
+        }
+        cx.repaint();
     }
 
     fn paint(&mut self, d: &mut DrawCtx, theme: &Theme) {
+        self.menu_bar.paint_bar(d, theme);
+        if let Some(root) = self.panes.explorer.root_path() {
+            let label = root.display().to_string();
+            let row = self.menu_row;
+            let w = d.text_system().measure(TextStyle::UiSmall, &label);
+            let x = (row.right() - w - 12.0).max(self.menu_end + 16.0);
+            d.text(
+                TextStyle::UiSmall,
+                &label,
+                RectF::new(x, row.y, row.right() - x - 8.0, row.h),
+                theme.text_dim,
+            );
+        }
         d.fill_rect(self.strip, theme.chrome_bg);
         for t in TopTab::ALL {
             let i = t.index();
@@ -349,33 +405,6 @@ impl Views {
                 );
             }
         }
-        let b = self.panels_button;
-        if self.panels_hover || self.menu.is_some() {
-            d.fill_round_rect(b, 4.0, theme.hover_bg);
-        }
-        let label_color = if self.menu.is_some() {
-            theme.text
-        } else {
-            theme.text_dim
-        };
-        d.text(
-            TextStyle::UiSmall,
-            "Panels \u{25be}",
-            RectF::new(b.x + 10.0, b.y, b.w - 10.0, b.h),
-            label_color,
-        );
-        if let Some(root) = self.panes.explorer.root_path() {
-            let label = root.display().to_string();
-            let w = d.text_system().measure(TextStyle::UiSmall, &label);
-            let after = b.right() + 16.0;
-            let x = (self.strip.right() - w - 12.0).max(after);
-            d.text(
-                TextStyle::UiSmall,
-                &label,
-                RectF::new(x, self.strip.y, self.strip.right() - x - 8.0, self.strip.h),
-                theme.text_dim,
-            );
-        }
         d.fill_rect(
             RectF::new(self.strip.x, self.strip.bottom() - 1.0, self.strip.w, 1.0),
             theme.border,
@@ -392,55 +421,7 @@ impl Views {
 
         let i = self.tab.index();
         self.areas[i].paint(d, theme, &mut self.panes, self.window_focused);
-        self.paint_menu(d, theme);
-    }
-
-    fn paint_menu(&self, d: &mut DrawCtx, theme: &Theme) {
-        let (Some(rows), Some(r)) = (&self.menu, self.menu_rect()) else {
-            return;
-        };
-        d.fill_round_rect(r, 6.0, theme.panel_bg);
-        d.stroke_rect(r, theme.border, 1.0);
-        for &(pane, row) in rows {
-            let ws = self.workspace_of(pane);
-            if self.menu_hover == Some(pane) {
-                d.fill_round_rect(row, 4.0, theme.hover_bg);
-            }
-            // A lime dot when shown, a ring when closed.
-            let c = PointF::new(row.x + 12.0, row.y + row.h / 2.0);
-            if ws.is_some() {
-                d.fill_round_rect(
-                    RectF::new(c.x - 3.5, c.y - 3.5, 7.0, 7.0),
-                    3.5,
-                    theme.accent,
-                );
-            } else {
-                d.stroke_rect(
-                    RectF::new(c.x - 3.0, c.y - 3.0, 6.0, 6.0),
-                    theme.text_dim,
-                    1.0,
-                );
-            }
-            let text = if ws.is_some() {
-                theme.text
-            } else {
-                theme.text_dim
-            };
-            d.text(
-                TextStyle::Ui,
-                pane.title(),
-                RectF::new(row.x + 26.0, row.y, row.w - 26.0, row.h),
-                text,
-            );
-            let hint = ws.map_or("closed", TopTab::title);
-            let w = d.text_system().measure(TextStyle::UiSmall, hint);
-            d.text(
-                TextStyle::UiSmall,
-                hint,
-                RectF::new(row.right() - w - 8.0, row.y, w + 4.0, row.h),
-                theme.text_dim,
-            );
-        }
+        self.menu_bar.paint_menus(d, theme);
     }
 
     /// The Visualizer canvas is on screen.
@@ -458,52 +439,31 @@ impl Views {
         }
     }
 
-    /// The Panels menu: returns whether it took the event.
+    /// The menu bar and its open menus: returns whether they took the event.
     fn menu_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
-        if self.menu.is_none() {
-            return false;
-        }
-        let row_at = |p: PointF| -> Option<PaneId> {
-            let rows = self.menu.as_ref()?;
-            rows.iter().find(|(_, r)| r.contains(p)).map(|&(id, _)| id)
-        };
-        match *e {
-            Event::MouseDown { pos, .. } => {
-                match row_at(pos) {
-                    Some(pane) => self.toggle_pane(pane, cx),
-                    None => {
-                        self.menu = None;
-                        // A click on the button itself only closes it.
-                        if self.panels_button.contains(pos) {
-                            self.owner = Some(MouseOwner::TopStrip);
-                        } else {
-                            return false;
-                        }
+        let menus = self.menus();
+        let before = self.menu_bar.state();
+        match self.menu_bar.on_event(e, cx.text, |i| menus[i].clone()) {
+            Outcome::Ignored => {
+                if before != self.menu_bar.state() {
+                    cx.repaint();
+                }
+                false
+            }
+            Outcome::Consumed => {
+                if let Some(pos) = e.pos() {
+                    self.areas[self.tab.index()].leave(&mut self.panes, cx);
+                    if self.menu_bar.over_title(pos) {
+                        cx.cursor = CursorShape::Hand;
                     }
                 }
                 cx.repaint();
                 true
             }
-            Event::MouseMove { pos, .. } => {
-                let hover = row_at(pos);
-                if hover != self.menu_hover {
-                    self.menu_hover = hover;
-                    cx.repaint();
-                }
-                if self.menu_rect().is_some_and(|r| r.contains(pos)) {
-                    self.areas[self.tab.index()].leave(&mut self.panes, cx);
-                    return true;
-                }
-                false
-            }
-            Event::KeyDown {
-                key: Key::Escape, ..
-            } => {
-                self.menu = None;
-                cx.repaint();
+            Outcome::Picked(cmd) => {
+                self.run_menu(cmd, cx);
                 true
             }
-            _ => false,
         }
     }
 
@@ -542,10 +502,6 @@ impl Views {
                 self.owner = Some(MouseOwner::TopStrip);
                 if let Some(i) = self.tab_rects.iter().position(|r| r.contains(pos)) {
                     self.switch_tab(TopTab::ALL[i], cx);
-                } else if self.panels_button.contains(pos) {
-                    self.menu = Some(self.menu_rows());
-                    self.menu_hover = None;
-                    cx.repaint();
                 }
                 return;
             }
@@ -561,13 +517,11 @@ impl Views {
                     }
                 } else if self.owner.is_none() {
                     let hover = self.tab_rects.iter().position(|r| r.contains(pos));
-                    let panels = self.panels_button.contains(pos);
-                    if hover != self.tab_hover || panels != self.panels_hover {
+                    if hover != self.tab_hover {
                         self.tab_hover = hover;
-                        self.panels_hover = panels;
                         cx.repaint();
                     }
-                    if hover.is_some() || panels {
+                    if hover.is_some() {
                         cx.cursor = CursorShape::Hand;
                     }
                     if over_strip {
@@ -579,12 +533,7 @@ impl Views {
                     return;
                 }
             }
-            Event::MouseLeave => {
-                let had = self.tab_hover.take().is_some();
-                if had | std::mem::take(&mut self.panels_hover) {
-                    cx.repaint();
-                }
-            }
+            Event::MouseLeave if self.tab_hover.take().is_some() => cx.repaint(),
             Event::MouseUp { .. } => {
                 let strip = self.owner.take() == Some(MouseOwner::TopStrip);
                 if strip && self.drag.is_none() {
@@ -1045,10 +994,9 @@ impl Shell {
                 strip: RectF::default(),
                 tab_rects: [RectF::default(); 2],
                 tab_hover: None,
-                panels_button: RectF::default(),
-                panels_hover: false,
-                menu: None,
-                menu_hover: None,
+                menu_bar: MenuBar::new(&MENUS),
+                menu_row: RectF::default(),
+                menu_end: 0.0,
                 areas: TopTab::ALL.map(|t| DockArea::new(default_tree(t))),
                 closed: HashMap::new(),
                 drag: None,

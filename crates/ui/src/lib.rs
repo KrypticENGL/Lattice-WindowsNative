@@ -16,6 +16,7 @@ mod explorer;
 mod folder_watch;
 pub mod geom;
 mod infomodal;
+mod menubar;
 mod objects;
 mod output;
 mod panel;

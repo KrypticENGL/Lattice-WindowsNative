@@ -33,6 +33,40 @@ pub struct Filter {
     pub library: bool,
     /// Compiler-generated symbols (RTTI, vtables, literals, ...).
     pub generated: bool,
+    /// Calls into code no loaded object defines (`printf`, iostream
+    /// operators, runtime helpers).
+    pub external: bool,
+}
+
+/// How much of the program the call graph shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GraphMode {
+    /// Only the functions, classes and globals the user wrote.
+    #[default]
+    Abstracted,
+    /// Everything: library code, compiler-generated symbols and calls into
+    /// code outside the loaded objects.
+    Verbose,
+}
+
+impl GraphMode {
+    pub const ALL: [Self; 2] = [Self::Abstracted, Self::Verbose];
+
+    pub fn filter(self) -> Filter {
+        let all = self == Self::Verbose;
+        Filter {
+            library: all,
+            generated: all,
+            external: all,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Abstracted => "Abstracted",
+            Self::Verbose => "Verbose",
+        }
+    }
 }
 
 /// One thing in the program, by index into its [`Program`] table.
@@ -383,7 +417,7 @@ impl Program {
                 let x = &self.globals[i as usize];
                 ok(x.library, x.artificial)
             }
-            Entity::External(i) => ok(false, self.externals[i as usize].artificial),
+            Entity::External(i) => f.external && ok(false, self.externals[i as usize].artificial),
             Entity::Field(_) | Entity::Local(_) => true,
         }
     }
@@ -581,6 +615,7 @@ impl Program {
                 let library = Filter {
                     library: true,
                     generated: false,
+                    external: true,
                 };
                 self.visible(o, library)
             })
@@ -642,6 +677,7 @@ impl Program {
                 let user = Filter {
                     library: true,
                     generated: false,
+                    external: true,
                 };
                 let sorted = |es: Vec<Entity>| -> Vec<String> {
                     let mut v: Vec<String> = es
@@ -1497,7 +1533,12 @@ mod tests {
         assert!(names.contains(&"graph.c"), "{names:?}");
         assert!(names.contains(&"shapes.cpp"), "{names:?}");
 
-        let m = p.model(file_level(&p, "graph.c"), Filter::default());
+        // Abstracted: only what the user wrote.
+        let m = p.model(file_level(&p, "graph.c"), GraphMode::Abstracted.filter());
+        assert!(!labels(&m).contains(&"external_fn"), "{:?}", labels(&m));
+        assert!(labels(&m).contains(&"caller"));
+
+        let m = p.model(file_level(&p, "graph.c"), GraphMode::Verbose.filter());
         let hub = m.hub.expect("file hub");
         assert_eq!(&*m.nodes()[hub as usize].label, "graph.c");
         for want in ["caller", "callee", "helper", "counter", "read_counter"] {
@@ -1627,13 +1668,7 @@ mod tests {
         let off = p.model(Level::Files, Filter::default());
         assert!(!labels(&off).contains(&"stdio.h"));
         assert!(off.hidden > 0);
-        let on = p.model(
-            Level::Files,
-            Filter {
-                library: true,
-                generated: true,
-            },
-        );
+        let on = p.model(Level::Files, GraphMode::Verbose.filter());
         assert!(labels(&on).contains(&"stdio.h"), "{:?}", labels(&on));
     }
 
