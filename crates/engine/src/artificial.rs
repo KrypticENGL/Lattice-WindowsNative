@@ -67,6 +67,8 @@ const INFIXES: &[&str] = &[
     // MSVC's sized-delete stub, emitted mangled: `?__empty_global_delete@@...`.
     "__empty_global_delete",
     "__ioinit",
+    // MSVC's pointer to a global's dynamic initialiser (`/Gy` sections).
+    "$initializer$",
 ];
 
 /// Whole names that are compiler-inserted calls (MinGW's `__main` runs
@@ -146,6 +148,7 @@ mod tests {
             "__CxxFrameHandler4",
             "?__empty_global_delete@@YAXPEAX_K@Z",
             "_RTC_InitBase.rtc$IMZ",
+            "?unit$initializer$@@3P6AXXZEA",
         ] {
             assert!(is_artificial(name), "{name}");
         }

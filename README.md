@@ -11,10 +11,12 @@ top-level workspaces, and every panel in them can be docked anywhere:
   their functions, variables and externals, read by `crates/engine`, and
   reload automatically when they change on disk.
 - **Visualizer**, in two modes:
-  - **Call graph:** the call and reference graph of every loaded object,
-    merged into one graph and laid out by a force simulation on a worker
-    thread. You can pan, zoom, drag, hover and select, and double-click a
-    node to open its source.
+  - **Call graph:** every loaded object, merged and shown in levels: the
+    source files joined by `#include`; a file's classes, functions and
+    globals with the calls between them; a class's members or a
+    function's locals. Click to go a level down, and at the innermost
+    level click any node for a details window. Laid out by a force
+    simulation on a worker thread; pan, zoom and drag as usual.
   - **Data:** the live data of a program stopped under GDB, drawn by
     shape: trees as trees, linked lists as chains, arrays and vectors as
     rows of cells, 2-D arrays as grids, with the stack frames beside them.
@@ -56,10 +58,12 @@ cargo test --workspace
 | Open a file | Double-click it in the Explorer (or select it and press `Enter`) |
 | Inspect an object file | Click a `.obj` / `.o` in the Explorer. Its symbols load in the background, grouped as Functions / Variables / Externals, with `file:line` when debug info has it. Expand a function to see its parameters and locals, with their types. Standard-library code and compiler-generated symbols are in collapsed **Library** and **Compiler-generated** groups. Rebuilding the file reloads it |
 | Switch top tabs | Click **Code** / **Visualizer**, or `Ctrl+1` / `Ctrl+2` |
-| See the graph | Every object you load shows up in the **Visualizer**, merged into one graph: a call to an external in one object links to its definition in another. **Add folder objects** loads every `.obj` / `.o` under the open folder. Lime nodes are functions, teal globals, amber unresolved externals. Calls are the brighter edges; arrowheads appear when zoomed in |
-| Move around the graph | Drag empty space to pan, wheel to zoom, drag a node to move it. **Fit** (or `F`) frames everything. The arrow keys pan and `+` / `-` zoom. `Space` re-runs the layout |
-| Inspect a node | Hover for its name. Click to select: its neighbours and edges light up, everything else dims, and a card shows its kind, source location and caller/callee counts. `Esc` clears the selection. Double-click opens its source at the line, in the Code tab (needs debug info) |
-| Filter the graph | **Library** (standard library and toolchain headers), **Generated** (compiler-generated symbols) and **Locals** are off by default; toggling them keeps existing nodes where they are. Types are never nodes: selecting a node shows the types it uses (a variable's type, a function's parameters and locals with theirs) as chips around it |
+| See the graph | Every object you load shows up in the **Visualizer**, merged: a call to an external in one object links to its definition in another. **Add folder objects** loads every `.obj` / `.o` under the open folder. The graph opens on **Files**: one blue node per source file, with an arrow for each `#include` (headers are found next to the includer, beside the other sources, and in the open folder and its `include/`) |
+| Go down a level | Click a file to see its classes (pink), free functions (lime) and globals (teal) around the file itself, with the calls between them; calls to and from other files end at amber nodes. Click a class to see its member functions and data members, or a function to see its parameters and locals. The level's subject has a ring around it |
+| Go back up | Click a segment of the breadcrumb over the canvas (`Files › shapes.cpp › Square`), or press `Backspace` (`Esc` too, when nothing is selected). Each level keeps its layout when you come back |
+| Details | At a class or function level, click any node: a fixed window in the middle of the canvas shows what it is, where it is declared, its size and type, its members or locals, and what calls or uses it. Click the level's subject (or the last breadcrumb segment) for its own details, files included. **Open source** jumps to it; `Esc`, `×` or a click outside closes it. Double-click a node to open its source directly |
+| Move around the graph | Drag empty space to pan, wheel to zoom, drag a node to move it. Hover a node for its name. **Fit** (or `F`) frames everything. The arrow keys pan and `+` / `-` zoom. `Space` re-runs the layout |
+| Filter the graph | **Library** (standard library and toolchain headers) and **Generated** (compiler-generated symbols) are off by default; toggling them keeps existing nodes where they are |
 | Switch Visualizer mode | **Call graph** / **Data** at the left of the Visualizer toolbar. Each mode keeps its own view |
 | Debug a program (Data mode) | Build it with `g++ -g` (or `gcc -g`). Set breakpoints with `F9` on the caret line, or click the editor's gutter. `F5` runs it: the program is `foo.exe` next to the open `foo.cpp`, or the one chosen with **Program**. With no breakpoints it stops at `main`. It gets its own console window for input and output |
 | Step | `F5` continue, `F10` step over, `F11` step into, `Shift+F11` step out, `Shift+F5` stop, or the toolbar buttons; **Pause** interrupts a running program. In the Code tab the editor follows each stop |
@@ -140,6 +144,8 @@ it. `app` hands the window to `ui` as an opaque `ui::NativeWindow`.
   and divider drags, pure and unit-tested; `mod.rs` lays a tree out, draws
   tab strips, dividers and the drop overlay, and turns tab drags into
   drops.
+- `visualizer.rs` hosts both Visualizer modes, the call graph's breadcrumb
+  and level navigation; `infomodal.rs` is the call graph's details window.
 - `explorer.rs` is a lazily loaded tree with directories first; `.git` is
   hidden.
 - `editor/` contains the line buffer with byte-column positions, undo

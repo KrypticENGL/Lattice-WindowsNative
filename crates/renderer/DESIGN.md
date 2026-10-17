@@ -6,10 +6,48 @@ about the **Call graph**.
 
 ## What it does
 
-The Visualizer tab draws the merged code graph of every loaded object file.
-It runs a force-directed layout on a worker thread. You can pan, zoom, drag
-nodes, hover, and select a node to light up its neighbours. Double-clicking
-a node opens its source.
+The Visualizer tab draws the code of every loaded object file, merged, one
+level at a time. It runs a force-directed layout on a worker thread. You
+can pan, zoom, drag nodes, hover, and select a node to light up its
+neighbours. Double-clicking a node opens its source.
+
+### Levels (`program.rs`)
+
+A flat graph of every symbol was unreadable past a few objects, so
+`Program::build` regroups the merged objects by where things are written:
+
+| Level | Nodes | Edges | A click |
+|---|---|---|---|
+| Files | each source file | `#include` | opens the file's level |
+| File | the file (the hub), its classes, free functions and globals; outside nodes for functions in other files that they call or are called by | calls and references (a method stands in for its class); hub spokes | opens a class's or function's level; other nodes and the hub open the details window |
+| Class | the class, its member functions and data members | calls between members; spokes | details window |
+| Function | the function, its parameters and locals | spokes | details window |
+
+- **Files** come from debug info (each symbol's declaration file) and from
+  following `#include` lines on disk. A quoted include is looked up next
+  to the includer first; both kinds are then looked up in every folder
+  that holds a known source, the open folder, and its `include/`. What is
+  not found (system headers) is listed in the file's details, not drawn.
+  It is a line scan, not a preprocessor: both branches of an `#if` count.
+- **Classes** come from the engine (`Type` nodes with `Contains` edges to
+  data members and `Method` edges to member functions), merged by name.
+  A class shows in the file that declares it and in every file that
+  defines one of its methods.
+- **Merging** across objects: an external links to the first definition
+  with its linkage name. Definitions with the same name on the same line
+  of the same file are one (GCC's constructor variants, a header-inline
+  function in several objects); otherwise definitions match by linkage
+  name per file. Symbols without a line (MSVC globals) go to their
+  object's main source file.
+- Levels are named by stable id, so a reload keeps the current level, and
+  each level's node positions are kept when you leave it.
+- The details window (`crates/ui/src/infomodal.rs`) shows
+  `Program::details`: kind, size, declaration, type, members, locals,
+  callers, callees, includes. It is modal and fixed: centred on the
+  canvas, closed by `Esc`, `×` or a click outside.
+
+`Program::build` reads files, so it runs only when the set of objects (or
+the open folder) changes, not on navigation or filter changes.
 
 The work is split across two crates:
 
@@ -142,13 +180,14 @@ The UI keeps rendering at full rate meanwhile.
   name. Object files do not say which definitions the linker would pick, so
   a `static` function that shares a name with a global one in another
   object could be linked wrongly.
-- Layout quality is that of a plain force simulation. Very dense graphs
-  form a hairball when zoomed out. The filters (Library, Generated, Locals) and
-  selection highlighting are the tools for reading them.
-
-Types are not graph nodes. Each node carries the types it uses
-(`ModelNode::types`), and they are drawn as chips around the selected node
-only.
+- The same source built by two compilers (GCC and MSVC objects side by
+  side) appears twice: mangled names differ and MSVC gives globals no line.
+- Include edges come from scanning source text, so they need the sources
+  on disk; conditional includes all count, and macro includes
+  (`#include FOO`) are skipped.
+- Layout quality is that of a plain force simulation. A very large file
+  level can still be dense; the filters (Library, Generated) and
+  selection highlighting are the tools for reading it.
 
 ## Data mode
 

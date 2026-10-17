@@ -25,6 +25,8 @@ try {
     Invoke-Cl '/Od /Gy /Z7 /Fomsvc_z7.obj src\graph.c'
     Invoke-Cl '/Od /Gy /Fomsvc_nodebug.obj src\graph.c'
     Invoke-Cl '/Od /Gy /EHsc /Fomsvc_comdat.obj src\comdat.cpp'
+    # C++ classes in CodeView: field lists and LF_UDT_SRC_LINE records.
+    Invoke-Cl '/Od /Gy /GR- /Z7 /Fomsvc_cpp.obj src\shapes.cpp'
     Invoke-Cl '/Od /Fomsvc_empty.obj src\empty.c'
 
     # MinGW COFF with DWARF.

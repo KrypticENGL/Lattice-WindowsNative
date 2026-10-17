@@ -259,3 +259,48 @@ fn mingw_cpp_resolves_refptr_cells_and_flags_generated_symbols() {
         Some(source_line("shapes.cpp", "explicit Square(double v)"))
     );
 }
+
+#[test]
+fn classes_carry_fields_methods_and_declarations() {
+    for name in ["mingw_cpp.o", "msvc_cpp.obj"] {
+        let g = load(name);
+        let square = g.find(NodeKind::Type, "Square").expect("Square");
+        assert_eq!(square.size, Some(16), "{name}");
+        assert_eq!(
+            square.source.as_ref().map(|s| s.line),
+            Some(source_line("shapes.cpp", "struct Square")),
+            "{name}"
+        );
+        let targets = |kind| {
+            let mut v: Vec<String> = g
+                .edges_from(square.id)
+                .filter(|e| e.kind == kind)
+                .filter_map(|e| g.node(e.to))
+                .map(|n| n.display_name.to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(targets(EdgeKind::Contains), ["s"], "{name}");
+        assert!(edge(&g, "s", "double", EdgeKind::HasType), "{name}");
+        let methods = targets(EdgeKind::Method);
+        assert!(
+            methods.iter().any(|m| m.starts_with("Square::area")),
+            "{name}: {methods:?}"
+        );
+        assert!(
+            methods.iter().any(|m| m.starts_with("Square::Square")),
+            "{name}: {methods:?}"
+        );
+        // Free functions are nobody's methods; library structs are skipped.
+        let measure = g
+            .nodes_of(NodeKind::Function)
+            .find(|n| n.display_name.starts_with("measure"))
+            .expect("measure");
+        assert!(g
+            .edges()
+            .iter()
+            .all(|e| e.to != measure.id || e.kind != EdgeKind::Method));
+        assert!(g.find(NodeKind::Type, "_iobuf").is_none(), "{name}");
+    }
+}

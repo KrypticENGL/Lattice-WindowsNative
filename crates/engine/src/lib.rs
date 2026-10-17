@@ -29,6 +29,7 @@ use std::path::Path;
 
 use object::{BinaryFormat, FileKind, Object, ObjectKind};
 
+pub use debug::is_library_path;
 pub use demangle::demangle;
 pub use error::{EngineError, ErrorKind};
 pub use graph::{

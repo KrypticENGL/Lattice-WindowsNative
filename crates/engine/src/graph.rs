@@ -30,12 +30,15 @@ pub enum EdgeKind {
     Calls,
     /// Any other use: address taken, data read or written.
     References,
-    /// Function to its parameters and local variables.
+    /// Function to its parameters and local variables; record type (class,
+    /// struct, union) to its data members.
     Contains,
     /// Variable to its type.
     HasType,
     /// Symbol to the section that holds it.
     DefinedIn,
+    /// Record type to one of its member functions.
+    Method,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

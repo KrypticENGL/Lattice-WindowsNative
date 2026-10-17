@@ -11,7 +11,9 @@ use std::borrow::Cow;
 use gimli::{AttributeValue, EndianSlice, RunTimeEndian};
 use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 
-use crate::debug::{is_library_path, DebugInfo, FuncInfo, Location, VarInfo};
+use std::collections::HashMap;
+
+use crate::debug::{is_library_path, ClassInfo, DebugInfo, FuncInfo, Location, VarInfo};
 
 type R<'a> = EndianSlice<'a, RunTimeEndian>;
 
@@ -146,19 +148,45 @@ struct Cx<'a, 'd> {
     unit: &'a gimli::Unit<R<'d>>,
 }
 
+/// Ties functions to the classes that declare them, within one unit.
+#[derive(Default)]
+struct Members {
+    /// In-class member function declaration -> qualified class name.
+    decls: HashMap<gimli::UnitOffset, String>,
+    /// Function key -> the declarations its definition points back to
+    /// (`DW_AT_specification` / `DW_AT_abstract_origin`).
+    origins: Vec<(String, Vec<gimli::UnitOffset>)>,
+}
+
 impl<'d> Cx<'_, 'd> {
     fn walk_unit(&self, info: &mut DebugInfo) -> gimli::Result<()> {
         let mut tree = self.unit.entries_tree(None)?;
         let root = tree.root()?;
-        self.walk(root, None, 0, info)
+        let mut members = Members::default();
+        self.walk(root, None, "", 0, info, &mut members)?;
+        for (key, origins) in members.origins {
+            let Some(class) = origins.iter().find_map(|o| members.decls.get(o)) else {
+                continue;
+            };
+            if let Some(c) = info.classes.get_mut(class) {
+                if !c.methods.contains(&key) {
+                    c.methods.push(key);
+                }
+            }
+        }
+        Ok(())
     }
 
+    /// `scope` is the enclosing function's key (for its locals); `prefix`
+    /// the enclosing namespaces and classes (`ns::Outer`).
     fn walk(
         &self,
         node: gimli::EntriesTreeNode<'_, '_, R<'d>>,
         scope: Option<&str>,
+        prefix: &str,
         depth: usize,
         info: &mut DebugInfo,
+        members: &mut Members,
     ) -> gimli::Result<()> {
         if depth > MAX_DEPTH {
             return Ok(());
@@ -179,8 +207,15 @@ impl<'d> Cx<'_, 'd> {
                         source: self.location(&names),
                         size: high_pc_length(entry),
                         locals: Vec::new(),
+                        qualified: None,
                     });
-                    self.walk(child, Some(&key), depth + 1, info)?;
+                    members.origins.push((key.clone(), self.origins(entry)));
+                    self.walk(child, Some(&key), prefix, depth + 1, info, members)?;
+                }
+                gimli::DW_TAG_structure_type
+                | gimli::DW_TAG_class_type
+                | gimli::DW_TAG_union_type => {
+                    self.walk_class(child, prefix, depth + 1, info, members)?;
                 }
                 gimli::DW_TAG_formal_parameter | gimli::DW_TAG_variable => {
                     // Compiler-supplied parameters such as C++ `this`.
@@ -208,14 +243,119 @@ impl<'d> Cx<'_, 'd> {
                         }
                     }
                 }
-                gimli::DW_TAG_lexical_block => self.walk(child, scope, depth + 1, info)?,
+                gimli::DW_TAG_lexical_block => {
+                    self.walk(child, scope, prefix, depth + 1, info, members)?;
+                }
                 gimli::DW_TAG_namespace | gimli::DW_TAG_module => {
-                    self.walk(child, None, depth + 1, info)?;
+                    let name = self
+                        .own_names(entry)
+                        .name
+                        .unwrap_or_else(|| "(anonymous namespace)".into());
+                    let inner = qualify(prefix, &name);
+                    self.walk(child, None, &inner, depth + 1, info, members)?;
                 }
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    /// A class, struct or union definition: its data members, its member
+    /// function declarations (matched to definitions in [`Self::walk_unit`])
+    /// and nested classes. Library and anonymous types are skipped.
+    fn walk_class(
+        &self,
+        node: gimli::EntriesTreeNode<'_, '_, R<'d>>,
+        prefix: &str,
+        depth: usize,
+        info: &mut DebugInfo,
+        members: &mut Members,
+    ) -> gimli::Result<()> {
+        if depth > MAX_DEPTH {
+            return Ok(());
+        }
+        let entry = node.entry();
+        if is_flag_set(entry.attr_value(gimli::DW_AT_declaration)) {
+            return Ok(());
+        }
+        let names = self.own_names(entry);
+        let Some(name) = names.name.clone() else {
+            return Ok(());
+        };
+        let source = self.location(&names);
+        if source.as_ref().is_some_and(|s| s.library) {
+            return Ok(());
+        }
+        let qualified = qualify(prefix, &name);
+        let mut class = ClassInfo {
+            source,
+            size: entry
+                .attr_value(gimli::DW_AT_byte_size)
+                .and_then(|v| v.udata_value()),
+            ..ClassInfo::default()
+        };
+        let mut children = node.children();
+        while let Some(child) = children.next()? {
+            let entry = child.entry();
+            match entry.tag() {
+                gimli::DW_TAG_member => {
+                    // Static members are declarations; `_vptr` is artificial.
+                    if is_flag_set(entry.attr_value(gimli::DW_AT_declaration))
+                        || self.is_artificial(entry)
+                    {
+                        continue;
+                    }
+                    let names = self.own_names(entry);
+                    let Some(field) = names.name.clone() else {
+                        continue;
+                    };
+                    class.fields.push(VarInfo {
+                        name: field,
+                        type_name: self.type_name(entry, 0),
+                        source: self.location(&names),
+                    });
+                }
+                gimli::DW_TAG_subprogram => {
+                    members.decls.insert(entry.offset(), qualified.clone());
+                    if let Some(linkage) = self.own_names(entry).linkage {
+                        if !class.methods.contains(&linkage) {
+                            class.methods.push(linkage);
+                        }
+                    }
+                }
+                gimli::DW_TAG_structure_type
+                | gimli::DW_TAG_class_type
+                | gimli::DW_TAG_union_type => {
+                    self.walk_class(child, &qualified, depth + 1, info, members)?;
+                }
+                _ => {}
+            }
+        }
+        info.classes.entry(qualified).or_insert(class);
+        Ok(())
+    }
+
+    /// The declarations a definition refers back to, nearest first.
+    fn origins(&self, entry: &gimli::DebuggingInformationEntry<R<'d>>) -> Vec<gimli::UnitOffset> {
+        let mut out = Vec::new();
+        let mut current = entry.clone();
+        for _ in 0..MAX_ORIGIN_HOPS {
+            let next = [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification]
+                .into_iter()
+                .find_map(|attr| match current.attr_value(attr) {
+                    Some(AttributeValue::UnitRef(offset)) => Some(offset),
+                    _ => None,
+                });
+            let Some(offset) = next else {
+                break;
+            };
+            out.push(offset);
+            match self.unit.entry(offset) {
+                Ok(e) => current = e,
+                Err(_) => break,
+            }
+        }
+        out
     }
 
     fn string(&self, value: AttributeValue<R<'d>>) -> Option<String> {
@@ -360,6 +500,14 @@ fn high_pc_length(entry: &gimli::DebuggingInformationEntry<R<'_>>) -> Option<u64
     match entry.attr_value(gimli::DW_AT_high_pc)? {
         AttributeValue::Addr(_) => None,
         other => other.udata_value(),
+    }
+}
+
+fn qualify(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{prefix}::{name}")
     }
 }
 

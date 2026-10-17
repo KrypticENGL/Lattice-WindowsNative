@@ -37,7 +37,7 @@ const LIBRARY_PATHS: &[&str] = &[
 /// the user's project: Visual Studio and Windows SDK headers, MinGW/MSYS and
 /// libstdc++, system includes, the Rust standard library (`/rustc/<hash>/`
 /// or rustup) and cargo/vcpkg packages. Relative paths are project files.
-pub(crate) fn is_library_path(file: &str) -> bool {
+pub fn is_library_path(file: &str) -> bool {
     let path = file.replace('\\', "/").to_ascii_lowercase();
     path.starts_with("/rustc/") || LIBRARY_PATHS.iter().any(|p| path.contains(p))
 }
@@ -55,13 +55,29 @@ pub(crate) struct FuncInfo {
     pub(crate) size: Option<u64>,
     /// Parameters and locals, in declaration order.
     pub(crate) locals: Vec<VarInfo>,
+    /// Scope-qualified name without parameters (`Shape::area`), when the
+    /// format gives one. CodeView ties methods to classes through it.
+    pub(crate) qualified: Option<String>,
 }
 
-/// Keyed by linkage name (the symbol name in the object).
+/// A class, struct or union defined in project code.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ClassInfo {
+    pub(crate) source: Option<Location>,
+    pub(crate) size: Option<u64>,
+    /// Non-static data members, in declaration order.
+    pub(crate) fields: Vec<VarInfo>,
+    /// Linkage names of member functions.
+    pub(crate) methods: Vec<String>,
+}
+
+/// Functions and globals are keyed by linkage name (the symbol name in the
+/// object); classes by their scope-qualified name.
 #[derive(Debug, Default)]
 pub(crate) struct DebugInfo {
     pub(crate) functions: HashMap<String, FuncInfo>,
     pub(crate) globals: HashMap<String, VarInfo>,
+    pub(crate) classes: HashMap<String, ClassInfo>,
 }
 
 impl DebugInfo {
@@ -103,7 +119,69 @@ impl DebugInfo {
             }
             add_type(b, id, g.type_name.as_deref());
         }
+        for (name, class) in &self.classes {
+            let id = b.add_node(NodeKind::Type, &format!("type:{name}"), Some(name));
+            if let Some(src) = &class.source {
+                b.set_source(id, &src.file, src.line);
+                b.mark_library(id, src.library);
+            }
+            if let Some(size) = class.size {
+                b.set_size(id, size);
+            }
+            for field in &class.fields {
+                // Keyed under the type, like locals under their function.
+                let key = format!("type:{name}::{}", field.name);
+                let field_id = b.add_node(NodeKind::Variable, &key, Some(&field.name));
+                if let Some(src) = &field.source {
+                    b.set_source(field_id, &src.file, src.line);
+                }
+                b.add_edge(id, field_id, EdgeKind::Contains);
+                add_type(b, field_id, field.type_name.as_deref());
+            }
+            for linkage in &class.methods {
+                let f = b.id_for(NodeKind::Function, linkage);
+                if b.contains(f) {
+                    b.add_edge(id, f, EdgeKind::Method);
+                }
+            }
+        }
+        // Formats without member lists (CodeView) qualify each procedure's
+        // name with its class instead.
+        for (linkage, f) in &self.functions {
+            let Some(class) = f.qualified.as_deref().and_then(owner_scope) else {
+                continue;
+            };
+            let (class_id, f_id) = (
+                b.id_for(NodeKind::Type, &format!("type:{class}")),
+                b.id_for(NodeKind::Function, linkage),
+            );
+            if self.classes.contains_key(class) && b.contains(f_id) {
+                b.add_edge(class_id, f_id, EdgeKind::Method);
+            }
+        }
     }
+}
+
+/// `ns::Shape` for `ns::Shape::area`: everything before the last `::` that
+/// is not inside template brackets.
+fn owner_scope(qualified: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    let bytes = qualified.as_bytes();
+    let mut split = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b':' if depth == 0 && bytes.get(i + 1) == Some(&b':') => {
+                split = Some(i);
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    split.map(|i| &qualified[..i]).filter(|s| !s.is_empty())
 }
 
 fn add_type(b: &mut Builder, var: crate::graph::NodeId, type_name: Option<&str>) {
@@ -116,6 +194,14 @@ fn add_type(b: &mut Builder, var: crate::graph::NodeId, type_name: Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_scope_skips_template_arguments() {
+        assert_eq!(owner_scope("Shape::area"), Some("Shape"));
+        assert_eq!(owner_scope("ns::Box<a::b>::get"), Some("ns::Box<a::b>"));
+        assert_eq!(owner_scope("Box<a::b>"), None);
+        assert_eq!(owner_scope("main"), None);
+    }
 
     #[test]
     fn library_paths() {

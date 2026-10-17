@@ -21,8 +21,20 @@ caller (the IDE does it in `crates/ui`).
 |---|---|---|
 | A | Symbols, sections, relocations (`object`) | `Function`, `Variable`, `External`, `Section` nodes. `References` / `Calls` / `DefinedIn` edges |
 | A | x86-64 code at each relocation (`iced-x86`) | Splits `Calls` from `References`. Covers `call`/`jmp`, `call [rip+x]`, and a RIP-relative load whose register is later called |
-| B | DWARF (`gimli`): ELF objects, and MinGW/windows-gnu COFF objects | Source file and line, function size, parameters and locals (`Contains`), types (`HasType`) |
+| B | DWARF (`gimli`): ELF objects, and MinGW/windows-gnu COFF objects | Source file and line, function size, parameters and locals (`Contains`), types (`HasType`), classes |
 | B | CodeView `.debug$S` / `.debug$T` (MSVC `/Z7`) | The same, parsed in this crate |
+
+**Classes.** Every class, struct and union defined in project code
+becomes a `Type` node named by its qualified name (`ns::Outer::Inner`),
+with its declaration line and size, `Contains` edges to its non-static
+data members (`Variable` nodes with `HasType`), and `Method` edges to the
+member functions defined in the object. DWARF ties a definition to its
+class through the in-class declaration (`DW_AT_specification`, or the
+abstract origin for constructors). CodeView has no such link, so a
+procedure whose qualified name (`Square::area`) starts with a known class
+is its method; data members come from the `LF_FIELDLIST`, and the
+declaration from `LF_UDT_SRC_LINE`. Library and anonymous types are left
+out.
 
 Unwind tables (`.pdata`, `.xdata`, `.eh_frame`), debug sections and linker
 directives are not graphed. MSVC associative COMDATs are ignored with them.
@@ -73,7 +85,7 @@ build). 99.9% of functions get a source location.
   symbol-record parser is not public, so the CodeView reader here handles
   just the records it needs: procedures, data, `S_LOCAL`, `S_REGREL32`,
   `S_BPREL32`, line starts, and type names.
-- **CodeView types are names only.** Supported: primitives, pointers,
+- **CodeView types are names only**, apart from class data members. Supported: primitives, pointers,
   `const`, arrays, struct/class/union/enum and procedures. With `/Zi` and
   `/ZI`, non-primitive types live in the PDB's type server, so a local such
   as `std::string name` is listed without its type. `/Z7` keeps the types

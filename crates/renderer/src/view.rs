@@ -23,15 +23,13 @@ const DETAIL_ZOOM: f32 = 0.8;
 /// this many; otherwise just for the selection and hover.
 const MAX_LABELS: usize = 250;
 const MAX_NEIGHBOR_LABELS: usize = 60;
-/// Type chips around the selected node; the rest are counted.
-const MAX_TYPE_CHIPS: usize = 12;
 /// Pointer travel (DIPs) before a press becomes a drag or pan.
 const DRAG_SLOP: f32 = 3.0;
 /// Hover/hit tolerance around a node, in DIPs.
 const HIT_SLOP_PX: f32 = 4.0;
 const WHEEL_STEP: f32 = 1.2;
 const FIT_MARGIN: f32 = 40.0;
-const FIT_MAX_ZOOM: f32 = 1.5;
+const FIT_MAX_ZOOM: f32 = 2.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Cursor {
@@ -50,6 +48,8 @@ pub struct Response {
     pub cursor: Cursor,
     /// A node was double-clicked: open its source.
     pub open: Option<u32>,
+    /// A node was clicked (pressed and released without dragging).
+    pub click: Option<u32>,
 }
 
 enum Gesture {
@@ -69,15 +69,10 @@ enum Gesture {
     },
 }
 
-/// Selection details shown in the info card.
 struct Selection {
     node: u32,
     /// Selected node and its neighbours.
     lit: Vec<bool>,
-    callers: usize,
-    callees: usize,
-    refs_in: usize,
-    refs_out: usize,
 }
 
 /// Index of (class, state) draw buckets.
@@ -162,13 +157,29 @@ impl GraphView {
     /// Replaces the graph. Nodes that existed before keep their positions
     /// (matched by id), so a reload or filter change only nudges the layout.
     pub fn set_model(&mut self, model: GraphModel) {
-        let old: HashMap<NodeId, Vec2> = self
-            .model
+        let old = self.positions_by_id();
+        self.load(model, &old);
+    }
+
+    /// Where each node is now, by id (to restore a level later).
+    pub fn positions_by_id(&self) -> HashMap<NodeId, Vec2> {
+        self.model
             .nodes()
             .iter()
             .zip(&self.positions)
             .map(|(n, &p)| (n.id, p))
-            .collect();
+            .collect()
+    }
+
+    /// Shows a different graph (another level), starting from `seeds` for
+    /// the nodes it has positions for, and frames it.
+    pub fn switch_model(&mut self, model: GraphModel, seeds: &HashMap<NodeId, Vec2>) {
+        self.selection = None;
+        self.auto_fit = true;
+        self.load(model, seeds);
+    }
+
+    fn load(&mut self, model: GraphModel, old: &HashMap<NodeId, Vec2>) {
         let selected = self.selected().map(|n| n.id);
         let initial: Vec<Option<Vec2>> = model
             .nodes()
@@ -279,24 +290,7 @@ impl GraphView {
             for &j in self.model.neighbors(node) {
                 lit[j as usize] = true;
             }
-            let mut s = Selection {
-                node,
-                lit,
-                callers: 0,
-                callees: 0,
-                refs_in: 0,
-                refs_out: 0,
-            };
-            for e in self.model.edges() {
-                match (e.class, e.from == node, e.to == node) {
-                    (EdgeClass::Calls, true, _) => s.callees += 1,
-                    (EdgeClass::Calls, _, true) => s.callers += 1,
-                    (EdgeClass::References, true, _) => s.refs_out += 1,
-                    (EdgeClass::References, _, true) => s.refs_in += 1,
-                    _ => {}
-                }
-            }
-            s
+            Selection { node, lit }
         });
     }
 
@@ -321,9 +315,9 @@ impl GraphView {
         if clicks >= 2 {
             self.gesture = Gesture::None;
             return Response {
-                repaint: false,
                 cursor: cursor_for(node),
                 open: node,
+                ..Response::default()
             };
         }
         self.gesture = Gesture::Press { at: pos, node };
@@ -365,7 +359,7 @@ impl GraphView {
                 Response {
                     repaint: true,
                     cursor: Cursor::Move,
-                    open: None,
+                    ..Response::default()
                 }
             }
             Gesture::Drag { node, grab } => {
@@ -381,7 +375,7 @@ impl GraphView {
                 Response {
                     repaint: true,
                     cursor: Cursor::Move,
-                    open: None,
+                    ..Response::default()
                 }
             }
             Gesture::None => {
@@ -391,27 +385,28 @@ impl GraphView {
                 Response {
                     repaint: changed,
                     cursor: cursor_for(hover),
-                    open: None,
+                    ..Response::default()
                 }
             }
         }
     }
 
     pub fn pointer_up(&mut self, pos: Vec2) -> Response {
-        let repaint = match self.gesture {
+        let (repaint, click) = match self.gesture {
             Gesture::Press { node, .. } => {
                 // A click: select the node, or clear on empty space.
                 let before = self.selection.as_ref().map(|s| s.node);
                 self.select(node);
-                before != node
+                (before != node, node)
             }
-            _ => true,
+            _ => (true, None),
         };
         self.end_gesture();
         Response {
             repaint,
             cursor: cursor_for(self.node_at(pos)),
-            open: None,
+            click,
+            ..Response::default()
         }
     }
 
@@ -438,7 +433,7 @@ impl GraphView {
         Response {
             repaint: true,
             cursor: cursor_for(self.hover),
-            open: None,
+            ..Response::default()
         }
     }
 
@@ -537,6 +532,7 @@ impl GraphView {
                 EdgeClass::Structure,
                 EdgeClass::References,
                 EdgeClass::Calls,
+                EdgeClass::Includes,
             ] {
                 let segs = &s.segments[class.index() * 3 + tone as usize];
                 if segs.is_empty() {
@@ -545,7 +541,14 @@ impl GraphView {
                 let base = style.edge[class.index()];
                 let (color, width) = match tone {
                     Tone::Dim => (base.faded(style.dim), 1.0),
-                    Tone::Normal => (base, if class == EdgeClass::Calls { 1.2 } else { 1.0 }),
+                    Tone::Normal => (
+                        base,
+                        if matches!(class, EdgeClass::Calls | EdgeClass::Includes) {
+                            1.2
+                        } else {
+                            1.0
+                        },
+                    ),
                     Tone::Lit => (style.highlight, 1.8),
                 };
                 c.stroke_segments(segs, color, width * px);
@@ -577,6 +580,16 @@ impl GraphView {
                 c.stroke_circle(p, r + gap * px, color, width * px);
             }
         };
+        if let Some(hub) = self.model.hub {
+            // The level's subject: everything else here belongs to it.
+            ring(
+                c,
+                hub,
+                style.node[self.model.nodes()[hub as usize].class.index()],
+                4.0,
+                1.5,
+            );
+        }
         if let Some((sel, _)) = lit {
             ring(c, sel, style.highlight, 3.0, 2.0);
         }
@@ -586,62 +599,6 @@ impl GraphView {
         c.reset_transform();
 
         self.paint_labels(c, style, detail);
-        self.paint_types(c, style);
-        self.paint_card(c, style);
-    }
-
-    /// The selected node's types, as chips in a ring around it. Types are
-    /// not graph nodes; this is the only place they appear.
-    fn paint_types(&self, c: &mut dyn Canvas, style: &Style) {
-        let Some(sel) = &self.selection else {
-            return;
-        };
-        let Some(n) = self.model.node(sel.node) else {
-            return;
-        };
-        let Some(&p) = self.positions.get(sel.node as usize) else {
-            return;
-        };
-        if n.types.is_empty() {
-            return;
-        }
-        let mut tags: Vec<String> = n
-            .types
-            .iter()
-            .take(MAX_TYPE_CHIPS)
-            .map(|t| {
-                if t.role.is_empty() {
-                    t.ty.to_string()
-                } else {
-                    format!("{}: {}", t.role, t.ty)
-                }
-            })
-            .collect();
-        if n.types.len() > MAX_TYPE_CHIPS {
-            tags.push(format!("+{} more", n.types.len() - MAX_TYPE_CHIPS));
-        }
-        let center = self.camera.to_screen(p);
-        let lh = c.line_height();
-        let k = tags.len() as f32;
-        let ry = 56.0 + 5.0 * k;
-        let rx = ry * 1.6;
-        let color = style.node[NodeClass::Type.index()];
-        let mut spokes = Vec::with_capacity(tags.len());
-        let mut chips = Vec::with_capacity(tags.len());
-        for (i, t) in tags.iter().enumerate() {
-            let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / k;
-            let at = center + Vec2::new(a.cos() * rx, a.sin() * ry);
-            let w = c.measure_text(t, false) + 14.0;
-            let r = Rect::new(at.x - w / 2.0, at.y - (lh + 6.0) / 2.0, w, lh + 6.0);
-            spokes.push([center, at]);
-            chips.push((r, t));
-        }
-        c.stroke_segments(&spokes, color.faded(0.45), 1.0);
-        for (r, t) in chips {
-            c.fill_rect(r, r.h / 2.0, style.card_bg);
-            c.stroke_rect(r, r.h / 2.0, color.faded(0.8), 1.0);
-            c.text(t, Vec2::new(r.x + 7.0, r.y + 3.0), color, false);
-        }
     }
 
     /// Labels, placed greedily so none overlap: the hovered node first,
@@ -705,55 +662,6 @@ impl GraphView {
             }
             placed.push((i, rect));
             c.text(&n.label, Vec2::new(rect.x, rect.y), color, false);
-        }
-    }
-
-    /// Info card for the selection (bottom left) and the hovered node.
-    fn paint_card(&self, c: &mut dyn Canvas, style: &Style) {
-        let Some(sel) = &self.selection else {
-            return;
-        };
-        let Some(n) = self.model.node(sel.node) else {
-            return;
-        };
-        let mut lines: Vec<(String, bool)> = vec![(n.label.to_string(), true)];
-        let mut kind = n.class.describe().to_string();
-        if let Some(src) = &n.source {
-            let file = src.file.rsplit(['/', '\\']).next().unwrap_or(&src.file);
-            kind.push_str(&format!("  ·  {file}:{}", src.line));
-        }
-        lines.push((kind, false));
-        lines.push((
-            format!(
-                "{} callers  ·  {} callees  ·  {} refs in  ·  {} refs out",
-                sel.callers, sel.callees, sel.refs_in, sel.refs_out
-            ),
-            false,
-        ));
-        if n.source.is_some() {
-            lines.push(("Double-click to open the source".into(), false));
-        }
-        let lh = c.line_height() + 2.0;
-        let pad = 10.0;
-        let view = self.camera.viewport();
-        let w = lines
-            .iter()
-            .map(|(s, bold)| c.measure_text(s, *bold))
-            .fold(0.0f32, f32::max)
-            .min(view.w - 2.0 * pad - 24.0)
-            + 2.0 * pad;
-        let h = lines.len() as f32 * lh + 2.0 * pad;
-        let r = Rect::new(view.x + 12.0, view.bottom() - h - 12.0, w, h);
-        c.fill_rect(r, 6.0, style.card_bg);
-        c.stroke_rect(r, 6.0, style.card_border, 1.0);
-        for (k, (s, bold)) in lines.iter().enumerate() {
-            let color = if *bold { style.label } else { style.label_dim };
-            c.text(
-                s,
-                Vec2::new(r.x + pad, r.y + pad + k as f32 * lh),
-                color,
-                *bold,
-            );
         }
     }
 }
@@ -915,18 +823,33 @@ mod tests {
     }
 
     #[test]
-    fn selection_card_and_reload_keep_positions() {
+    fn click_is_reported_and_reload_keeps_positions() {
         let mut v = view(30);
         let p = screen_of(&v, 7);
         v.pointer_down(p, 1);
-        v.pointer_up(p);
-        let card = frame(&mut v);
-        assert!(card.texts.iter().any(|t| t.contains("callers")));
+        assert_eq!(v.pointer_up(p).click, Some(7));
+        let labelled = frame(&mut v);
+        assert!(labelled.texts.iter().any(|t| t == "m0::item_7"));
 
         // Same ids again: positions and selection survive.
         let before = v.positions.clone();
         v.set_model(GraphModel::synthetic(30, 1.5));
         assert_eq!(v.positions, before);
         assert_eq!(v.selected().map(|n| n.id), Some(NodeId(7)));
+
+        // A drag is not a click.
+        v.pointer_down(p, 1);
+        v.pointer_move(p + Vec2::new(30.0, 0.0), true);
+        assert_eq!(v.pointer_up(p + Vec2::new(30.0, 0.0)).click, None);
+    }
+
+    #[test]
+    fn switching_levels_restores_seeded_positions() {
+        let mut v = view(30);
+        let saved = v.positions_by_id();
+        v.switch_model(GraphModel::synthetic(10, 1.0), &HashMap::new());
+        assert_eq!(v.model().nodes().len(), 10);
+        v.switch_model(GraphModel::synthetic(30, 1.5), &saved);
+        assert_eq!(v.positions_by_id(), saved);
     }
 }

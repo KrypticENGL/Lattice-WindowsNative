@@ -2,10 +2,13 @@
 //! left of the toolbar. It is a separate root view: it owns its whole area
 //! and never shares layout or input with the Code tab.
 //!
-//! - **Call graph**: every loaded object file, merged. The toolbar loads
-//!   objects and toggles which node classes show; the canvas pans (drag
-//!   empty space), zooms (wheel), drags nodes, selects (click; neighbours
-//!   stay lit) and opens a node's source (double-click).
+//! - **Call graph**: every loaded object file, merged and shown a level at
+//!   a time: the source files joined by `#include`; one file's classes,
+//!   functions and globals; a class's members or a function's locals.
+//!   Clicking a file, class or function opens its level; a breadcrumb over
+//!   the canvas (and `Backspace`) goes back up. At the innermost level a
+//!   click opens a details window (see `infomodal.rs`). The canvas pans,
+//!   zooms and drags nodes as before.
 //! - **Data**: the live data of a program stopped under GDB, drawn by shape
 //!   (trees as trees, arrays as cells). The toolbar runs and steps the
 //!   program; clicking a box shows its type. The Source and Call stack
@@ -13,19 +16,22 @@
 //!   records the whole run and replays it with a play bar under the
 //!   canvas.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engine::CodeGraph;
+use engine::{CodeGraph, NodeId};
 use renderer::data::{DataStyle, DataView};
-use renderer::{Cursor, Filter, GraphModel, GraphView, NodeClass, Rgba, Style, Vec2};
+use renderer::{
+    Cursor, Entity, Filter, GraphModel, GraphView, Level, NodeClass, Program, Rgba, Style, Vec2,
+};
 
 use crate::codepane::Target;
 use crate::debug::Phase;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::geom::{PointF, RectF};
+use crate::infomodal::{InfoModal, ModalAction};
 use crate::panel::{Action, Cx, DebugAction, Panel};
 use crate::playbar::{BarState, PlayBar, PLAYBAR_H};
 use crate::replay::{ReplayAction, ReplayStatus};
@@ -35,6 +41,8 @@ use crate::sys::Waker;
 use crate::theme::{Color, Theme};
 
 const TOOLBAR_H: f32 = 40.0;
+const CRUMB_H: f32 = 26.0;
+const CRUMB_PAD: f32 = 10.0;
 const BUTTON_H: f32 = 26.0;
 const BUTTON_PAD: f32 = 12.0;
 const BUTTON_GAP: f32 = 6.0;
@@ -86,7 +94,6 @@ enum Button {
     Clear,
     Library,
     Generated,
-    Locals,
     Program,
     Run,
     Play,
@@ -98,13 +105,12 @@ enum Button {
 }
 
 impl Button {
-    const GRAPH: [Self; 6] = [
+    const GRAPH: [Self; 5] = [
         Self::AddFolder,
         Self::Fit,
         Self::Clear,
         Self::Library,
         Self::Generated,
-        Self::Locals,
     ];
     const DATA: [Self; 9] = [
         Self::Program,
@@ -127,7 +133,6 @@ impl Button {
             Self::Clear => "Clear".into(),
             Self::Library => "Library".into(),
             Self::Generated => "Generated".into(),
-            Self::Locals => "Locals".into(),
             Self::Program => match &debug.program {
                 Some(p) => format!("Program: {p}"),
                 None => "Choose program\u{2026}".into(),
@@ -147,7 +152,7 @@ impl Button {
     }
 
     fn is_toggle(self) -> bool {
-        matches!(self, Self::Library | Self::Generated | Self::Locals)
+        matches!(self, Self::Library | Self::Generated)
     }
 
     fn is_mode(self) -> bool {
@@ -193,6 +198,20 @@ pub struct Visualizer {
     bar: PlayBar,
     view: GraphView,
     graphs: BTreeMap<PathBuf, Arc<CodeGraph>>,
+    /// The loaded objects regrouped by file, class and function.
+    program: Program,
+    /// Which part of the program the canvas shows.
+    level: Level,
+    /// Node positions of the levels visited, restored on return.
+    saved: HashMap<Level, HashMap<NodeId, Vec2>>,
+    /// Breadcrumb segments over the canvas (laid out when painted).
+    crumbs: Vec<(String, Level, RectF)>,
+    hover_crumb: Option<usize>,
+    /// The details window, while open.
+    modal: Option<InfoModal>,
+    /// A click just opened a level; the second click of a double-click
+    /// must not act on the new level.
+    swallow_double: bool,
     filter: Filter,
     dirty: bool,
     folder_loading: bool,
@@ -225,6 +244,13 @@ impl Visualizer {
             bar: PlayBar::default(),
             view,
             graphs: BTreeMap::new(),
+            program: Program::default(),
+            level: Level::Files,
+            saved: HashMap::new(),
+            crumbs: Vec::new(),
+            hover_crumb: None,
+            modal: None,
+            swallow_double: false,
             filter: Filter::default(),
             dirty: false,
             folder_loading: false,
@@ -298,7 +324,11 @@ impl Visualizer {
     }
 
     pub fn set_root(&mut self, root: Option<PathBuf>) {
-        self.root = root;
+        if self.root != root {
+            self.root = root;
+            // Sources and headers resolve against the open folder.
+            self.dirty = !self.graphs.is_empty();
+        }
     }
 
     /// Adds or replaces (on reload) one object's graph.
@@ -331,8 +361,59 @@ impl Visualizer {
         self.dirty = false;
         self.last_build = Some(Instant::now());
         let graphs: Vec<Arc<CodeGraph>> = self.graphs.values().cloned().collect();
-        self.view.set_model(GraphModel::build(&graphs, self.filter));
+        self.program = Program::build(&graphs, self.root.as_deref());
+        if !self.program.has_level(self.level) {
+            self.saved.clear();
+            self.go(Level::Files);
+        } else {
+            self.view
+                .set_model(self.program.model(self.level, self.filter));
+        }
         true
+    }
+
+    /// Shows another level, restoring where its nodes were last time.
+    fn go(&mut self, level: Level) {
+        self.saved.insert(self.level, self.view.positions_by_id());
+        self.level = level;
+        self.modal = None;
+        self.hover_crumb = None;
+        let seeds = self.saved.get(&level).cloned().unwrap_or_default();
+        self.view
+            .switch_model(self.program.model(level, self.filter), &seeds);
+    }
+
+    fn go_up(&mut self) -> bool {
+        match self.program.parent(self.level) {
+            Some(parent) => {
+                self.go(parent);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A click on a node: files, classes and functions open their level
+    /// (from the outer two levels); anything else, and the level's own
+    /// subject, opens the details window.
+    fn click_node(&mut self, i: u32, cx: &mut Cx) {
+        let Some(e) = self.view.model().node(i).and_then(|n| n.entity) else {
+            return;
+        };
+        let outer = matches!(self.level, Level::Files | Level::File(_));
+        let hub = self.view.model().hub == Some(i);
+        match self.program.level_of(e) {
+            Some(level) if outer && !hub => {
+                self.go(level);
+                self.swallow_double = true;
+            }
+            _ => self.show_details(e),
+        }
+        cx.repaint();
+    }
+
+    fn show_details(&mut self, e: Entity) {
+        self.modal = Some(InfoModal::new(self.program.details(e)));
     }
 
     /// Takes new layout positions. Returns `true` if the view moved.
@@ -487,6 +568,9 @@ impl Visualizer {
     fn clear(&mut self, cx: &mut Cx) {
         self.graphs.clear();
         self.synthetic = false;
+        self.saved.clear();
+        self.level = Level::Files;
+        self.modal = None;
         self.dirty = true;
         self.update();
         cx.repaint();
@@ -496,7 +580,6 @@ impl Visualizer {
         match b {
             Button::Library => self.filter.library,
             Button::Generated => self.filter.generated,
-            Button::Locals => self.filter.locals,
             Button::Play => {
                 self.debug.recording.is_some() || self.debug.replay.is_some_and(|r| r.playing)
             }
@@ -525,11 +608,10 @@ impl Visualizer {
             Button::Clear => self.clear(cx),
             Button::Library => self.filter.library ^= true,
             Button::Generated => self.filter.generated ^= true,
-            Button::Locals => self.filter.locals ^= true,
         }
         if b.is_toggle() && !self.synthetic {
-            self.dirty = true;
-            self.update();
+            self.view
+                .set_model(self.program.model(self.level, self.filter));
         }
         cx.repaint();
     }
@@ -543,6 +625,9 @@ impl Visualizer {
             Cursor::Hand => CursorShape::Hand,
             Cursor::Move => CursorShape::Move,
         };
+        if let Some(i) = r.click {
+            self.click_node(i, cx);
+        }
         if let Some(i) = r.open {
             self.open_source(i, cx);
         }
@@ -566,21 +651,16 @@ impl Visualizer {
         let Some(node) = self.view.model().node(i) else {
             return;
         };
-        let Some(src) = &node.source else {
-            cx.log_error(format!(
-                "{}: no source location (needs debug info; externals have none)",
-                node.label
-            ));
+        let Some(e) = node.entity else {
             return;
         };
-        match resolve_source(&src.file, &node.object, self.root.as_deref()) {
-            Some(path) => cx.act(Action::OpenSource {
-                path,
-                line: src.line,
-            }),
+        self.modal = None;
+        match self.program.source(e) {
+            Some((path, line)) => cx.act(Action::OpenSource { path, line }),
             None => cx.log_error(format!(
-                "{}: source file not found: {}",
-                node.label, src.file
+                "{}: no source on disk (needs debug info and the file it was built from; \
+                 externals have none)",
+                node.label
             )),
         }
     }
@@ -628,7 +708,14 @@ impl Visualizer {
             _ if mods.ctrl || mods.alt => return false,
             Key::Letter('F') => self.view.fit_and_follow(),
             Key::Escape => {
-                self.view.clear_selection();
+                if !self.view.clear_selection() && !self.go_up() {
+                    return false;
+                }
+            }
+            Key::Backspace => {
+                if !self.go_up() {
+                    return false;
+                }
             }
             Key::Space => self.view.relayout(),
             Key::Left => self.view.pan_by(Vec2::new(KEY_PAN, 0.0)),
@@ -913,7 +1000,7 @@ impl Visualizer {
             (
                 "Nothing to show".to_string(),
                 format!(
-                    "All {} nodes are hidden. Turn on Library, Generated or Locals.",
+                    "All {} nodes here are hidden. Turn on Library or Generated.",
                     self.view.model().hidden
                 ),
             )
@@ -938,6 +1025,142 @@ impl Visualizer {
             );
             y += 26.0;
         }
+    }
+
+    /// What a click does here, shown after the breadcrumb.
+    fn hint(&self) -> &'static str {
+        match self.level {
+            Level::Files => "Click a file to see its classes and functions",
+            Level::File(_) => {
+                "Click a class or function to look inside \u{b7} the file itself for details"
+            }
+            Level::Class(_) | Level::Function(_) => {
+                "Click anything for details \u{b7} Backspace goes back"
+            }
+        }
+    }
+
+    /// `Files › shapes.cpp › Square` over the top left of the canvas: each
+    /// segment goes back to its level; the last shows its details.
+    fn paint_crumbs(&mut self, d: &mut DrawCtx, theme: &Theme) {
+        self.crumbs.clear();
+        if self.synthetic || self.graphs.is_empty() {
+            return;
+        }
+        let text = d.text_system();
+        let mut x = self.canvas.x + 12.0;
+        let y = self.canvas.y + 10.0;
+        let sep = 18.0;
+        for (name, level) in self.program.breadcrumb(self.level) {
+            let w = text.measure(TextStyle::Ui, &name) + 2.0 * CRUMB_PAD;
+            self.crumbs
+                .push((name, level, RectF::new(x, y, w, CRUMB_H)));
+            x += w + sep;
+        }
+        let hint = self.hint();
+        let hint_x = x - sep + 12.0;
+        let hint_w = text.measure(TextStyle::UiSmall, hint);
+        let all = RectF::new(
+            self.canvas.x + 8.0,
+            y - 3.0,
+            (hint_x + hint_w + 12.0 - self.canvas.x - 8.0).min(self.canvas.w - 16.0),
+            CRUMB_H + 6.0,
+        );
+        d.fill_round_rect(all, 7.0, theme.graph_card_bg);
+        let last = self.crumbs.len().saturating_sub(1);
+        for (k, (name, _, r)) in self.crumbs.iter().enumerate() {
+            let hover = self.hover_crumb == Some(k);
+            if k == last {
+                d.fill_round_rect(*r, 5.0, theme.selection_bg);
+            } else if hover {
+                d.fill_round_rect(*r, 5.0, theme.hover_bg);
+            }
+            let color = if k == last {
+                theme.accent
+            } else if hover {
+                theme.text
+            } else {
+                theme.text_dim
+            };
+            d.text(
+                TextStyle::Ui,
+                name,
+                RectF::new(r.x + CRUMB_PAD, r.y, r.w - CRUMB_PAD, r.h),
+                color,
+            );
+            if k < last {
+                d.text(
+                    TextStyle::Ui,
+                    "\u{203a}",
+                    RectF::new(r.right() + 5.0, r.y, 10.0, r.h),
+                    theme.text_dim,
+                );
+            }
+        }
+        d.text(
+            TextStyle::UiSmall,
+            hint,
+            RectF::new(hint_x, y, (all.right() - hint_x).max(0.0), CRUMB_H),
+            theme.text_dim,
+        );
+    }
+
+    fn crumb_at(&self, p: PointF) -> Option<usize> {
+        if self.mode != Mode::Graph || self.modal.is_some() {
+            return None;
+        }
+        self.crumbs.iter().position(|(_, _, r)| r.contains(p))
+    }
+
+    fn press_crumb(&mut self, k: usize, cx: &mut Cx) {
+        let Some(&(_, level, _)) = self.crumbs.get(k) else {
+            return;
+        };
+        if k + 1 == self.crumbs.len() {
+            let subject = match level {
+                Level::Files => None,
+                Level::File(id) | Level::Class(id) | Level::Function(id) => self.program.entity(id),
+            };
+            if let Some(e) = subject {
+                self.show_details(e);
+            }
+        } else {
+            self.go(level);
+        }
+        cx.repaint();
+    }
+
+    /// Routes an event to the details window while it is open. Returns
+    /// whether it was handled there.
+    fn modal_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
+        let Some(modal) = self.modal.as_mut() else {
+            return false;
+        };
+        // The second click of a double-click outside the card goes on to
+        // the canvas (it opens the source).
+        if let Event::MouseDown { pos, clicks, .. } = *e {
+            if clicks >= 2 && !modal.contains(pos) {
+                self.modal = None;
+                cx.repaint();
+                return false;
+            }
+        }
+        let Some(action) = modal.on_event(e, cx) else {
+            return false;
+        };
+        match action {
+            ModalAction::None => {}
+            ModalAction::Close => {
+                self.modal = None;
+                cx.repaint();
+            }
+            ModalAction::Open(path, line) => {
+                self.modal = None;
+                cx.act(Action::OpenSource { path, line });
+                cx.repaint();
+            }
+        }
+        true
     }
 
     fn leave_canvas(&mut self, cx: &mut Cx) {
@@ -1023,6 +1246,7 @@ impl Panel for Visualizer {
         self.paint_toolbar(d, theme);
         if self.view.model().is_empty() {
             self.paint_empty(d, theme);
+            self.paint_crumbs(d, theme);
             return;
         }
         let style = graph_style(theme);
@@ -1031,6 +1255,11 @@ impl Panel for Visualizer {
         d.clip(self.canvas, |d| view.paint(d, &style));
         if let Some(bench) = self.bench.as_mut() {
             bench.records.push(started.elapsed().as_secs_f32() * 1000.0);
+        }
+        self.paint_crumbs(d, theme);
+        if let Some(modal) = self.modal.as_mut() {
+            modal.layout(self.canvas, d.text_system());
+            modal.paint(d, theme);
         }
     }
 
@@ -1046,6 +1275,45 @@ impl Panel for Visualizer {
             }
             if matches!(e, Event::MouseMove { .. } | Event::MouseLeave) && self.bar.leave() {
                 cx.repaint();
+            }
+        }
+        if self.mode == Mode::Graph {
+            let toolbar = match *e {
+                Event::MouseDown { pos, .. } | Event::MouseMove { pos, .. } => {
+                    self.toolbar.contains(pos)
+                }
+                _ => false,
+            };
+            if !toolbar && self.modal_event(e, cx) {
+                return true;
+            }
+            if let Event::MouseMove { pos, .. } = *e {
+                let hover = self.crumb_at(pos);
+                if hover != self.hover_crumb {
+                    self.hover_crumb = hover;
+                    cx.repaint();
+                }
+                if hover.is_some() && !self.canvas_capture {
+                    self.leave_canvas(cx);
+                    cx.cursor = CursorShape::Hand;
+                    return true;
+                }
+            }
+            if let Event::MouseDown {
+                pos,
+                button: MouseButton::Left,
+                clicks,
+                ..
+            } = *e
+            {
+                if let Some(k) = self.crumb_at(pos) {
+                    self.press_crumb(k, cx);
+                    return true;
+                }
+                if clicks >= 2 && std::mem::take(&mut self.swallow_double) {
+                    return true;
+                }
+                self.swallow_double = false;
             }
         }
         match *e {
@@ -1143,27 +1411,6 @@ impl Panel for Visualizer {
     }
 }
 
-/// Finds a node's source file: absolute paths as they are; relative ones
-/// (DWARF with a remapped prefix) against the object's folder and its
-/// parents, then the open folder.
-fn resolve_source(file: &str, object: &Path, root: Option<&Path>) -> Option<PathBuf> {
-    // Rebuild from components so mixed separators come out uniform.
-    let p: PathBuf = Path::new(file)
-        .components()
-        .filter(|c| !matches!(c, std::path::Component::CurDir))
-        .collect();
-    if p.is_absolute() {
-        return p.is_file().then_some(p);
-    }
-    object
-        .ancestors()
-        .skip(1)
-        .take(5)
-        .chain(root)
-        .map(|dir| dir.join(&p))
-        .find(|c| c.is_file())
-}
-
 /// Opens a GDB frame's source (absolute paths from DWARF).
 pub(crate) fn open_frame_source(file: &str, line: u32, cx: &mut Cx) {
     let path = PathBuf::from(file);
@@ -1178,24 +1425,27 @@ pub(crate) fn rgba(c: Color) -> Rgba {
     Rgba::new(c.r, c.g, c.b, c.a)
 }
 
-fn to_rect(r: RectF) -> renderer::Rect {
+pub(crate) fn to_rect(r: RectF) -> renderer::Rect {
     renderer::Rect::new(r.x, r.y, r.w, r.h)
 }
 
 fn graph_style(t: &Theme) -> Style {
     let mut node = [rgba(t.graph_function); NodeClass::COUNT];
     for (class, color) in [
+        (NodeClass::File, t.graph_file),
+        (NodeClass::Class, t.graph_class),
         (NodeClass::Function, t.graph_function),
         (NodeClass::Variable, t.graph_variable),
+        (NodeClass::Field, t.graph_variable),
+        (NodeClass::Local, t.graph_local),
         (NodeClass::External, t.graph_external),
         (NodeClass::Library, t.graph_library),
         (NodeClass::Generated, t.graph_generated),
-        (NodeClass::Local, t.graph_local),
-        (NodeClass::Type, t.graph_type),
     ] {
         node[class.index()] = rgba(color);
     }
     let mut edge = [rgba(t.graph_calls); renderer::EdgeClass::COUNT];
+    edge[renderer::EdgeClass::Includes.index()] = rgba(t.graph_includes);
     edge[renderer::EdgeClass::References.index()] = rgba(t.graph_refs);
     edge[renderer::EdgeClass::Structure.index()] = rgba(t.graph_structure);
     Style {
@@ -1278,17 +1528,5 @@ mod tests {
         assert_eq!(percentile(&v, 0.5), 3.0);
         assert_eq!(percentile(&v, 1.0), 5.0);
         assert_eq!(percentile(&[], 0.5), 0.0);
-    }
-
-    #[test]
-    fn relative_sources_resolve_against_object_folder() {
-        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../engine/tests/fixtures");
-        let object = fixtures.join("mingw_dwarf.o");
-        let found = resolve_source("./src/graph.c", &object, None).expect("found");
-        assert!(found.ends_with("src/graph.c"));
-        assert_eq!(resolve_source("./src/missing.c", &object, None), None);
-        let abs = fixtures.join("src").join("graph.c");
-        let abs = abs.to_string_lossy();
-        assert!(resolve_source(&abs, Path::new("x.o"), None).is_some());
     }
 }

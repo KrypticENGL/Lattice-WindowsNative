@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::debug::{is_library_path, DebugInfo, Location, VarInfo};
+use crate::debug::{is_library_path, ClassInfo, DebugInfo, Location, VarInfo};
 use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 
 const CV_SIGNATURE_C13: u32 = 4;
@@ -56,7 +56,10 @@ pub(crate) fn read(file: &object::File<'_>, warnings: &mut Vec<String>) -> Optio
         .unwrap_or(&[]);
     let types = TypeTable::parse(types_data);
 
-    let mut info = DebugInfo::default();
+    let mut info = DebugInfo {
+        classes: types.classes(),
+        ..DebugInfo::default()
+    };
     let mut strings: &[u8] = &[];
     let mut checksums: &[u8] = &[];
     let mut line_starts: Vec<(String, u32, u32)> = Vec::new();
@@ -160,13 +163,16 @@ fn read_symbols(
         if PROC_KINDS.contains(&kind) {
             // parent, end, next, len, dbg start, dbg end, type, offset,
             // segment (u16), flags (u8), name.
+            let name = cstr(d, 35);
             let key = relocs
                 .get(&at(PROC_OFFSET_FIELD))
                 .cloned()
-                .or_else(|| cstr(d, 35));
+                .or_else(|| name.clone());
             if let (Some(key), Some(len)) = (&key, read_u32(d, 12)) {
                 let func = info.functions.entry(key.clone()).or_default();
                 func.size = Some(u64::from(len));
+                // `Square::area`: ties methods to their class.
+                func.qualified = name;
             }
             scopes.push(key);
             continue;
@@ -300,7 +306,180 @@ impl<'a> TypeTable<'a> {
             _ => None,
         }
     }
+
+    fn record(&self, index: u32) -> Option<(u16, &'a [u8])> {
+        let i = usize::try_from(index.checked_sub(0x1000)?).ok()?;
+        self.records.get(i).copied()
+    }
+
+    /// Class, struct and union definitions (not forward references) with
+    /// their data members and, from `LF_UDT_SRC_LINE`, where they are
+    /// declared. Library types are left out.
+    fn classes(&self) -> HashMap<String, ClassInfo> {
+        let mut lines: HashMap<u32, Location> = HashMap::new();
+        for &(kind, d) in &self.records {
+            // LF_UDT_SRC_LINE: type, source file (an LF_STRING_ID), line.
+            if kind != LF_UDT_SRC_LINE {
+                continue;
+            }
+            let (Some(udt), Some(src), Some(line)) =
+                (read_u32(d, 0), read_u32(d, 4), read_u32(d, 8))
+            else {
+                continue;
+            };
+            let file = match self.record(src) {
+                Some((LF_STRING_ID, s)) => cstr(s, 4),
+                _ => None,
+            };
+            if let Some(file) = file {
+                let library = is_library_path(&file);
+                lines.insert(
+                    udt,
+                    Location {
+                        file,
+                        line,
+                        library,
+                    },
+                );
+            }
+        }
+        let mut out = HashMap::new();
+        for (i, &(kind, d)) in self.records.iter().enumerate() {
+            // count, property, field list, then (class/struct) derived and
+            // vshape, then the size leaf and the name.
+            let fixed = match kind {
+                0x1504 | 0x1505 => 16,
+                0x1506 => 8,
+                _ => continue,
+            };
+            let Some(property) = read_u16(d, 2) else {
+                continue;
+            };
+            if property & PROP_FWDREF != 0 {
+                continue;
+            }
+            let Some((size, name_at)) = read_numeric(d, fixed) else {
+                continue;
+            };
+            let Some(name) = cstr(d, name_at).filter(|n| !n.starts_with('<')) else {
+                continue;
+            };
+            let index = 0x1000 + i as u32;
+            let source = lines.get(&index).cloned();
+            if source.as_ref().is_some_and(|s| s.library) {
+                continue;
+            }
+            let fields = read_u32(d, 4)
+                .map(|list| self.fields(list))
+                .unwrap_or_default();
+            out.entry(name).or_insert(ClassInfo {
+                source,
+                size: Some(size),
+                fields,
+                methods: Vec::new(),
+            });
+        }
+        out
+    }
+
+    /// Non-static data members (`LF_MEMBER`) of a field list, following
+    /// `LF_INDEX` continuations.
+    fn fields(&self, mut list: u32) -> Vec<VarInfo> {
+        let mut out = Vec::new();
+        for _ in 0..16 {
+            let Some((LF_FIELDLIST, d)) = self.record(list) else {
+                break;
+            };
+            let mut next = None;
+            let mut pos = 0;
+            while let Some(leaf) = read_u16(d, pos) {
+                let body = pos + 2;
+                // Offset just past this member, before padding.
+                let end = match leaf {
+                    // attributes, type, offset leaf, name
+                    LF_MEMBER => {
+                        let Some((_, name_at)) = read_numeric(d, body + 6) else {
+                            break;
+                        };
+                        let Some(name) = cstr(d, name_at) else {
+                            break;
+                        };
+                        let end = name_at + name.len() + 1;
+                        out.push(VarInfo {
+                            name,
+                            type_name: read_u32(d, body + 2).and_then(|t| self.name(t, 0)),
+                            source: None,
+                        });
+                        end
+                    }
+                    // attributes, base type, offset leaf
+                    0x1400 => match read_numeric(d, body + 6) {
+                        Some((_, end)) => end,
+                        None => break,
+                    },
+                    // virtual bases: attributes, two types, two leaves
+                    0x1401 | 0x1402 => {
+                        match read_numeric(d, body + 10).and_then(|(_, p)| read_numeric(d, p)) {
+                            Some((_, end)) => end,
+                            None => break,
+                        }
+                    }
+                    // LF_VFUNCTAB: pad, type
+                    0x1409 => body + 6,
+                    // LF_INDEX: pad, continuation list
+                    0x1404 => {
+                        next = read_u32(d, body + 2);
+                        body + 6
+                    }
+                    // LF_ONEMETHOD: attributes, type, [vtable offset], name
+                    0x1511 => {
+                        let Some(attr) = read_u16(d, body) else {
+                            break;
+                        };
+                        // Introducing virtual methods carry a vtable offset.
+                        let intro = matches!((attr >> 2) & 7, 4 | 6);
+                        let name_at = body + 6 + if intro { 4 } else { 0 };
+                        match cstr(d, name_at) {
+                            Some(n) => name_at + n.len() + 1,
+                            None => break,
+                        }
+                    }
+                    // LF_METHOD (count, list), LF_STMEMBER (attributes, type),
+                    // LF_NESTTYPE (pad, type): then a name.
+                    0x150e..=0x1510 => match cstr(d, body + 6) {
+                        Some(n) => body + 6 + n.len() + 1,
+                        None => break,
+                    },
+                    // LF_ENUMERATE: attributes, value leaf, name
+                    0x1502 => match read_numeric(d, body + 2)
+                        .and_then(|(_, p)| cstr(d, p).map(|n| p + n.len() + 1))
+                    {
+                        Some(end) => end,
+                        None => break,
+                    },
+                    _ => break,
+                };
+                pos = end;
+                // LF_PAD bytes (0xF0..=0xFF) align the next member.
+                while d.get(pos).is_some_and(|&b| b >= 0xF0) {
+                    pos += 1;
+                }
+            }
+            match next {
+                Some(n) => list = n,
+                None => break,
+            }
+        }
+        out
+    }
 }
+
+const LF_FIELDLIST: u16 = 0x1203;
+const LF_MEMBER: u16 = 0x150d;
+const LF_STRING_ID: u16 = 0x1605;
+const LF_UDT_SRC_LINE: u16 = 0x1606;
+/// Class property bit: a forward reference, defined in another record.
+const PROP_FWDREF: u16 = 0x0080;
 
 /// Built-in CodeView types (index below 0x1000): low byte is the base type,
 /// bits 8..12 the pointer mode.
@@ -343,16 +522,32 @@ fn primitive_name(index: u32) -> Option<String> {
 
 /// Skips a CodeView numeric leaf at `pos`, returning the following offset.
 fn skip_numeric(d: &[u8], pos: usize) -> Option<usize> {
+    read_numeric(d, pos).map(|(_, next)| next)
+}
+
+/// Reads a CodeView numeric leaf at `pos`: its value (signed kinds are
+/// reinterpreted) and the offset after it.
+fn read_numeric(d: &[u8], pos: usize) -> Option<(u64, usize)> {
     let leaf = read_u16(d, pos)?;
-    let extra = match leaf {
-        0..=0x7fff => 0,
-        0x8000 => 1,          // LF_CHAR
-        0x8001 | 0x8002 => 2, // LF_SHORT, LF_USHORT
-        0x8003 | 0x8004 => 4, // LF_LONG, LF_ULONG
-        0x8009 | 0x800a => 8, // LF_QUADWORD, LF_UQUADWORD
+    let at = pos + 2;
+    let le = |n: usize| -> Option<u64> {
+        let bytes = d.get(at..at.checked_add(n)?)?;
+        Some(
+            bytes
+                .iter()
+                .rev()
+                .fold(0u64, |v, &b| (v << 8) | u64::from(b)),
+        )
+    };
+    let (value, extra) = match leaf {
+        0..=0x7fff => (u64::from(leaf), 0),
+        0x8000 => (le(1)?, 1),          // LF_CHAR
+        0x8001 | 0x8002 => (le(2)?, 2), // LF_SHORT, LF_USHORT
+        0x8003 | 0x8004 => (le(4)?, 4), // LF_LONG, LF_ULONG
+        0x8009 | 0x800a => (le(8)?, 8), // LF_QUADWORD, LF_UQUADWORD
         _ => return None,
     };
-    Some(pos + 2 + extra)
+    Some((value, at + extra))
 }
 
 fn cstr(d: &[u8], start: usize) -> Option<String> {

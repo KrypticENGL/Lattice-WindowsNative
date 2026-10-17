@@ -1,5 +1,6 @@
 //! Visualizer viewport for the code graph: merges loaded objects into a
-//! drawable model, lays it out with a force simulation on a worker thread,
+//! program index shown a level at a time (files, a file, a class or a
+//! function), lays it out with a force simulation on a worker thread,
 //! and paints it with culling and level of detail through the [`Canvas`]
 //! trait.
 //!
@@ -14,6 +15,7 @@ pub mod data;
 mod geom;
 mod layout;
 mod model;
+pub mod program;
 mod spatial;
 mod view;
 
@@ -21,5 +23,6 @@ pub use camera::Camera;
 pub use canvas::{Canvas, Rgba, Style};
 pub use geom::{Affine, Rect, Vec2};
 pub use layout::{LayoutWorker, Simulation, Snapshot};
-pub use model::{EdgeClass, Filter, GraphModel, ModelEdge, ModelNode, NodeClass, TypeTag};
+pub use model::{EdgeClass, GraphModel, ModelEdge, ModelNode, NodeClass};
+pub use program::{Details, Entity, Filter, Level, Program};
 pub use view::{Cursor, GraphView, Response, NODE_RADIUS};

@@ -15,6 +15,7 @@ pub mod event;
 mod explorer;
 mod folder_watch;
 pub mod geom;
+mod infomodal;
 mod objects;
 mod output;
 mod panel;
