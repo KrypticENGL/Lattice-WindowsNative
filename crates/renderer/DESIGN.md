@@ -271,6 +271,17 @@ out without recursion (tested).
   focus dim. Box backgrounds stay opaque so edges never show through.
 - **Running.** While the program runs, the last stop stays on screen,
   dimmed.
+- **Transitions** (`data/anim.rs`). Nothing jumps. The camera glides
+  (about 0.3 s, eased) for **Fit**, the zoom buttons, revealing a frame and
+  following a new stop. After a step, boxes matched by object id slide from
+  where they were drawn to their new place (from mid-slide when steps come
+  quickly), and edges bend along. New boxes fade in, and changed values
+  flash before settling to their tint. Focus dimming, hover and the running
+  dim cross-fade. Dragging and the wheel move the camera directly and
+  cancel a glide; resizing does not animate. While anything moves,
+  `is_animating` keeps the host painting; when idle it paints nothing. A
+  tween's clock starts at the first frame that draws it, so the input
+  handlers need no clock and the tests drive time explicitly.
 
 ### Data mode limits
 

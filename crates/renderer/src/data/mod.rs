@@ -1,6 +1,7 @@
 //! Data mode: the stopped program's frames and the objects they reach,
 //! drawn by shape (see [`layout`]).
 
+mod anim;
 pub mod layout;
 mod view;
 

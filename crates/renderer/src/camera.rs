@@ -86,6 +86,19 @@ impl Camera {
         self.center = world_center;
     }
 
+    /// The camera `t` of the way from `a` to `b`. Zoom moves evenly in
+    /// scale, so a big zoom change does not rush at one end.
+    pub fn lerp(a: Self, b: Self, t: f32) -> Self {
+        if t >= 1.0 {
+            return b;
+        }
+        Self {
+            zoom: a.zoom * (b.zoom / a.zoom).powf(t),
+            center: a.center + (b.center - a.center) * t,
+            viewport: b.viewport,
+        }
+    }
+
     /// Frames `bounds` with `margin` DIPs on each side, zooming in no
     /// further than `max_zoom`.
     pub fn fit(&mut self, bounds: Rect, margin: f32, max_zoom: f32) {

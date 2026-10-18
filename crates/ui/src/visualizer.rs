@@ -424,9 +424,10 @@ impl Visualizer {
         self.view.poll()
     }
 
-    /// Wants another frame right away (benchmark running).
+    /// Wants another frame right away (benchmark running, or a Data view
+    /// transition under way).
     pub fn wants_frame(&self) -> bool {
-        self.bench.is_some()
+        self.bench.is_some() || (self.mode == Mode::Data && self.data.is_animating())
     }
 
     /// Called after each presented frame with its BeginDraw..EndDraw time.

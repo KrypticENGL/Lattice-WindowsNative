@@ -629,7 +629,7 @@ pub fn outline(b: &DataBox) -> Rect {
     })
 }
 
-fn translate(b: &mut DataBox, d: Vec2) {
+pub(crate) fn translate(b: &mut DataBox, d: Vec2) {
     b.rect.x += d.x;
     b.rect.y += d.y;
     for s in &mut b.slots {

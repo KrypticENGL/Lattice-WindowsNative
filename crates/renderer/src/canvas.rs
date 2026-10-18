@@ -24,6 +24,17 @@ impl Rgba {
         Self { a, ..self }
     }
 
+    /// `t` of the way from `self` to `o`.
+    pub fn mix(self, o: Self, t: f32) -> Self {
+        let m = |a: f32, b: f32| a + (b - a) * t;
+        Self {
+            r: m(self.r, o.r),
+            g: m(self.g, o.g),
+            b: m(self.b, o.b),
+            a: m(self.a, o.a),
+        }
+    }
+
     /// Scales the alpha (for dimmed elements).
     pub fn faded(self, k: f32) -> Self {
         Self {

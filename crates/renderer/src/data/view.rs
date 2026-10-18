@@ -4,12 +4,20 @@
 //! Types are abstracted away: boxes show names and values only. Focusing a
 //! box (click) brings in its type, size and address in a chip above it and
 //! each field's type beside its row, and dims what is not connected to it.
+//!
+//! Changes ease in rather than jump: the camera glides to a new framing,
+//! after a step boxes slide from where they were to where they are now
+//! while new ones fade in and changed values flash, and focus, hover and
+//! the stale fade cross-fade. [`DataView::is_animating`] tells the host to
+//! keep painting. Pointer drags and the wheel move the camera directly.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use debugger::Snapshot;
 
-use super::layout::{outline, BoxKind, DataLayout, EdgeKind, Link};
+use super::anim::{approach, Tween};
+use super::layout::{outline, translate, BoxKind, DataLayout, EdgeKind, Link};
 use crate::camera::Camera;
 use crate::canvas::{Canvas, Rgba};
 use crate::geom::{Rect, Vec2};
@@ -26,6 +34,16 @@ const READABLE_ZOOM: f32 = 0.7;
 const MIN_TEXT_PX: f32 = 5.0;
 const PORT_R: f32 = 3.2;
 const ARROW: f32 = 7.0;
+/// Alpha of everything while the program runs (the data is from the last
+/// stop).
+const STALE_ALPHA: f32 = 0.55;
+/// Camera moves: Fit, the zoom buttons, revealing a frame, following stops.
+const GLIDE: Duration = Duration::from_millis(320);
+/// Boxes sliding to their new place after a step.
+const SETTLE: Duration = Duration::from_millis(300);
+/// Focus dimming and the stale fade, in seconds from one end to the other.
+const FADE_S: f32 = 0.16;
+const HOVER_FADE_S: f32 = 0.1;
 
 /// Colours for the data view; filled from the UI theme.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +107,24 @@ pub struct DataView {
     gesture: Gesture,
     /// The program is running: the data shown is from the last stop.
     stale: bool,
+
+    // Transitions; see the module docs.
+    /// The camera gliding from one framing to another.
+    glide: Option<(Camera, Camera, Tween)>,
+    /// After a step, each box's previous drawn position minus its new one
+    /// (`None`: new, it fades in). Boxes slide home as the tween runs.
+    settle: Option<(Vec<Option<Vec2>>, Tween)>,
+    /// Shown emphasis per box: 1 lit, 0 dimmed by the focus.
+    lit: Vec<f32>,
+    /// Shown hover per box, 0..=1.
+    hovered: Vec<f32>,
+    /// Shown focus for the edges: 0 nothing focused, 1 focused.
+    focused: f32,
+    /// Shown alpha for staleness: 1, or `STALE_ALPHA` while running.
+    stale_alpha: f32,
+    last_tick: Option<Instant>,
+    /// Something was still in motion at the last paint.
+    moving: bool,
 }
 
 impl Default for DataView {
@@ -111,6 +147,14 @@ impl DataView {
             reveal: false,
             gesture: Gesture::None,
             stale: false,
+            glide: None,
+            settle: None,
+            lit: Vec::new(),
+            hovered: Vec::new(),
+            focused: 0.0,
+            stale_alpha: 1.0,
+            last_tick: None,
+            moving: false,
         }
     }
 
@@ -152,11 +196,21 @@ impl DataView {
         self.camera.zoom()
     }
 
+    /// A transition is under way: the host should paint again.
+    pub fn is_animating(&self) -> bool {
+        self.moving
+    }
+
+    /// Resizing follows at once (no glide).
     pub fn set_viewport(&mut self, r: Rect) {
         if r != self.camera.viewport() {
             self.camera.set_viewport(r);
+            if let Some((from, to, _)) = &mut self.glide {
+                from.set_viewport(r);
+                to.set_viewport(r);
+            }
             if self.follow {
-                self.frame();
+                self.frame(false);
             }
         }
     }
@@ -165,33 +219,51 @@ impl DataView {
     /// is too big, and keeps doing so for later stops.
     pub fn fit(&mut self) {
         self.follow = true;
-        self.frame();
+        self.frame(true);
     }
 
-    fn frame(&mut self) {
+    fn frame(&mut self, glide: bool) {
         let Some(l) = &self.layout else {
             return;
         };
         let b = l.bounds;
-        self.camera.fit(b, FIT_MARGIN, FIT_MAX_ZOOM);
-        if self.camera.zoom() < READABLE_ZOOM {
-            let v = self.camera.viewport();
+        let mut to = self.camera;
+        to.fit(b, FIT_MARGIN, FIT_MAX_ZOOM);
+        if to.zoom() < READABLE_ZOOM {
+            let v = to.viewport();
             let z = READABLE_ZOOM;
             let half = Vec2::new(v.w / z / 2.0, v.h / z / 2.0);
             let margin = FIT_MARGIN / z;
-            self.camera
-                .look_at(Vec2::new(b.x - margin, b.y - margin) + half, z);
+            to.look_at(Vec2::new(b.x - margin, b.y - margin) + half, z);
         }
+        self.go(to, glide);
+    }
+
+    /// Moves the camera to `to`, gliding there from where it is now.
+    fn go(&mut self, to: Camera, glide: bool) {
+        if glide && to != self.camera {
+            self.glide = Some((self.camera, to, Tween::new(GLIDE)));
+        } else {
+            self.camera = to;
+            self.glide = None;
+        }
+    }
+
+    /// Where the camera is heading.
+    fn target(&self) -> Camera {
+        self.glide.map_or(self.camera, |(_, to, _)| to)
     }
 
     pub fn zoom_by(&mut self, factor: f32) {
         self.follow = false;
-        let c = self.camera.viewport().center();
-        self.camera.zoom_at(c, factor);
+        let mut to = self.target();
+        to.zoom_at(to.viewport().center(), factor);
+        self.go(to, true);
     }
 
     pub fn pan_by(&mut self, delta: Vec2) {
         self.follow = false;
+        self.glide = None;
         self.camera.pan(delta);
     }
 
@@ -207,7 +279,7 @@ impl DataView {
         self.follow = false;
         self.reveal = true;
         if !self.dirty {
-            self.center_focus();
+            self.center_focus(true);
         }
     }
 
@@ -221,14 +293,15 @@ impl DataView {
             .ok()
     }
 
-    fn center_focus(&mut self) {
+    fn center_focus(&mut self, glide: bool) {
         self.reveal = false;
         let (Some(b), Some(l)) = (self.focus(), &self.layout) else {
             return;
         };
         let at = outline(&l.boxes[b]).center();
-        let zoom = self.camera.zoom().max(READABLE_ZOOM);
-        self.camera.look_at(at, zoom);
+        let mut to = self.target();
+        to.look_at(at, to.zoom().max(READABLE_ZOOM));
+        self.go(to, glide);
     }
 
     fn focus(&self) -> Option<usize> {
@@ -242,8 +315,8 @@ impl DataView {
             return;
         }
         self.dirty = false;
+        let old = self.layout.take();
         let Some(snap) = &self.snapshot else {
-            self.layout = None;
             return;
         };
         let mut l = DataLayout::build(snap, c);
@@ -257,15 +330,125 @@ impl DataView {
             }
         }
         self.previous = values;
+        let first = old.is_none();
+        if let Some(old) = old {
+            self.carry_over(&old, &l);
+        }
         self.layout = Some(l);
         if self.focus().is_none() {
             self.focus_key = None;
         }
         if self.follow {
-            self.frame();
+            self.frame(!first);
         } else if self.reveal {
-            self.center_focus();
+            self.center_focus(!first);
         }
+    }
+
+    /// Starts the settle from the old layout to `new`: boxes are matched by
+    /// key and start where they were drawn (mid-slide, if a step came
+    /// quickly), keeping their shown focus and hover.
+    fn carry_over(&mut self, old: &DataLayout, new: &DataLayout) {
+        let offsets = self.offsets(old.boxes.len());
+        let was: HashMap<&str, usize> = old
+            .boxes
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.key.as_str(), i))
+            .collect();
+        let mut from = Vec::with_capacity(new.boxes.len());
+        let mut lit = Vec::with_capacity(new.boxes.len());
+        let mut hovered = Vec::with_capacity(new.boxes.len());
+        for b in &new.boxes {
+            let i = was.get(b.key.as_str()).copied();
+            from.push(i.map(|i| {
+                let o = &old.boxes[i].rect;
+                Vec2::new(o.x - b.rect.x, o.y - b.rect.y) + offsets[i]
+            }));
+            let shown = |v: &[f32]| i.and_then(|i| v.get(i).copied()).unwrap_or(f32::NAN);
+            lit.push(shown(&self.lit));
+            hovered.push(shown(&self.hovered));
+        }
+        self.lit = lit;
+        self.hovered = hovered;
+        self.settle = Some((from, Tween::new(SETTLE)));
+    }
+
+    /// How far each of `n` boxes is drawn from its place right now.
+    fn offsets(&self, n: usize) -> Vec<Vec2> {
+        match &self.settle {
+            Some((from, tw)) if from.len() == n => {
+                let k = 1.0 - tw.eased();
+                from.iter()
+                    .map(|d| d.map_or(Vec2::ZERO, |d| d * k))
+                    .collect()
+            }
+            _ => vec![Vec2::ZERO; n],
+        }
+    }
+
+    /// Which boxes the focus leaves lit: all of them with no focus, else
+    /// the focus and its neighbours.
+    fn lit_targets(&self) -> Vec<bool> {
+        let Some(l) = &self.layout else {
+            return Vec::new();
+        };
+        let focus = self.focus();
+        let mut lit = vec![focus.is_none(); l.boxes.len()];
+        if let Some(f) = focus {
+            lit[f] = true;
+            for e in &l.edges {
+                if e.from == f {
+                    lit[e.to] = true;
+                }
+                if e.to == f {
+                    lit[e.from] = true;
+                }
+            }
+        }
+        lit
+    }
+
+    /// Steps every transition to `now`.
+    fn advance(&mut self, now: Instant) {
+        let dt = self
+            .last_tick
+            .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f32());
+        let mut moving = false;
+        if let Some((from, to, tw)) = &mut self.glide {
+            let k = tw.advance(now);
+            self.camera = Camera::lerp(*from, *to, k);
+            if tw.done() {
+                self.glide = None;
+            } else {
+                moving = true;
+            }
+        }
+        if let Some((_, tw)) = &mut self.settle {
+            tw.advance(now);
+            if tw.done() {
+                self.settle = None;
+            } else {
+                moving = true;
+            }
+        }
+        let lit = self.lit_targets();
+        self.lit.resize(lit.len(), f32::NAN);
+        self.hovered.resize(lit.len(), f32::NAN);
+        let (fade, hover_fade) = (dt / FADE_S, dt / HOVER_FADE_S);
+        for (i, on) in lit.into_iter().enumerate() {
+            moving |= approach(&mut self.lit[i], f32::from(u8::from(on)), fade);
+            let h = f32::from(u8::from(self.hover == Some(i)));
+            moving |= approach(&mut self.hovered[i], h, hover_fade);
+        }
+        let focused = f32::from(u8::from(self.focus().is_some()));
+        moving |= approach(&mut self.focused, focused, fade);
+        let stale = if self.stale { STALE_ALPHA } else { 1.0 };
+        moving |= approach(&mut self.stale_alpha, stale, fade * (1.0 - STALE_ALPHA));
+        self.moving = moving;
+        // Idle, the clock stops: the next change starts from its first
+        // frame rather than jumping by the idle time.
+        self.last_tick = moving.then_some(now);
     }
 
     fn box_at(&self, screen: Vec2) -> Option<usize> {
@@ -304,6 +487,7 @@ impl DataView {
             }
             Gesture::Press { .. } => DataResponse::default(),
             Gesture::Pan { last } => {
+                self.glide = None;
                 self.camera.pan(pos - last);
                 self.follow = false;
                 self.gesture = Gesture::Pan { last: pos };
@@ -353,6 +537,7 @@ impl DataView {
     }
 
     pub fn wheel(&mut self, pos: Vec2, notches: f32) -> DataResponse {
+        self.glide = None;
         self.camera.zoom_at(pos, WHEEL_STEP.powf(notches));
         self.follow = false;
         DataResponse {
@@ -366,35 +551,45 @@ impl DataView {
 
     /// Draws into the viewport. The caller clears the background and clips.
     pub fn paint(&mut self, c: &mut dyn Canvas, style: &DataStyle) {
+        self.paint_at(c, style, Instant::now());
+    }
+
+    fn paint_at(&mut self, c: &mut dyn Canvas, style: &DataStyle, now: Instant) {
         self.refresh(&*c);
-        let Some(l) = &self.layout else { return };
+        self.advance(now);
+        let Some(real) = &self.layout else { return };
+        // Mid-settle, draw a copy with the boxes where they are on the way.
+        let settling = self.settle.as_ref().map(|(from, tw)| (from, tw.eased()));
+        let shown;
+        let l = match settling {
+            Some((from, _)) => {
+                shown = displaced(real, &self.offsets(from.len()));
+                &shown
+            }
+            None => real,
+        };
+        let k = settling.map_or(1.0, |(_, k)| k);
+        let born = |i: usize| match settling {
+            Some((from, k)) if from[i].is_none() => k,
+            _ => 1.0,
+        };
         let zoom = self.camera.zoom();
         let visible = self.camera.visible_world().inflate(40.0 / zoom);
         let focus = self.focus();
-        // Boxes connected to the focus stay lit.
-        let mut lit = vec![focus.is_none(); l.boxes.len()];
-        if let Some(f) = focus {
-            lit[f] = true;
-            for e in &l.edges {
-                if e.from == f {
-                    lit[e.to] = true;
-                }
-                if e.to == f {
-                    lit[e.from] = true;
-                }
-            }
-        }
-        let stale = if self.stale { 0.55 } else { 1.0 };
-        let fade = |c: Rgba, on: bool| c.faded(stale * if on { 1.0 } else { style.dim });
+        let stale = self.stale_alpha;
+        // A box's alpha: dimmed by the focus, faded in when new.
+        let alpha = |i: usize| stale * born(i) * (style.dim + (1.0 - style.dim) * self.lit[i]);
+        let fade = |c: Rgba, a: f32| c.faded(a);
         let text_on = zoom * c.line_height() >= MIN_TEXT_PX;
         let lh = c.line_height();
 
         c.set_transform(self.camera.transform());
         c.set_antialias(true);
 
-        // Edges under the boxes, bucketed by colour.
+        // Edges under the boxes, bucketed by colour, and apart while they
+        // fade in with a new box.
         let w = 1.4f32.max(1.0 / zoom);
-        let mut buckets: [Vec<[Vec2; 2]>; 4] = Default::default();
+        let mut buckets: [[Vec<[Vec2; 2]>; 3]; 2] = Default::default();
         for e in &l.edges {
             let Some(bb) = Rect::bounding(&e.points) else {
                 continue;
@@ -404,12 +599,12 @@ impl DataView {
             }
             let hot = focus.is_some_and(|f| e.from == f || e.to == f);
             let i = match (e.kind, hot, focus.is_some()) {
-                (_, true, _) => 3,
+                (_, true, _) => 2,
                 (EdgeKind::Cross, false, false) => 1,
-                (_, false, false) => 0,
-                (_, false, true) => 2,
+                _ => 0,
             };
-            let seg = &mut buckets[i];
+            let new = born(e.from).min(born(e.to)) < 1.0;
+            let seg = &mut buckets[usize::from(new)][i];
             for p in e.points.windows(2) {
                 seg.push([p[0], p[1]]);
             }
@@ -417,25 +612,28 @@ impl DataView {
                 arrowhead(seg, &e.points);
             }
         }
+        // Edges away from the focus dim with it.
+        let calm = stale * (1.0 + (style.dim - 1.0) * self.focused);
         let colors = [
-            fade(style.pointer, true),
-            fade(style.cross, true),
-            fade(style.pointer, false),
-            fade(style.highlight, true),
+            style.pointer.faded(calm),
+            style.cross.faded(calm),
+            style.highlight.faded(stale),
         ];
-        for (seg, color) in buckets.iter().zip(colors) {
-            if !seg.is_empty() {
-                c.stroke_segments(seg, color, w);
+        for (set, new) in buckets.iter().zip([1.0, k]) {
+            for (seg, color) in set.iter().zip(colors) {
+                if !seg.is_empty() {
+                    c.stroke_segments(seg, color.faded(new), w);
+                }
             }
         }
 
-        // Boxes.
-        let mut ports: [Vec<Vec2>; 2] = Default::default();
+        // Boxes. Ports are batched by their (rounded) alpha.
+        let mut ports: Vec<(u8, Vec<Vec2>)> = Vec::new();
         for (bi, b) in l.boxes.iter().enumerate() {
             if !outline(b).intersects(&visible) {
                 continue;
             }
-            let on = lit[bi];
+            let on = alpha(bi);
             let bg = if b.kind == BoxKind::Frame {
                 style.frame_bg
             } else {
@@ -453,7 +651,13 @@ impl DataView {
             }
             for s in &b.slots {
                 if s.changed {
-                    c.fill_rect(s.cell.inflate(-1.0), 2.0, fade(style.changed, on));
+                    // Fades in as the step settles, under a brief flash.
+                    let cell = s.cell.inflate(-1.0);
+                    c.fill_rect(cell, 2.0, fade(style.changed, on * k));
+                    if k < 1.0 {
+                        let flash = style.highlight.faded(on * (1.0 - k));
+                        c.stroke_rect(cell, 2.0, flash, 1.5f32.max(1.0 / zoom));
+                    }
                 }
             }
             // Cell and row separators.
@@ -491,18 +695,21 @@ impl DataView {
             if !lines.is_empty() {
                 c.stroke_segments(&lines, fade(style.grid_line, on), 1.0f32.max(0.75 / zoom));
             }
+            let h = self.hovered[bi];
             let (border, bw) = if focus == Some(bi) {
                 (style.highlight, 2.0)
-            } else if self.hover == Some(bi) {
-                (style.hover, 1.5)
             } else {
-                (style.border, 1.0f32)
+                (style.border.mix(style.hover, h), 1.0f32 + 0.5 * h)
             };
             c.stroke_rect(b.rect, 4.0, fade(border, on), bw.max(1.0 / zoom));
 
+            let q = (on * 32.0).round() as u8;
             for s in &b.slots {
                 if matches!(s.link, Link::Pointer | Link::Embedded) && s.target.is_some() {
-                    ports[usize::from(!on)].push(s.port());
+                    match ports.iter_mut().find(|(a, _)| *a == q) {
+                        Some((_, p)) => p.push(s.port()),
+                        None => ports.push((q, vec![s.port()])),
+                    }
                 }
             }
             if !text_on {
@@ -542,11 +749,8 @@ impl DataView {
                 c.text(label, *at, fade(style.text_dim, on).faded(0.8), false);
             }
         }
-        if !ports[0].is_empty() {
-            c.fill_discs(&ports[0], PORT_R, fade(style.pointer, true));
-        }
-        if !ports[1].is_empty() {
-            c.fill_discs(&ports[1], PORT_R, fade(style.pointer, false));
+        for (q, p) in &ports {
+            c.fill_discs(p, PORT_R, fade(style.pointer, f32::from(*q) / 32.0));
         }
 
         if let (Some(f), true) = (focus, text_on) {
@@ -621,6 +825,27 @@ impl DataView {
             }
         }
     }
+}
+
+/// A copy of `l` with box `i` drawn `offsets[i]` from its place; edges
+/// bend along, each end following its box.
+fn displaced(l: &DataLayout, offsets: &[Vec2]) -> DataLayout {
+    let mut out = l.clone();
+    if offsets.len() != out.boxes.len() {
+        return out;
+    }
+    for (b, d) in out.boxes.iter_mut().zip(offsets) {
+        translate(b, *d);
+    }
+    for e in &mut out.edges {
+        let (a, b) = (offsets[e.from], offsets[e.to]);
+        let n = e.points.len().saturating_sub(1).max(1) as f32;
+        for (j, p) in e.points.iter_mut().enumerate() {
+            let t = j as f32 / n;
+            *p = *p + a * (1.0 - t) + b * t;
+        }
+    }
+    out
 }
 
 fn cursor_for(hit: Option<usize>) -> Cursor {
@@ -819,7 +1044,118 @@ mod tests {
         v.paint(&mut Recorder::default(), &style());
         assert_eq!(v.camera, moved, "stepping keeps the user's camera");
         v.fit();
+        assert_eq!(v.camera, moved, "Fit glides from where the camera is");
+        settle(&mut v);
         assert_eq!(v.camera, framed);
+        assert!(!v.is_animating());
+    }
+
+    /// Paints now and again once every transition has finished.
+    fn settle(v: &mut DataView) {
+        let t0 = Instant::now();
+        v.paint_at(&mut Recorder::default(), &style(), t0);
+        v.paint_at(
+            &mut Recorder::default(),
+            &style(),
+            t0 + Duration::from_secs(2),
+        );
+    }
+
+    #[test]
+    fn the_camera_glides_and_direct_moves_cancel_it() {
+        let mut v = view();
+        v.set_snapshot(snap(1));
+        v.paint(&mut Recorder::default(), &style());
+        let framed = v.camera;
+        let t0 = Instant::now();
+        v.zoom_by(2.0);
+        v.paint_at(&mut Recorder::default(), &style(), t0);
+        assert_eq!(v.camera, framed, "the glide starts at its first frame");
+        assert!(v.is_animating());
+        v.paint_at(&mut Recorder::default(), &style(), t0 + GLIDE / 2);
+        let mid = v.zoom();
+        assert!(mid > framed.zoom() && mid < framed.zoom() * 2.0, "{mid}");
+        // Zooming again builds on where the glide was heading.
+        v.zoom_by(2.0);
+        settle(&mut v);
+        assert!((v.zoom() - framed.zoom() * 4.0).abs() < 1e-3);
+
+        // Dragging takes over at once.
+        v.fit();
+        v.paint_at(&mut Recorder::default(), &style(), t0);
+        v.pointer_down(Vec2::new(500.0, 500.0), 1);
+        v.pointer_move(Vec2::new(560.0, 520.0), true);
+        v.pointer_up(Vec2::new(560.0, 520.0));
+        let dragged = v.camera;
+        v.paint_at(&mut Recorder::default(), &style(), t0 + GLIDE);
+        assert_eq!(v.camera, dragged);
+    }
+
+    #[test]
+    fn a_step_settles_then_stops_painting() {
+        let mut v = view();
+        v.set_snapshot(snap(1));
+        v.paint(&mut Recorder::default(), &style());
+        assert!(!v.is_animating(), "the first stop just appears");
+        v.set_snapshot(snap(2));
+        let t0 = Instant::now();
+        v.paint_at(&mut Recorder::default(), &style(), t0);
+        assert!(v.is_animating(), "the changed value flashes");
+        v.paint_at(&mut Recorder::default(), &style(), t0 + SETTLE / 2);
+        assert!(v.is_animating());
+        v.paint_at(&mut Recorder::default(), &style(), t0 + SETTLE);
+        assert!(!v.is_animating());
+    }
+
+    #[test]
+    fn moved_boxes_slide_from_where_they_were() {
+        let mut v = view();
+        v.set_snapshot(snap(1));
+        v.paint(&mut Recorder::default(), &style());
+        // Pretend box "a" was drawn 100 to the left at the last stop.
+        let l = v.layout.clone().unwrap();
+        let a = l.find("a").unwrap();
+        let mut old = l.clone();
+        translate(&mut old.boxes[a], Vec2::new(-100.0, 0.0));
+        v.carry_over(&old, &l);
+        let t0 = Instant::now();
+        v.advance(t0);
+        assert_eq!(v.offsets(l.boxes.len())[a], Vec2::new(-100.0, 0.0));
+        v.advance(t0 + SETTLE / 2);
+        let mid = v.offsets(l.boxes.len())[a].x;
+        assert!(mid > -100.0 && mid < 0.0, "{mid}");
+        let shown = displaced(&l, &v.offsets(l.boxes.len()));
+        assert_eq!(shown.boxes[a].rect.x, l.boxes[a].rect.x + mid);
+        v.advance(t0 + SETTLE);
+        assert_eq!(v.offsets(l.boxes.len())[a], Vec2::ZERO);
+    }
+
+    #[test]
+    fn hover_and_stale_fade() {
+        let mut v = view();
+        v.set_snapshot(snap(1));
+        v.paint(&mut Recorder::default(), &style());
+        let l = v.layout().unwrap();
+        let a = l.find("a").unwrap();
+        let at = v.camera.to_screen(l.boxes[a].rect.center());
+        v.pointer_move(at, false);
+        v.set_stale(true);
+        let t0 = Instant::now();
+        v.paint_at(&mut Recorder::default(), &style(), t0);
+        v.paint_at(
+            &mut Recorder::default(),
+            &style(),
+            t0 + Duration::from_millis(50),
+        );
+        assert!(v.hovered[a] > 0.0 && v.hovered[a] < 1.0, "{}", v.hovered[a]);
+        assert!(v.stale_alpha < 1.0 && v.stale_alpha > STALE_ALPHA);
+        v.paint_at(
+            &mut Recorder::default(),
+            &style(),
+            t0 + Duration::from_secs(1),
+        );
+        assert_eq!((v.hovered[a], v.stale_alpha), (1.0, STALE_ALPHA));
+        assert!(!v.is_animating());
     }
 
     #[test]
