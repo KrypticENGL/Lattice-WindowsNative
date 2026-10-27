@@ -5,11 +5,15 @@ mod undo;
 mod view;
 
 use std::path::Path;
+use std::sync::Arc;
 
+use debugger::Snapshot;
 use view::Document;
 
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::geom::{PointF, RectF};
+use crate::hovercard::{self, HoverCard};
+use crate::memory::{self, MemTarget};
 use crate::panel::{Cx, Panel};
 use crate::sys::dialog::{self, SaveChoice};
 use crate::sys::gfx::DrawCtx;
@@ -35,9 +39,16 @@ pub struct EditorArea {
     hits: Vec<TabHit>,
     hover: Option<usize>,
     hover_close: Option<usize>,
+    /// The last stop, for the "View in memory" card on variables.
+    snap: Option<Arc<Snapshot>>,
+    card: Option<HoverCard>,
 }
 
 impl EditorArea {
+    pub fn set_snapshot(&mut self, snap: Arc<Snapshot>) {
+        self.snap = Some(snap);
+    }
+
     pub fn has_documents(&self) -> bool {
         !self.docs.is_empty()
     }
@@ -277,7 +288,12 @@ impl Panel for EditorArea {
         );
 
         match self.docs.get_mut(self.active) {
-            Some(doc) => doc.paint(d, theme, focused),
+            Some(doc) => {
+                doc.paint(d, theme, focused);
+                if let Some(card) = &self.card {
+                    card.paint(d, theme);
+                }
+            }
             None => {
                 d.fill_rect(self.body, theme.editor_bg);
                 d.text(
@@ -358,6 +374,26 @@ impl Panel for EditorArea {
         }
         let body = self.body;
         let text = cx.text;
+        let snap = self.snap.clone();
+        let mut card = self.card.take();
+        let doc = self.docs.get_mut(self.active);
+        let taken = hovercard::track(&mut card, e, cx, |pos| {
+            // Only names live at the last stop get a card.
+            let (snap, doc) = (snap.as_deref()?, doc?);
+            let (path, anchor) = doc.expr_at_point(text, pos)?;
+            let target = MemTarget::Expr {
+                file: doc.path().to_path_buf(),
+                path,
+            };
+            if memory::resolve(snap, &target).is_empty() {
+                return None;
+            }
+            Some(HoverCard::new(target, anchor, body, Some(snap), text))
+        });
+        self.card = card;
+        if taken {
+            return true;
+        }
         match self.docs.get_mut(self.active) {
             Some(doc) => {
                 doc.layout(body, text);

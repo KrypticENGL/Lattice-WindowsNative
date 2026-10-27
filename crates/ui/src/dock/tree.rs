@@ -35,10 +35,11 @@ pub enum PaneId {
     Visualizer,
     Source,
     CallStack,
+    Memory,
 }
 
 impl PaneId {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Explorer,
         Self::Editor,
         Self::Output,
@@ -46,6 +47,7 @@ impl PaneId {
         Self::Visualizer,
         Self::Source,
         Self::CallStack,
+        Self::Memory,
     ];
 
     pub fn title(self) -> &'static str {
@@ -57,6 +59,7 @@ impl PaneId {
             Self::Visualizer => "Visualizer",
             Self::Source => "Source",
             Self::CallStack => "Call stack",
+            Self::Memory => "Memory",
         }
     }
 

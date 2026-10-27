@@ -1,6 +1,6 @@
 //! IDE shell: two workspaces (Code, Visualizer) whose panels (Solution
 //! Explorer, tabbed editor, Output, ConPTY terminal, Visualizer, Source,
-//! Call stack) dock anywhere in either. Drawn with Direct2D/DirectWrite.
+//! Call stack, Memory) dock anywhere in either. Drawn with Direct2D/DirectWrite.
 //!
 //! Public APIs expose only safe project types, never `windows::` types. All
 //! Win32/COM calls live in the private `sys` module.
@@ -15,7 +15,9 @@ pub mod event;
 mod explorer;
 mod folder_watch;
 pub mod geom;
+mod hovercard;
 mod infomodal;
+mod memory;
 mod menubar;
 mod objects;
 mod output;

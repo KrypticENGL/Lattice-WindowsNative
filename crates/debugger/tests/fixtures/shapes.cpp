@@ -9,6 +9,9 @@ struct DNode { int value; DNode* prev; DNode* next; };
 struct Point { int x, y; };
 struct TNode { std::string name; std::vector<std::unique_ptr<TNode>> kids; };
 
+int calls = 7;
+Point origin{3, 4};
+
 Node* insert(Node* n, int k) {
     if (!n) return new Node{k, nullptr, nullptr};
     if (k < n->key) n->left = insert(n->left, k);
@@ -43,5 +46,5 @@ int main() {
     const char* greeting = "hello";
     int total = 0;
     for (int x : v) total += x;
-    return total + grid[1][1] + pts[0].x + ages["ada"] + (greeting[0] == 'h') + (cyc != nullptr);
+    return total + grid[1][1] + pts[0].x + ages["ada"] + (greeting[0] == 'h') + (cyc != nullptr) + calls + origin.y;
 }

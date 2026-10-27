@@ -4,13 +4,18 @@
 //! tint); a caller's line, its call site, gets a fainter tint.
 //!
 //! Read-only. The gutter toggles breakpoints; double-clicking a line opens
-//! it in the editor.
+//! it in the editor. Hovering a variable offers "View in memory".
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
+
+use debugger::Snapshot;
 
 use crate::event::{Event, MouseButton};
 use crate::geom::{PointF, RectF};
+use crate::hovercard::{self, HoverCard};
+use crate::memory::{self, MemTarget};
 use crate::panel::{Action, Cx, Panel};
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::{TextStyle, TextSystem};
@@ -67,9 +72,45 @@ pub struct CodePane {
     recenter: bool,
     /// The program is running: the line is from the last stop.
     stale: bool,
+    snap: Option<Arc<Snapshot>>,
+    card: Option<HoverCard>,
 }
 
 impl CodePane {
+    /// The stop whose variables get the "View in memory" card.
+    pub fn set_snapshot(&mut self, snap: Arc<Snapshot>) {
+        self.snap = Some(snap);
+    }
+
+    /// The card for the variable under `p`, if it is live at the last stop.
+    fn card_at(&self, p: PointF, text: &TextSystem) -> Option<HoverCard> {
+        let (snap, t) = (self.snap.as_deref()?, self.target.as_ref()?);
+        let (i, false) = self.line_at(p)? else {
+            return None;
+        };
+        let line = &self.lines[i as usize - 1];
+        let x0 = self.body.x + self.gutter_w + 4.0 - self.hscroll;
+        if p.x < x0 || self.char_w <= 0.0 {
+            return None;
+        }
+        // Lines are tab-expanded and monospaced: one cell per char.
+        let ch = ((p.x - x0) / self.char_w) as usize;
+        let col = line.char_indices().nth(ch)?.0;
+        let (path, span) = memory::expr_at(line, col)?;
+        let target = MemTarget::Expr {
+            file: t.file.clone(),
+            path,
+        };
+        if memory::resolve(snap, &target).is_empty() {
+            return None;
+        }
+        let x = x0 + line[..span.start].chars().count() as f32 * self.char_w;
+        let w = line[span].chars().count() as f32 * self.char_w;
+        let y = self.body.y + (i - 1) as f32 * self.line_h - self.scroll;
+        let anchor = RectF::new(x, y, w, self.line_h);
+        Some(HoverCard::new(target, anchor, self.body, Some(snap), text))
+    }
+
     /// The frame to show; called before each layout. A new file or line
     /// is scrolled into view.
     pub fn show(&mut self, target: Option<Target>) {
@@ -345,9 +386,19 @@ impl Panel for CodePane {
 
     fn paint(&mut self, d: &mut DrawCtx, theme: &Theme, _focused: bool) {
         self.draw(d, theme);
+        if let Some(card) = &self.card {
+            card.paint(d, theme);
+        }
     }
 
     fn on_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
+        let text = cx.text;
+        let mut card = self.card.take();
+        let taken = hovercard::track(&mut card, e, cx, |p| self.card_at(p, text));
+        self.card = card;
+        if taken {
+            return true;
+        }
         let (repaint, action) = self.handle(e);
         if repaint {
             cx.repaint();

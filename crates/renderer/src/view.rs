@@ -294,6 +294,12 @@ impl GraphView {
         });
     }
 
+    /// The node under `screen` and its on-screen centre.
+    pub fn node_under(&mut self, screen: Vec2) -> Option<(u32, Vec2)> {
+        let i = self.node_at(screen)?;
+        Some((i, self.camera.to_screen(*self.positions.get(i as usize)?)))
+    }
+
     fn node_at(&mut self, screen: Vec2) -> Option<u32> {
         self.refresh_grid();
         let world = self.camera.to_world(screen);

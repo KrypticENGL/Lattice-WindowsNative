@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::callstack::CallStack;
@@ -15,6 +16,7 @@ use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::explorer::Explorer;
 use crate::folder_watch::{Changes, FolderWatcher};
 use crate::geom::{PointF, RectF, SizeF};
+use crate::memory::Memory;
 use crate::menubar::{Entry, Mark, MenuBar, Outcome};
 use crate::objects::{LoadResult, ObjectEvent, ObjectService};
 use crate::output::Output;
@@ -89,6 +91,7 @@ struct Panes {
     visualizer: Visualizer,
     source: CodePane,
     stack: CallStack,
+    memory: Memory,
 }
 
 impl PaneHost for Panes {
@@ -101,6 +104,7 @@ impl PaneHost for Panes {
             PaneId::Visualizer => &mut self.visualizer,
             PaneId::Source => &mut self.source,
             PaneId::CallStack => &mut self.stack,
+            PaneId::Memory => &mut self.memory,
         }
     }
 }
@@ -133,7 +137,7 @@ fn default_tree(tab: TopTab) -> Node {
                         Axis::Vertical,
                         vec![
                             (Node::tabs(&[Source]), 0.65),
-                            (Node::tabs(&[CallStack]), 0.35),
+                            (Node::tabs(&[CallStack, Memory]), 0.35),
                         ],
                     ),
                     0.3,
@@ -157,7 +161,9 @@ fn default_spot(pane: PaneId) -> (TopTab, Spot) {
         Editor => (TopTab::Code, spot(None, Zone::Center, 1.0)),
         Output | Terminal => (TopTab::Code, spot(Some(Editor), Zone::Bottom, 0.3)),
         Visualizer => (TopTab::Visualizer, spot(None, Zone::Center, 1.0)),
-        Source | CallStack => (TopTab::Visualizer, spot(Some(Visualizer), Zone::Left, 0.3)),
+        Source | CallStack | Memory => {
+            (TopTab::Visualizer, spot(Some(Visualizer), Zone::Left, 0.3))
+        }
     }
 }
 
@@ -687,11 +693,22 @@ impl Views {
             return;
         };
         let snap = r.snapshot().clone();
+        self.show_snapshot(snap);
+    }
+
+    /// A stop's data to every panel that shows it.
+    fn show_snapshot(&mut self, snap: debugger::Snapshot) {
+        // shortcut: one deep copy per stop for the panels that share it;
+        // make the Data view hold the Arc too if large snapshots get slow.
+        let shared = Arc::new(snap.clone());
         let p = &mut self.panes;
         p.stack.set_frames(&snap.frames);
         p.visualizer.set_snapshot(snap);
         p.source.show(p.visualizer.code_target());
         p.source.stopped();
+        p.source.set_snapshot(shared.clone());
+        p.editor.set_snapshot(shared.clone());
+        p.memory.set_snapshot(shared);
     }
 
     /// Wakes the UI thread when the replay's next step is due.
@@ -743,13 +760,7 @@ impl Views {
                         }
                     }
                 }
-                Update::Snapshot(snap) => {
-                    let p = &mut self.panes;
-                    p.stack.set_frames(&snap.frames);
-                    p.visualizer.set_snapshot(*snap);
-                    p.source.show(p.visualizer.code_target());
-                    p.source.stopped();
-                }
+                Update::Snapshot(snap) => self.show_snapshot(*snap),
                 Update::Ended => self.panes.visualizer.set_data_stale(true),
                 Update::Recording => {}
                 Update::Recorded(steps) => {
@@ -954,6 +965,11 @@ impl Views {
                         self.panes.output.push(error, &text);
                         cx.repaint();
                     }
+                    Action::ShowMemory(target) => {
+                        self.panes.memory.show(target);
+                        self.reveal_pane(PaneId::Memory, cx);
+                        cx.repaint();
+                    }
                     Action::RevealFrame(i) => {
                         self.panes.visualizer.reveal_frame(i);
                         cx.repaint();
@@ -1010,6 +1026,7 @@ impl Shell {
                     visualizer,
                     source: CodePane::default(),
                     stack: CallStack::default(),
+                    memory: Memory::default(),
                 },
                 owner: None,
                 window_focused: true,

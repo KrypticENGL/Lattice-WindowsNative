@@ -9,6 +9,7 @@ use super::buffer::{byte_to_utf16, order, utf16_to_byte, Buffer, Pos};
 use super::undo::{Edit, EditKind, UndoStack};
 use crate::event::{CursorShape, Event, Key, Modifiers, MouseButton};
 use crate::geom::{PointF, RectF};
+use crate::memory;
 use crate::panel::{Action, Cx};
 use crate::sys::clipboard;
 use crate::sys::gfx::DrawCtx;
@@ -192,6 +193,31 @@ impl Document {
         };
         let x = p.x - self.text_rect.x - TEXT_PAD + self.scroll.x;
         Pos::new(line, self.col_at_x(text, line, x.max(0.0)))
+    }
+
+    /// The member chain under `p` (see [`memory::expr_at`]) and the
+    /// hovered identifier's on-screen rect.
+    pub fn expr_at_point(&mut self, text: &TextSystem, p: PointF) -> Option<(Vec<String>, RectF)> {
+        if !self.text_rect.contains(p) {
+            return None;
+        }
+        let at = self.pos_at_point(text, p);
+        let y = self.text_rect.y + at.line as f32 * self.line_h - self.scroll.y;
+        let origin_x = self.text_rect.x + TEXT_PAD - self.scroll.x;
+        let line = self.buffer.line(at.line).to_string();
+        // The caret position nearest `p` can be just past the identifier.
+        for col in [at.col, at.col.saturating_sub(1)] {
+            let Some((path, span)) = memory::expr_at(&line, col) else {
+                continue;
+            };
+            let x0 = origin_x + self.x_of(text, Pos::new(at.line, span.start));
+            let x1 = origin_x + self.x_of(text, Pos::new(at.line, span.end));
+            let r = RectF::new(x0, y, x1 - x0, self.line_h);
+            if r.contains(p) {
+                return Some((path, r));
+            }
+        }
+        None
     }
 
     fn visible_lines(&self) -> usize {

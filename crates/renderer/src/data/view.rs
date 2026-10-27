@@ -456,6 +456,35 @@ impl DataView {
         l.box_at(self.camera.to_world(screen))
     }
 
+    /// The value slot under `screen`: its box key (object id or
+    /// `frame:N`), slot name and on-screen rect (the whole row for row
+    /// boxes, the cell for arrays and grids).
+    pub fn slot_at(&self, screen: Vec2) -> Option<(String, String, Rect)> {
+        let l = self.layout.as_ref()?;
+        let p = self.camera.to_world(screen);
+        let b = &l.boxes[l.box_at(p)?];
+        let rows = !matches!(b.kind, BoxKind::Array | BoxKind::Matrix);
+        let s = b.slots.iter().find(|s| {
+            if rows {
+                p.y >= s.cell.y && p.y < s.cell.bottom()
+            } else {
+                s.cell.contains(p)
+            }
+        })?;
+        let r = if rows {
+            Rect::new(b.rect.x, s.cell.y, b.rect.w, s.cell.h)
+        } else {
+            s.cell
+        };
+        let at = self.camera.to_screen(Vec2::new(r.x, r.y));
+        let z = self.camera.zoom();
+        Some((
+            b.key.clone(),
+            s.name.clone(),
+            Rect::new(at.x, at.y, r.w * z, r.h * z),
+        ))
+    }
+
     // ---- input ----------------------------------------------------------
 
     pub fn pointer_down(&mut self, pos: Vec2, clicks: u8) -> DataResponse {
@@ -988,6 +1017,27 @@ mod tests {
         let mut c = Recorder::default();
         v.paint(&mut c, &style());
         assert!(!c.texts.iter().any(|t| t.contains("Node")));
+    }
+
+    #[test]
+    fn slots_under_the_pointer() {
+        let mut v = view();
+        v.set_snapshot(snap(1));
+        v.paint(&mut Recorder::default(), &style());
+        let l = v.layout().unwrap();
+        let cell = l.boxes[l.find("a").unwrap()].slots[0].cell;
+        // Anywhere on the row, the name included.
+        let row = v.camera.to_screen(Vec2::new(
+            l.boxes[l.find("a").unwrap()].rect.x + 2.0,
+            cell.center().y,
+        ));
+        let (key, name, r) = v.slot_at(row).unwrap();
+        assert_eq!((key.as_str(), name.as_str()), ("a", "key"));
+        assert!(r.contains(row));
+        let frame = l.boxes[0].slots[0].cell.center();
+        let (key, name, _) = v.slot_at(v.camera.to_screen(frame)).unwrap();
+        assert_eq!((key.as_str(), name.as_str()), ("frame:0", "p"));
+        assert_eq!(v.slot_at(Vec2::new(990.0, 690.0)), None);
     }
 
     #[test]

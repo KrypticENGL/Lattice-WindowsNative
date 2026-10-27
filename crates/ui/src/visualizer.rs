@@ -32,7 +32,9 @@ use crate::codepane::Target;
 use crate::debug::Phase;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::geom::{PointF, RectF};
+use crate::hovercard::{self, HoverCard};
 use crate::infomodal::{InfoModal, ModalAction};
+use crate::memory::{self, MemTarget};
 use crate::panel::{Action, Cx, DebugAction, Panel};
 use crate::playbar::{BarState, PlayBar, PLAYBAR_H};
 use crate::replay::{ReplayAction, ReplayStatus};
@@ -196,6 +198,8 @@ pub struct Visualizer {
     hover_crumb: Option<usize>,
     /// The details window, while open.
     modal: Option<InfoModal>,
+    /// "View in memory" for the hovered variable.
+    card: Option<HoverCard>,
     /// A click just opened a level; the second click of a double-click
     /// must not act on the new level.
     swallow_double: bool,
@@ -237,6 +241,7 @@ impl Visualizer {
             crumbs: Vec::new(),
             hover_crumb: None,
             modal: None,
+            card: None,
             swallow_double: false,
             graph_mode: GraphMode::default(),
             dirty: false,
@@ -274,6 +279,7 @@ impl Visualizer {
             self.mode = mode;
             self.canvas_capture = false;
             self.hover_button = None;
+            self.card = None;
             cx.repaint();
         }
     }
@@ -1219,6 +1225,35 @@ impl Visualizer {
         }
     }
 
+    /// The "View in memory" card for the variable under `p`: a Data view
+    /// slot, or a field, global or local node in the call graph.
+    fn card_at(&mut self, p: PointF, text: &TextSystem) -> Option<HoverCard> {
+        if !self.canvas.contains(p) {
+            return None;
+        }
+        let snap = self.data.snapshot();
+        let (target, anchor) = match self.mode {
+            Mode::Data => {
+                let (key, name, r) = self.data.slot_at(Vec2::new(p.x, p.y))?;
+                let target = MemTarget::Slot { key, name };
+                // Rows of grids and the like that do not resolve get none.
+                if memory::resolve(snap?, &target).is_empty() {
+                    return None;
+                }
+                (target, RectF::new(r.x, r.y, r.w, r.h))
+            }
+            Mode::Graph if self.modal.is_none() => {
+                let (i, c) = self.view.node_under(Vec2::new(p.x, p.y))?;
+                let e = self.view.model().node(i)?.entity?;
+                let target = graph_target(&self.program, e)?;
+                let r = (renderer::NODE_RADIUS * self.view.zoom()).max(6.0);
+                (target, RectF::new(c.x - r, c.y - r, 2.0 * r, 2.0 * r))
+            }
+            Mode::Graph => return None,
+        };
+        Some(HoverCard::new(target, anchor, self.canvas, snap, text))
+    }
+
     fn button_at(&self, p: PointF) -> Option<Button> {
         self.buttons
             .iter()
@@ -1286,6 +1321,9 @@ impl Panel for Visualizer {
                 self.bar.paint(d, theme, state);
             }
             self.paint_toolbar(d, theme);
+            if let Some(card) = &self.card {
+                card.paint(d, theme);
+            }
             return;
         }
         self.paint_toolbar(d, theme);
@@ -1306,6 +1344,9 @@ impl Panel for Visualizer {
         if let Some(modal) = self.modal.as_mut() {
             modal.layout(self.canvas, d.text_system());
             modal.paint(d, theme);
+        }
+        if let Some(card) = &self.card {
+            card.paint(d, theme);
         }
     }
 
@@ -1360,6 +1401,16 @@ impl Panel for Visualizer {
                     return true;
                 }
                 self.swallow_double = false;
+            }
+        }
+        if !self.canvas_capture {
+            let text = cx.text;
+            let mut card = self.card.take();
+            let taken = hovercard::track(&mut card, e, cx, |p| self.card_at(p, text));
+            self.card = card;
+            if taken {
+                self.leave_canvas(cx);
+                return true;
             }
         }
         match *e {
@@ -1455,6 +1506,31 @@ impl Panel for Visualizer {
         }
         true
     }
+}
+
+/// What "View in memory" shows for a call graph node: data members,
+/// globals and locals have memory; functions, files and classes do not.
+fn graph_target(p: &Program, e: Entity) -> Option<MemTarget> {
+    Some(match e {
+        Entity::Field(i) => {
+            let f = p.fields.get(i as usize)?;
+            MemTarget::Field {
+                class: p.classes.get(f.owner as usize)?.name.to_string(),
+                name: f.name.to_string(),
+            }
+        }
+        Entity::Local(i) => {
+            let l = p.locals.get(i as usize)?;
+            MemTarget::Local {
+                func: p.functions.get(l.owner as usize)?.name.to_string(),
+                name: l.name.to_string(),
+            }
+        }
+        Entity::Global(i) => MemTarget::Global {
+            name: p.globals.get(i as usize)?.name.to_string(),
+        },
+        _ => return None,
+    })
 }
 
 /// Opens a GDB frame's source (absolute paths from DWARF).

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::event::{CursorShape, Event};
 use crate::geom::RectF;
+use crate::memory::MemTarget;
 use crate::replay::ReplayAction;
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::TextSystem;
@@ -40,6 +41,8 @@ pub enum Action {
     RevealFrame(usize),
     /// A play bar command.
     Replay(ReplayAction),
+    /// Open the Memory panel on a variable (hover card click).
+    ShowMemory(MemTarget),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

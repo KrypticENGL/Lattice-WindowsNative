@@ -7,6 +7,11 @@
 #
 #   ^done,json="{...}"
 #
+# For the Memory panel, objects and variables with an address also carry
+# their first MAX_BYTES bytes (hex), and struct fields and array elements
+# their byte offset and size. `globals` lists the file-level variables of
+# the source files on the stack.
+#
 # The schema is mirrored by crates/debugger/src/snapshot.rs. Objects are
 # keyed by "address:type", so the same heap block keeps its id across stops.
 
@@ -18,6 +23,7 @@ import gdb
 MAX_FRAMES = 12
 MAX_ELEMENTS = 100
 MAX_TEXT = 120
+MAX_BYTES = 256
 
 _POINTERS = (gdb.TYPE_CODE_PTR,)
 _REFERENCES = (gdb.TYPE_CODE_REF, gdb.TYPE_CODE_RVALUE_REF)
@@ -43,6 +49,30 @@ def _type_name(t):
         return str(t)
     except Exception:
         return "?"
+
+
+def _address(v):
+    try:
+        return int(v.address.cast(gdb.lookup_type("unsigned long long"))) if v.address is not None else None
+    except gdb.error:
+        return None
+
+
+def _bytes(addr, size):
+    """Up to MAX_BYTES of memory at `addr` as hex, or None if unreadable."""
+    if addr is None or size <= 0:
+        return None
+    try:
+        return gdb.selected_inferior().read_memory(addr, min(size, MAX_BYTES)).tobytes().hex()
+    except (gdb.MemoryError, gdb.error):
+        return None
+
+
+def _sizeof(t):
+    try:
+        return t.sizeof
+    except gdb.error:
+        return 0
 
 
 def _is_char(t):
@@ -147,10 +177,7 @@ class _Walker:
 
     def intern(self, obj):
         """The id of the object holding `obj`, queueing it the first time."""
-        try:
-            addr = int(obj.address.cast(gdb.lookup_type("unsigned long long"))) if obj.address is not None else None
-        except gdb.error:
-            addr = None
+        addr = _address(obj)
         tname = _type_name(obj.type)
         if addr is None:
             self.anon += 1
@@ -175,10 +202,8 @@ class _Walker:
                 body = {"kind": "cell", "fields": [{"name": "", "type": "", "value": {"k": "s", "v": "<%s>" % e}}]}
             body["addr"] = None if addr is None else "0x%x" % addr
             body["type"] = _type_name(obj.type)
-            try:
-                body["size"] = obj.type.sizeof
-            except gdb.error:
-                body["size"] = 0
+            body["size"] = _sizeof(obj.type)
+            body["bytes"] = _bytes(addr, body["size"])
             self.objects[key] = body
 
     def build(self, obj):
@@ -191,7 +216,11 @@ class _Walker:
             n = hi - lo + 1
             shown = min(n, MAX_ELEMENTS)
             elem = _type_name(t.target())
-            fields = [{"name": str(lo + i), "type": elem, "value": self.value(obj[lo + i])} for i in range(shown)]
+            esize = _sizeof(t.target())
+            fields = [
+                {"name": str(lo + i), "type": elem, "off": i * esize, "size": esize, "value": self.value(obj[lo + i])}
+                for i in range(shown)
+            ]
             return {"kind": "array", "fields": fields, "more": n - shown}
         if t.code in _AGGREGATES:
             fields = []
@@ -201,15 +230,16 @@ class _Walker:
             return {"kind": "cell", "fields": [{"name": "", "type": _type_name(obj.type), "value": {"k": "s", "v": self.pretty_text(pp)}}]}
         return {"kind": "cell", "fields": [{"name": "", "type": _type_name(obj.type), "value": self.value(obj)}]}
 
-    def struct_fields(self, obj, t, out):
+    def struct_fields(self, obj, t, out, base=0):
         for f in t.fields():
             if not hasattr(f, "bitpos"):  # static member
                 continue
+            off = base + f.bitpos // 8
             ft = f.type.strip_typedefs() if f.type is not None else None
             if f.is_base_class or (not f.name and ft is not None and ft.code in _AGGREGATES):
                 try:
                     sub = obj[f]
-                    self.struct_fields(sub, sub.type.strip_typedefs(), out)
+                    self.struct_fields(sub, sub.type.strip_typedefs(), out, off)
                 except gdb.error:
                     pass
                 continue
@@ -219,7 +249,8 @@ class _Walker:
                 cell = self.value(obj[f])
             except gdb.error as e:
                 cell = {"k": "s", "v": "<%s>" % e}
-            out.append({"name": f.name or "", "type": _type_name(f.type), "value": cell})
+            size = (f.bitsize + 7) // 8 if f.bitsize else _sizeof(f.type)
+            out.append({"name": f.name or "", "type": _type_name(f.type), "off": off, "size": size, "value": cell})
 
     def build_pretty(self, obj, pp):
         hint = _hint(pp)
@@ -307,6 +338,69 @@ def _frame_vars(frame, line, innermost):
     return [(s, True) for s in args] + [(s, False) for s in locs]
 
 
+def _var(name, v, cell, arg=False):
+    addr = _address(v)
+    size = _sizeof(v.type)
+    return {
+        "name": name,
+        "arg": arg,
+        "type": _type_name(v.type),
+        "value": cell,
+        "addr": None if addr is None else "0x%x" % addr,
+        "size": size,
+        "bytes": _bytes(addr, size),
+    }
+
+
+def _flat_fields(v):
+    """A by-value struct's own fields as text, without walking pointers
+    (globals: the Data view does not draw them, so nothing is interned)."""
+    out = []
+    t = v.type.strip_typedefs()
+    if t.code not in _AGGREGATES:
+        return out
+    for f in t.fields():
+        if not hasattr(f, "bitpos") or f.is_base_class or not f.name or f.name.startswith("_vptr"):
+            continue
+        try:
+            text = _text(v[f])
+        except gdb.error as e:
+            text = "<%s>" % e
+        size = (f.bitsize + 7) // 8 if f.bitsize else _sizeof(f.type)
+        out.append({"name": f.name, "type": _type_name(f.type), "off": f.bitpos // 8, "size": size, "value": {"k": "s", "v": text}})
+    return out
+
+
+def _globals(frames):
+    """File-level variables defined in the source files of `frames`."""
+    out, seen, files = [], set(), set()
+    for f in frames:
+        sal = f.find_sal()
+        name = sal.symtab.filename
+        if name in files:
+            continue
+        files.add(name)
+        try:
+            block = f.block()
+        except RuntimeError:
+            continue
+        for b in (block.global_block, block.static_block):
+            for sym in b:
+                if not sym.is_variable or sym.name in seen or sym.name.startswith("_"):
+                    continue
+                if getattr(sym, "is_artificial", False) or sym.symtab is None or sym.symtab.filename != name:
+                    continue
+                seen.add(sym.name)
+                try:
+                    v = sym.value()
+                    g = _var(sym.name, v, {"k": "s", "v": _text(v)})
+                    g["fields"] = _flat_fields(v)
+                except (gdb.error, gdb.MemoryError) as e:
+                    g = {"name": sym.name, "type": _type_name(sym.type), "value": {"k": "s", "v": "<%s>" % e}}
+                out.append(g)
+    return out
+
+
 def _has_user_frame(thread):
     thread.switch()
     f = gdb.newest_frame()
@@ -347,10 +441,11 @@ def snapshot(max_objects):
         vars_ = []
         for sym, is_arg in _frame_vars(f, sal.line, f == frames[0]):
             try:
-                cell = w.value(sym.value(f))
+                v = sym.value(f)
+                vars_.append(_var(sym.name, v, w.value(v), is_arg))
             except (gdb.error, gdb.MemoryError) as e:
                 cell = {"k": "s", "v": "<%s>" % e}
-            vars_.append({"name": sym.name, "arg": is_arg, "type": _type_name(sym.type), "value": cell})
+                vars_.append({"name": sym.name, "arg": is_arg, "type": _type_name(sym.type), "value": cell})
         out.append(
             {
                 "level": f.level(),
@@ -361,7 +456,7 @@ def snapshot(max_objects):
             }
         )
     w.drain()
-    return {"frames": out, "objects": w.objects, "truncated": w.truncated}
+    return {"frames": out, "objects": w.objects, "truncated": w.truncated, "globals": _globals(frames)}
 
 
 class _LatticeSnapshot(gdb.MICommand):

@@ -16,6 +16,10 @@ pub struct Snapshot {
     /// The object cap was hit; some pointers were not followed.
     #[serde(default)]
     pub truncated: bool,
+    /// File-level variables of the source files on the stack. Their
+    /// targets are not walked; struct globals list their fields as text.
+    #[serde(default)]
+    pub globals: Vec<Var>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -35,6 +39,17 @@ pub struct Var {
     #[serde(rename = "type", default)]
     pub ty: String,
     pub value: Cell,
+    /// Where the variable itself lives (for a pointer, the pointer).
+    #[serde(default)]
+    pub addr: Option<String>,
+    #[serde(default)]
+    pub size: u64,
+    /// Its first bytes (see [`Object::bytes`]).
+    #[serde(default, deserialize_with = "hex")]
+    pub bytes: Vec<u8>,
+    /// Globals only: a by-value struct's fields.
+    #[serde(default)]
+    pub fields: Vec<Field>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -67,6 +82,10 @@ pub struct Object {
     /// `std::vector of length 4, capacity 4`.
     #[serde(default)]
     pub summary: Option<String>,
+    /// The first `min(size, 256)` bytes; empty when unreadable or without
+    /// an address.
+    #[serde(default, deserialize_with = "hex")]
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -76,6 +95,12 @@ pub struct Field {
     #[serde(rename = "type", default)]
     pub ty: String,
     pub value: Cell,
+    /// Byte offset in the object: struct fields and C array elements
+    /// (not pretty-printed container entries, which live elsewhere).
+    #[serde(default)]
+    pub off: Option<u64>,
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 /// One value slot.
@@ -122,6 +147,27 @@ where
     Ok(raw.into_iter().filter_map(|(k, v)| Some((k, v?))).collect())
 }
 
+/// Hex text (or `null`) as bytes; malformed text gives no bytes.
+fn hex<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = Option::<String>::deserialize(d)?.unwrap_or_default();
+    let digits = s.as_bytes();
+    if digits.len() % 2 != 0 {
+        return Ok(Vec::new());
+    }
+    Ok(digits
+        .chunks(2)
+        .map(|p| {
+            std::str::from_utf8(p)
+                .ok()
+                .and_then(|p| u8::from_str_radix(p, 16).ok())
+        })
+        .collect::<Option<Vec<u8>>>()
+        .unwrap_or_default())
+}
+
 impl Snapshot {
     pub fn parse(json: &str) -> Result<Self, String> {
         serde_json::from_str(json).map_err(|e| format!("bad snapshot: {e}"))
@@ -137,14 +183,16 @@ mod tests {
                 {"name":"v","type":"std::vector<int>","value":{"k":"o","to":"5f:std::vector<int>"}},
                 {"name":"n","value":{"k":"s","v":"3"}}]}],
         "objects":{"a0:Node":{"addr":"0xa0","type":"Node","size":24,"kind":"struct",
-                     "fields":[{"name":"key","type":"int","value":{"k":"s","v":"50"}},
+                     "bytes":"32000000ff",
+                     "fields":[{"name":"key","type":"int","off":0,"size":4,"value":{"k":"s","v":"50"}},
                                {"name":"left","type":"Node *","value":{"k":"p","to":null,"v":"nullptr"}},
                                {"name":"right","type":"Node *","value":{"k":"p","to":null,"v":"0x1","bad":true}}]},
                    "5f:std::vector<int>":{"addr":"0x5f","type":"std::vector<int>","kind":"array",
                      "fields":[{"name":"0","type":"","value":{"k":"s","v":"4"}}],"more":-1,
                      "summary":"std::vector of length 9"},
                    "dead:X":null},
-        "truncated":false}"#;
+        "truncated":false,
+        "globals":[{"name":"g","type":"int","value":{"k":"s","v":"7"},"addr":"0x40","size":4,"bytes":"07000000"}]}"#;
 
     #[test]
     fn parses_the_script_output() {
@@ -168,11 +216,25 @@ mod tests {
         ));
         let v = &s.objects["5f:std::vector<int>"];
         assert_eq!((v.kind, v.more), (ObjectKind::Array, -1));
+        // Memory: bytes, offsets, globals.
+        assert_eq!(node.bytes, [0x32, 0, 0, 0, 0xff]);
+        assert_eq!(
+            (node.fields[0].off, node.fields[0].size),
+            (Some(0), Some(4))
+        );
+        assert_eq!(node.fields[1].off, None);
+        assert!(v.bytes.is_empty());
+        assert_eq!(s.globals[0].bytes, [7, 0, 0, 0]);
+        assert_eq!(s.globals[0].addr.as_deref(), Some("0x40"));
     }
 
     #[test]
     fn rejects_garbage() {
         assert!(Snapshot::parse("{").is_err());
         assert!(Snapshot::parse(r#"{"frames":[{"level":0}],"objects":{}}"#).is_err());
+        let odd = r#"{"frames":[],"objects":{"1:T":{"addr":"0x1","type":"T","kind":"cell","fields":[],"bytes":"abc"}}}"#;
+        assert!(Snapshot::parse(odd).unwrap().objects["1:T"]
+            .bytes
+            .is_empty());
     }
 }

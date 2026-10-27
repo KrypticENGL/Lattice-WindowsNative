@@ -128,6 +128,29 @@ fn stops_and_reads_shapes() {
     let back = target(&snap, &c1.fields[1].value);
     assert_eq!(back.fields[1].value.target(), Some(c0.as_str()));
 
+    // Memory: a Node's bytes start with its key, fields have offsets, and
+    // the file's globals come along.
+    assert_eq!(root.bytes.len() as u64, root.size);
+    assert_eq!(root.bytes[..4], 50i32.to_le_bytes());
+    let offsets: Vec<Option<u64>> = root.fields.iter().map(|f| f.off).collect();
+    assert_eq!(offsets, [Some(0), Some(8), Some(16)]);
+    let pts = target(&snap, var("pts"));
+    assert_eq!((pts.fields[1].off, pts.fields[1].size), (Some(8), Some(8)));
+    let root_var = main.vars.iter().find(|v| v.name == "root").unwrap();
+    assert_eq!(
+        (root_var.size, root_var.bytes.len()),
+        (8, 8),
+        "a pointer's own bytes"
+    );
+    let global = |name: &str| snap.globals.iter().find(|g| g.name == name).unwrap();
+    assert_eq!(global("calls").bytes, 7i32.to_le_bytes());
+    let origin = global("origin");
+    assert_eq!(origin.fields.len(), 2);
+    assert_eq!(
+        (origin.fields[1].off, &origin.fields[1].value),
+        (Some(4), &Cell::Scalar { v: "4".into() })
+    );
+
     // Stepping produces another stop and snapshot.
     s.send(Command::Next).unwrap();
     events.wait_for(|e| match e {
