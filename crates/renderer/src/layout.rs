@@ -3,7 +3,9 @@
 //! The simulation follows d3-force: velocity Verlet with an `alpha`
 //! "temperature" that decays to zero, springs on edges, Barnes–Hut many-body
 //! repulsion (θ = 0.9) and a weak pull toward the origin that keeps
-//! disconnected components together. It stops once alpha falls below
+//! disconnected components together. Each node is also pulled toward the
+//! column of its rank along the edges' direction, so callers sit left of
+//! the functions they call. It stops once alpha falls below
 //! [`ALPHA_MIN`] (about 300 ticks from a cold start).
 //!
 //! The UI thread talks to it through [`LayoutWorker`]: commands go over a
@@ -29,6 +31,10 @@ pub const ALPHA_MIN: f32 = 0.001;
 const ALPHA_DECAY: f32 = 0.0228;
 /// Alpha while a node is being dragged.
 const DRAG_ALPHA: f32 = 0.3;
+/// Horizontal distance between rank columns.
+const RANK_GAP: f32 = 90.0;
+/// Pull toward the rank column (d3's forceX strength).
+const RANK_STRENGTH: f32 = 0.15;
 /// Spacing of the initial phyllotaxis spiral.
 const INITIAL_RADIUS: f32 = 12.0;
 const LEAF_CAPACITY: usize = 4;
@@ -42,6 +48,8 @@ pub struct Simulation {
     vel: Vec<Vec2>,
     fixed: Vec<Option<Vec2>>,
     links: Vec<Link>,
+    /// Target x of each node's rank column.
+    column: Vec<f32>,
     alpha: f32,
     alpha_target: f32,
     tree: QuadTree,
@@ -94,6 +102,7 @@ impl Simulation {
             vel: vec![Vec2::ZERO; n],
             fixed: vec![None; n],
             links,
+            column: columns(n, edges),
             alpha: alpha.clamp(0.0, 1.0),
             alpha_target: 0.0,
             tree: QuadTree::default(),
@@ -147,6 +156,7 @@ impl Simulation {
         for i in 0..self.pos.len() {
             let v = &mut self.vel[i];
             *v = *v + self.forces[i] - self.pos[i] * (GRAVITY * alpha);
+            v.x += (self.column[i] - self.pos[i].x) * (RANK_STRENGTH * alpha);
             if let Some(f) = self.fixed[i] {
                 self.pos[i] = f;
                 *v = Vec2::ZERO;
@@ -198,6 +208,54 @@ impl Simulation {
             }
         }
     }
+}
+
+/// The x of each node's column: its rank is the longest path to it from a
+/// node nothing points at, ignoring the edges that close a cycle. Columns
+/// are centred on the origin.
+fn columns(n: usize, edges: &[(u32, u32)]) -> Vec<f32> {
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for &(a, b) in edges {
+        if a != b && (a as usize) < n && (b as usize) < n {
+            out[a as usize].push(b);
+        }
+    }
+    // Reverse DFS post-order is a topological order once back edges go.
+    let mut seen = vec![false; n];
+    let mut post = Vec::with_capacity(n);
+    for root in 0..n {
+        if seen[root] {
+            continue;
+        }
+        seen[root] = true;
+        let mut stack = vec![(root, 0usize)];
+        while let Some((u, k)) = stack.last_mut() {
+            if let Some(&v) = out[*u].get(*k) {
+                *k += 1;
+                if !seen[v as usize] {
+                    seen[v as usize] = true;
+                    stack.push((v as usize, 0));
+                }
+            } else {
+                post.push(*u);
+                stack.pop();
+            }
+        }
+    }
+    let mut order = vec![0usize; n];
+    for (i, &u) in post.iter().rev().enumerate() {
+        order[u] = i;
+    }
+    let mut rank = vec![0u32; n];
+    for &u in post.iter().rev() {
+        for &v in &out[u] {
+            if order[v as usize] > order[u] {
+                rank[v as usize] = rank[v as usize].max(rank[u] + 1);
+            }
+        }
+    }
+    let mid = rank.iter().max().map_or(0.0, |&m| m as f32 / 2.0);
+    rank.iter().map(|&r| (r as f32 - mid) * RANK_GAP).collect()
 }
 
 /// Seeds positions: known ones are kept, a new node starts beside a placed
@@ -615,6 +673,17 @@ mod tests {
         let d = |a: usize, b: usize| (p[a] - p[b]).length();
         assert!(d(0, 1) < d(0, 4));
         assert!((d(0, 1) - LINK_DISTANCE).abs() < LINK_DISTANCE);
+    }
+
+    #[test]
+    fn callers_end_left_of_callees_even_with_a_cycle() {
+        // 0 calls 1 and 2, 1 calls 2, 2 calls back into 1.
+        let edges = [(0, 1), (0, 2), (1, 2), (2, 1)];
+        assert_eq!(columns(3, &edges), vec![-RANK_GAP, 0.0, RANK_GAP]);
+        let mut s = Simulation::new(&[None; 3], &edges, 1.0);
+        settle(&mut s);
+        let p = s.positions();
+        assert!(p[0].x < p[1].x && p[1].x < p[2].x, "{p:?}");
     }
 
     #[test]

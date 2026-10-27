@@ -27,6 +27,18 @@ pub enum NodeClass {
 
 impl NodeClass {
     pub const COUNT: usize = 9;
+    /// In `index` order.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::File,
+        Self::Class,
+        Self::Function,
+        Self::Variable,
+        Self::Field,
+        Self::Local,
+        Self::External,
+        Self::Library,
+        Self::Generated,
+    ];
 
     pub fn index(self) -> usize {
         self as usize
@@ -60,9 +72,25 @@ pub enum EdgeClass {
 
 impl EdgeClass {
     pub const COUNT: usize = 4;
+    /// In `index` order.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Includes,
+        Self::Calls,
+        Self::References,
+        Self::Structure,
+    ];
 
     pub fn index(self) -> usize {
         self as usize
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Includes => "includes",
+            Self::Calls => "calls",
+            Self::References => "references",
+            Self::Structure => "contains",
+        }
     }
 }
 
@@ -266,6 +294,14 @@ mod tests {
             to,
             class: EdgeClass::Calls,
         };
+        assert!(NodeClass::ALL
+            .iter()
+            .enumerate()
+            .all(|(i, c)| c.index() == i));
+        assert!(EdgeClass::ALL
+            .iter()
+            .enumerate()
+            .all(|(i, c)| c.index() == i));
         let m = GraphModel::new(
             vec![node(1), node(2)],
             vec![e(0, 1), e(0, 1), e(1, 1), e(0, 7)],

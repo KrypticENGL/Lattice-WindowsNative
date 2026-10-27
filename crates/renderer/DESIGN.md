@@ -118,7 +118,9 @@ kept as a fallback in case sprite batches are unavailable.
   - springs on edges, with strength 1/min(degree), so hubs do not collapse;
   - Barnes–Hut repulsion over a quadtree (θ = 0.9), computed on up to 8
     threads once there are 2,000 or more nodes;
-  - a weak pull toward the origin, so disconnected parts stay on screen.
+  - a weak pull toward the origin, so disconnected parts stay on screen;
+  - a pull toward each node's rank column (longest path along the edges,
+    cycles broken), so callers sit left of what they call.
 
   Dragging pins the node and keeps alpha at 0.3; releasing lets it cool
   again. Node positions are kept by `NodeId`, so a reload or filter change

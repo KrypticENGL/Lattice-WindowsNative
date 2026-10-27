@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 use engine::{CodeGraph, NodeId};
 use renderer::data::{DataStyle, DataView};
 use renderer::{
-    Cursor, Entity, GraphMode, GraphModel, GraphView, Level, NodeClass, Program, Rgba, Style, Vec2,
+    Cursor, EdgeClass, Entity, GraphMode, GraphModel, GraphView, Level, NodeClass, Program, Rgba,
+    Style, Vec2,
 };
 
 use crate::codepane::Target;
@@ -1089,6 +1090,67 @@ impl Visualizer {
         );
     }
 
+    /// The colour of each node and edge kind on this level, bottom left.
+    fn paint_legend(&self, d: &mut DrawCtx, theme: &Theme) {
+        let m = self.view.model();
+        // Field and Variable share a colour; list each colour once.
+        let nodes = NodeClass::ALL
+            .into_iter()
+            .filter(|&c| {
+                c != NodeClass::Field || !m.nodes().iter().any(|n| n.class == NodeClass::Variable)
+            })
+            .filter(|&c| m.nodes().iter().any(|n| n.class == c));
+        let edges = EdgeClass::ALL
+            .into_iter()
+            .filter(|&c| m.edges().iter().any(|e| e.class == c));
+        let rows: Vec<(&str, Color, bool)> = nodes
+            .map(|c| (c.describe(), node_color(theme, c), false))
+            .chain(edges.map(|c| (c.describe(), edge_color(theme, c), true)))
+            .collect();
+        if self.synthetic || rows.is_empty() {
+            return;
+        }
+        const ROW: f32 = 18.0;
+        const SWATCH: f32 = 18.0;
+        let text = d.text_system();
+        let w = rows
+            .iter()
+            .map(|r| text.measure(TextStyle::UiSmall, r.0))
+            .fold(0.0, f32::max)
+            + SWATCH
+            + 24.0;
+        let h = rows.len() as f32 * ROW + 12.0;
+        let card = RectF::new(self.canvas.x + 8.0, self.canvas.bottom() - h - 8.0, w, h);
+        if card.y < self.canvas.y + CRUMB_H + 16.0 {
+            return;
+        }
+        d.fill_round_rect(card, 7.0, theme.graph_card_bg);
+        for (k, &(name, color, edge)) in rows.iter().enumerate() {
+            let y = card.y + 6.0 + k as f32 * ROW;
+            let mid = y + ROW / 2.0;
+            let x = card.x + 10.0;
+            if edge {
+                d.line(
+                    PointF::new(x, mid),
+                    PointF::new(x + SWATCH, mid),
+                    color,
+                    1.5,
+                );
+            } else {
+                let r = 4.0;
+                let disc = RectF::new(x + SWATCH / 2.0 - r, mid - r, 2.0 * r, 2.0 * r);
+                d.fill_round_rect(disc, r, color);
+            }
+            let tx = x + SWATCH + 6.0;
+            d.text(
+                TextStyle::UiSmall,
+                name,
+                RectF::new(tx, y, card.right() - tx, ROW),
+                theme.text_dim,
+            );
+        }
+    }
+
     fn crumb_at(&self, p: PointF) -> Option<usize> {
         if self.mode != Mode::Graph || self.modal.is_some() {
             return None;
@@ -1240,6 +1302,7 @@ impl Panel for Visualizer {
             bench.records.push(started.elapsed().as_secs_f32() * 1000.0);
         }
         self.paint_crumbs(d, theme);
+        self.paint_legend(d, theme);
         if let Some(modal) = self.modal.as_mut() {
             modal.layout(self.canvas, d.text_system());
             modal.paint(d, theme);
@@ -1412,25 +1475,31 @@ pub(crate) fn to_rect(r: RectF) -> renderer::Rect {
     renderer::Rect::new(r.x, r.y, r.w, r.h)
 }
 
-fn graph_style(t: &Theme) -> Style {
-    let mut node = [rgba(t.graph_function); NodeClass::COUNT];
-    for (class, color) in [
-        (NodeClass::File, t.graph_file),
-        (NodeClass::Class, t.graph_class),
-        (NodeClass::Function, t.graph_function),
-        (NodeClass::Variable, t.graph_variable),
-        (NodeClass::Field, t.graph_variable),
-        (NodeClass::Local, t.graph_local),
-        (NodeClass::External, t.graph_external),
-        (NodeClass::Library, t.graph_library),
-        (NodeClass::Generated, t.graph_generated),
-    ] {
-        node[class.index()] = rgba(color);
+fn node_color(t: &Theme, class: NodeClass) -> Color {
+    match class {
+        NodeClass::File => t.graph_file,
+        NodeClass::Class => t.graph_class,
+        NodeClass::Function => t.graph_function,
+        NodeClass::Variable | NodeClass::Field => t.graph_variable,
+        NodeClass::Local => t.graph_local,
+        NodeClass::External => t.graph_external,
+        NodeClass::Library => t.graph_library,
+        NodeClass::Generated => t.graph_generated,
     }
-    let mut edge = [rgba(t.graph_calls); renderer::EdgeClass::COUNT];
-    edge[renderer::EdgeClass::Includes.index()] = rgba(t.graph_includes);
-    edge[renderer::EdgeClass::References.index()] = rgba(t.graph_refs);
-    edge[renderer::EdgeClass::Structure.index()] = rgba(t.graph_structure);
+}
+
+fn edge_color(t: &Theme, class: EdgeClass) -> Color {
+    match class {
+        EdgeClass::Includes => t.graph_includes,
+        EdgeClass::Calls => t.graph_calls,
+        EdgeClass::References => t.graph_refs,
+        EdgeClass::Structure => t.graph_structure,
+    }
+}
+
+fn graph_style(t: &Theme) -> Style {
+    let node = NodeClass::ALL.map(|c| rgba(node_color(t, c)));
+    let edge = EdgeClass::ALL.map(|c| rgba(edge_color(t, c)));
     Style {
         node,
         edge,
