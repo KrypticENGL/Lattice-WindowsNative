@@ -2,15 +2,18 @@
 //! handling and painting. Line layouts are cached by line id (ids change on
 //! every edit) and evicted when the line scrolls out of view.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use super::buffer::{byte_to_utf16, order, utf16_to_byte, Buffer, Pos};
+use super::complete;
 use super::undo::{Edit, EditKind, UndoStack};
 use crate::event::{CursorShape, Event, Key, Modifiers, MouseButton};
 use crate::geom::{PointF, RectF};
 use crate::memory;
+use crate::menubar::Entry;
 use crate::panel::{Action, Cx};
+use crate::syntax::{self, is_word, Kind};
 use crate::sys::clipboard;
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::{TextLayout, TextStyle, TextSystem};
@@ -22,6 +25,13 @@ const TEXT_PAD: f32 = 6.0;
 const GUTTER_PAD: f32 = 14.0;
 const TAB_WIDTH: usize = 4;
 const WHEEL_LINES: f32 = 3.0;
+
+/// One coloured token of a line.
+struct Run {
+    x: f32,
+    kind: Kind,
+    layout: TextLayout,
+}
 
 pub struct Document {
     path: PathBuf,
@@ -40,6 +50,16 @@ pub struct Document {
     gutter_w: f32,
     line_h: f32,
     layouts: HashMap<u64, TextLayout>,
+    /// C or C++ source: coloured, and completes as you type.
+    code: bool,
+    /// Whether each line starts inside a block comment; a prefix of the
+    /// file, extended as lines are needed and cut back by edits.
+    in_comment: Vec<bool>,
+    /// Token layouts by line id, with the comment state they were made for
+    /// (an edit further up can change it without touching the line).
+    runs: HashMap<u64, (bool, Vec<Run>)>,
+    /// The words of the file, for completion; `None` when out of date.
+    words: Option<BTreeSet<String>>,
     dragging: bool,
     /// Breakpoint lines (1-based), drawn as gutter dots.
     breakpoints: Vec<u32>,
@@ -86,6 +106,10 @@ impl Document {
             gutter_w: 0.0,
             line_h: 18.0,
             layouts: HashMap::new(),
+            code: syntax::is_c_like(path),
+            in_comment: Vec::new(),
+            runs: HashMap::new(),
+            words: None,
             dragging: false,
             breakpoints: Vec::new(),
             exec_line: None,
@@ -150,6 +174,109 @@ impl Document {
     /// Drops cached layouts (DPI change).
     pub fn clear_layouts(&mut self) {
         self.layouts.clear();
+        self.runs.clear();
+    }
+
+    pub fn is_code(&self) -> bool {
+        self.code
+    }
+
+    /// Whether `line` starts inside a block comment.
+    fn comment_state(&mut self, line: usize) -> bool {
+        if self.in_comment.is_empty() {
+            self.in_comment.push(false);
+        }
+        while self.in_comment.len() <= line {
+            let i = self.in_comment.len() - 1;
+            let (_, open) = syntax::scan_line(self.buffer.line(i), self.in_comment[i]);
+            self.in_comment.push(open);
+        }
+        self.in_comment[line]
+    }
+
+    /// Builds (or reuses) the coloured tokens of `line`.
+    fn line_runs(&mut self, text: &TextSystem, line: usize) {
+        let state = self.comment_state(line);
+        let id = self.buffer.line_id(line);
+        if self.runs.get(&id).is_some_and(|(s, _)| *s == state) {
+            return;
+        }
+        let s = self.buffer.line(line).to_owned();
+        let (spans, _) = syntax::scan_line(&s, state);
+        let mut runs = Vec::with_capacity(spans.len());
+        for span in spans {
+            // Split at tabs: a tab stop in a token's own layout would count
+            // from the token, not the line.
+            let mut at = span.start;
+            for piece in s[span.start..span.end].split('\t') {
+                if !piece.trim().is_empty() {
+                    let x = self.x_of(text, Pos::new(line, at));
+                    if let Ok(layout) = text.layout(TextStyle::Mono, piece) {
+                        runs.push(Run {
+                            x,
+                            kind: span.kind,
+                            layout,
+                        });
+                    }
+                }
+                at += piece.len() + 1;
+            }
+        }
+        self.runs.insert(id, (state, runs));
+    }
+
+    // ---- completion -----------------------------------------------------
+
+    /// The word being typed: where it starts on the caret's line and its
+    /// text. `None` where nothing should complete: a selection, a read-only
+    /// file, a number, or inside a comment or string.
+    pub fn completion_prefix(&mut self) -> Option<(usize, String)> {
+        if self.read_only || self.has_selection() {
+            return None;
+        }
+        let Pos { line, col } = self.caret;
+        if self.code && col > 0 {
+            let state = self.comment_state(line);
+            let (spans, _) = syntax::scan_line(self.buffer.line(line), state);
+            let inside = spans.iter().find(|s| s.start < col && col <= s.end);
+            // Just past a closing quote is still "in" the string's span, and
+            // not worth completing either.
+            if inside.is_some_and(|s| matches!(s.kind, Kind::Comment | Kind::Str)) {
+                return None;
+            }
+        }
+        let text = &self.buffer.line(line)[..col];
+        let start = text.bytes().rposition(|b| !is_word(b)).map_or(0, |i| i + 1);
+        let prefix = &text[start..];
+        if prefix.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+        Some((start, prefix.to_owned()))
+    }
+
+    /// The file's words, rescanned after an edit that could change them.
+    pub fn words(&mut self) -> &BTreeSet<String> {
+        let buffer = &self.buffer;
+        self.words.get_or_insert_with(|| {
+            complete::words_in((0..buffer.line_count()).map(|i| buffer.line(i)))
+        })
+    }
+
+    /// The caret's on-screen rect.
+    pub fn caret_rect(&mut self, text: &TextSystem) -> RectF {
+        let x = self.x_of(text, self.caret);
+        RectF::new(
+            self.text_rect.x + TEXT_PAD - self.scroll.x + x,
+            self.text_rect.y + self.caret.line as f32 * self.line_h - self.scroll.y,
+            2.0,
+            self.line_h,
+        )
+    }
+
+    /// Replaces the word being typed, from `start_col` to the caret.
+    pub fn accept_completion(&mut self, start_col: usize, word: &str, cx: &mut Cx) {
+        let start = Pos::new(self.caret.line, start_col);
+        self.replace(start, self.caret, word, EditKind::Other, cx);
     }
 
     pub fn layout(&mut self, rect: RectF, text: &TextSystem) {
@@ -274,6 +401,11 @@ impl Document {
         self.caret = new_end;
         self.anchor = new_end;
         self.preferred_x = None;
+        self.in_comment.truncate(start.line + 1);
+        // While a word is being typed its letters add nothing worth offering.
+        if kind != EditKind::Typing || !insert.bytes().all(is_word) {
+            self.words = None;
+        }
         self.undo.record(
             Edit {
                 start,
@@ -328,6 +460,8 @@ impl Document {
             self.undo.undo(&mut self.buffer)
         };
         if let Some((caret, anchor)) = sel {
+            self.in_comment.clear();
+            self.words = None;
             self.caret = self.buffer.clamp(caret);
             self.anchor = self.buffer.clamp(anchor);
             self.preferred_x = None;
@@ -469,9 +603,66 @@ impl Document {
         true
     }
 
+    /// The right-click menu for `line` (1-based); its rows press the
+    /// editor's own shortcuts.
+    fn context_menu(&self, line: u32) -> Vec<Entry<Action>> {
+        let key = |c, mods| Action::Key(Key::Letter(c), mods);
+        let ctrl = Modifiers::CTRL;
+        let write = !self.read_only;
+        let sel = self.has_selection();
+        vec![
+            Entry::item(key('Z', ctrl), "Undo", "Ctrl+Z", write),
+            Entry::item(key('Y', ctrl), "Redo", "Ctrl+Y", write),
+            Entry::Separator,
+            Entry::item(key('X', ctrl), "Cut", "Ctrl+X", write && sel),
+            Entry::item(key('C', ctrl), "Copy", "Ctrl+C", sel),
+            Entry::item(key('V', ctrl), "Paste", "Ctrl+V", write),
+            Entry::item(key('A', ctrl), "Select all", "Ctrl+A", true),
+            Entry::Separator,
+            Entry::item(key('S', ctrl), "Save", "Ctrl+S", write),
+            Entry::item(
+                Action::ToggleBreakpoint {
+                    path: self.path.clone(),
+                    line,
+                },
+                "Toggle breakpoint",
+                "",
+                true,
+            ),
+        ]
+    }
+
     pub fn on_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
         match *e {
             Event::KeyDown { key, mods } => self.on_key(key, mods, cx),
+            Event::MouseDown {
+                pos,
+                button: MouseButton::Right,
+                ..
+            } if self.rect.contains(pos) => {
+                // Inside the selection it stays, for Cut and Copy.
+                let p = self.pos_at_point(cx.text, pos);
+                let (start, end) = self.selection();
+                if !(start <= p && p < end) {
+                    self.anchor = p;
+                    self.caret = p;
+                    self.preferred_x = None;
+                    cx.repaint();
+                }
+                true
+            }
+            Event::MouseUp {
+                pos,
+                button: MouseButton::Right,
+                ..
+            } if self.rect.contains(pos) => {
+                let line = self.pos_at_point(cx.text, pos).line as u32 + 1;
+                cx.act(Action::ContextMenu {
+                    pos,
+                    items: self.context_menu(line),
+                });
+                true
+            }
             Event::Char(c) if !c.is_control() => {
                 let mut buf = [0u8; 4];
                 self.replace_selection(c.encode_utf8(&mut buf), EditKind::Typing, cx);
@@ -573,6 +764,9 @@ impl Document {
         for line in first..last {
             // Builds (or reuses) the layout drawn below.
             self.line_layout(text, line);
+            if self.code {
+                self.line_runs(text, line);
+            }
             let y = self.text_rect.y + line as f32 * self.line_h - self.scroll.y;
             let sel = if self.has_selection() && line >= sel_start.line && line <= sel_end.line {
                 let x0 = if line == sel_start.line {
@@ -658,7 +852,12 @@ impl Document {
                         d.fill_rect(RectF::new(origin_x + x0, y, x1 - x0, self.line_h), color);
                     }
                     let id = self.buffer.line_id(line);
-                    if let Some(layout) = self.layouts.get(&id) {
+                    if let Some((_, runs)) = self.runs.get(&id) {
+                        for run in runs {
+                            let at = PointF::new(origin_x + run.x, y + text_dy);
+                            d.draw_layout(&run.layout, at, syntax::color(theme, run.kind));
+                        }
+                    } else if let Some(layout) = self.layouts.get(&id) {
                         d.draw_layout(layout, PointF::new(origin_x, y + text_dy), theme.text);
                     }
                 }
@@ -676,6 +875,7 @@ impl Document {
         // Evict layouts for lines no longer visible.
         let visible: Vec<u64> = (first..last).map(|l| self.buffer.line_id(l)).collect();
         self.layouts.retain(|id, _| visible.contains(id));
+        self.runs.retain(|id, _| visible.contains(id));
     }
 
     fn paint_scrollbar(&self, d: &mut DrawCtx, theme: &Theme) {
@@ -695,6 +895,39 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A document holding `text`, as if typed into a C file.
+    fn code_doc(text: &str) -> Document {
+        Document::from_text(Path::new("a.cpp"), text, false)
+    }
+
+    #[test]
+    fn comment_state_follows_edits_to_earlier_lines() {
+        let mut doc = code_doc("int a;\nint b;\n");
+        assert!(!doc.comment_state(1));
+        doc.buffer.insert(Pos::new(0, 0), "/* ");
+        // What `replace` does after an edit on line 0.
+        doc.in_comment.truncate(1);
+        assert!(doc.comment_state(1));
+        assert!(doc.comment_state(2));
+    }
+
+    #[test]
+    fn completion_prefix_is_the_word_before_the_caret() {
+        let mut doc = code_doc("int count = cou; // cou\ns = \"cou\"; 12");
+        let at = |doc: &mut Document, line, col| {
+            doc.caret = Pos::new(line, col);
+            doc.anchor = doc.caret;
+            doc.completion_prefix()
+        };
+        assert_eq!(at(&mut doc, 0, 15), Some((12, "cou".to_string())));
+        assert_eq!(at(&mut doc, 0, 0), Some((0, String::new())));
+        assert_eq!(at(&mut doc, 0, 23), None, "comment");
+        assert_eq!(at(&mut doc, 1, 8), None, "string");
+        assert_eq!(at(&mut doc, 1, 13), None, "number");
+        doc.anchor = Pos::new(0, 0);
+        assert_eq!(doc.completion_prefix(), None, "selection");
+    }
 
     #[test]
     fn non_utf8_opens_read_only() {

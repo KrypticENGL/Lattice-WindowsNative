@@ -17,6 +17,7 @@ use crate::geom::{PointF, RectF};
 use crate::hovercard::{self, HoverCard};
 use crate::memory::{self, MemTarget};
 use crate::panel::{Action, Cx, Panel};
+use crate::syntax::{self, Span};
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::{TextStyle, TextSystem};
 use crate::theme::Theme;
@@ -60,6 +61,8 @@ pub struct CodePane {
     text_dy: f32,
     target: Option<Target>,
     lines: Vec<String>,
+    /// Each line's colours; empty when the file is not C or C++.
+    spans: Vec<Vec<Span>>,
     /// Why the file could not be shown.
     error: Option<String>,
     /// The file read into `lines` and its modification time then.
@@ -166,6 +169,7 @@ impl CodePane {
 
     fn load(&mut self) {
         self.lines.clear();
+        self.spans.clear();
         self.error = None;
         self.loaded = None;
         let Some(t) = &self.target else {
@@ -177,6 +181,14 @@ impl CodePane {
         }
         match read_lines(&t.file) {
             Ok(lines) => {
+                if syntax::is_c_like(&t.file) {
+                    let mut in_comment = false;
+                    for line in &lines {
+                        let (spans, open) = syntax::scan_line(line, in_comment);
+                        self.spans.push(spans);
+                        in_comment = open;
+                    }
+                }
                 self.lines = lines;
                 self.loaded = Some((t.file.clone(), modified(&t.file)));
             }
@@ -367,12 +379,20 @@ impl CodePane {
                 for i in first..(first + count).min(self.lines.len()) {
                     let y = body.y + i as f32 * lh - self.scroll;
                     let x = text_rect.x + 4.0 - self.hscroll;
-                    d.text_at(
-                        TextStyle::Mono,
-                        &self.lines[i],
-                        PointF::new(x, y + self.text_dy),
-                        theme.text.with_alpha(a),
-                    );
+                    let line = &self.lines[i];
+                    let Some(spans) = self.spans.get(i) else {
+                        let at = PointF::new(x, y + self.text_dy);
+                        d.text_at(TextStyle::Mono, line, at, theme.text.with_alpha(a));
+                        continue;
+                    };
+                    for s in spans {
+                        // The font is monospaced: columns give the position.
+                        let col = line[..s.start].chars().count();
+                        let at = PointF::new(x + col as f32 * self.char_w, y + self.text_dy);
+                        let ink = syntax::color(theme, s.kind);
+                        let token = &line[s.start..s.end];
+                        d.text_at(TextStyle::Mono, token, at, ink.with_alpha(ink.a * a));
+                    }
                 }
             });
         });

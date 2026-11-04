@@ -52,6 +52,17 @@ pub enum Entry<C> {
 }
 
 impl<C> Entry<C> {
+    /// A plain row, for right-click menus.
+    pub fn item(cmd: C, label: &str, hint: &str, enabled: bool) -> Self {
+        Self::Item {
+            cmd,
+            label: label.into(),
+            mark: Mark::Radio(false),
+            hint: (!hint.is_empty()).then(|| hint.into()),
+            enabled,
+        }
+    }
+
     fn height(&self) -> f32 {
         match self {
             Self::Header(_) => HEADER_H,
@@ -159,6 +170,18 @@ impl<C: Clone> MenuBar<C> {
 
     pub fn close(&mut self) {
         self.open = None;
+    }
+
+    /// Opens `entries` at `pos`, kept inside `bounds`. Used on a bar with no
+    /// titles, as a right-click menu.
+    pub fn popup(&mut self, entries: Vec<Entry<C>>, pos: PointF, bounds: RectF, text: &TextSystem) {
+        let size = Level::new(entries.clone(), 0.0, 0.0, text).rect;
+        let x = pos.x.min(bounds.right() - size.w).max(bounds.x);
+        let y = pos.y.min(bounds.bottom() - size.h).max(bounds.y);
+        self.open = Some(Open {
+            title: 0,
+            levels: vec![Level::new(entries, x, y, text)],
+        });
     }
 
     pub fn is_open(&self) -> bool {
@@ -581,6 +604,27 @@ mod tests {
             Outcome::Picked(11)
         );
         assert!(!bar.is_open());
+    }
+
+    #[test]
+    fn popup_stays_on_screen_and_skips_disabled_rows() {
+        let text = TextSystem::new().expect("DirectWrite");
+        let mut menu = MenuBar::new(&[]);
+        let items = vec![
+            Entry::item(1, "Off", "", false),
+            Entry::item(2, "On", "", true),
+        ];
+        let bounds = RectF::new(0.0, 0.0, 400.0, 300.0);
+        menu.popup(items, PointF::new(395.0, 295.0), bounds, &text);
+        let level = &menu.open.as_ref().unwrap().levels[0];
+        assert!(level.rect.right() <= 400.0 && level.rect.bottom() <= 300.0);
+        let rows = level.rows.clone();
+        let none = |_| Vec::new();
+        let (x, y) = centre(rows[0]);
+        assert_eq!(menu.on_event(&down(x, y), &text, none), Outcome::Consumed);
+        let (x, y) = centre(rows[1]);
+        assert_eq!(menu.on_event(&down(x, y), &text, none), Outcome::Picked(2));
+        assert!(!menu.is_open());
     }
 
     #[test]

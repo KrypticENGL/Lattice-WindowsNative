@@ -89,6 +89,14 @@ pub struct Theme {
     pub exec_line_bg: Color,
     /// Where a dragged panel would dock.
     pub dock_drop: Color,
+    /// Source code colours.
+    pub syntax_keyword: Color,
+    pub syntax_type: Color,
+    pub syntax_function: Color,
+    pub syntax_string: Color,
+    pub syntax_number: Color,
+    pub syntax_comment: Color,
+    pub syntax_preproc: Color,
     pub term_fg: Color,
     pub term_bg: Color,
     /// ANSI colours 0–15 (normal then bright).
@@ -154,6 +162,14 @@ impl Theme {
             breakpoint: Color::hex(0xE5484D),
             exec_line_bg: Color::hex(0xA3E635).with_alpha(0.13),
             dock_drop: Color::hex(0xA3E635).with_alpha(0.18),
+            // The accent for keywords; other hues as in the graph.
+            syntax_keyword: Color::hex(0xA3E635),
+            syntax_type: Color::hex(0x2DD4BF),
+            syntax_function: Color::hex(0xD9F99D),
+            syntax_string: Color::hex(0xE2C08D),
+            syntax_number: Color::hex(0xE58FB8),
+            syntax_comment: Color::hex(0x7C8471),
+            syntax_preproc: Color::hex(0x7DB4F0),
             term_fg: Color::hex(0xCCCCCC),
             term_bg: Color::hex(0x181818),
             term_palette: [

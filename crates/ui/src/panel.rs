@@ -2,9 +2,10 @@
 
 use std::path::PathBuf;
 
-use crate::event::{CursorShape, Event};
-use crate::geom::RectF;
+use crate::event::{CursorShape, Event, Key, Modifiers};
+use crate::geom::{PointF, RectF};
 use crate::memory::MemTarget;
+use crate::menubar::Entry;
 use crate::replay::ReplayAction;
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::TextSystem;
@@ -43,6 +44,20 @@ pub enum Action {
     Replay(ReplayAction),
     /// Open the Memory panel on a variable (hover card click).
     ShowMemory(MemTarget),
+    /// Open a right-click menu; a picked row queues its action.
+    ContextMenu {
+        pos: PointF,
+        items: Vec<Entry<Action>>,
+    },
+    /// Press a key in the focused panel (menu rows reuse its shortcuts).
+    Key(Key, Modifiers),
+    CopyText(String),
+    /// Show a file or folder in Windows File Explorer.
+    Reveal(PathBuf),
+    CloseTab(usize),
+    /// Close every editor tab but this one, or all of them.
+    CloseTabsExcept(Option<usize>),
+    ClearOutput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +71,8 @@ pub enum DebugAction {
     Step(debugger::Command),
     Stop,
     PickProgram,
+    /// Compile the open folder into `debug\` and link `target\<name>.exe`.
+    Build,
 }
 
 /// Context for one event dispatch.

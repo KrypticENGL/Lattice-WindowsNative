@@ -3,10 +3,12 @@
 //! routing.
 
 use std::collections::HashMap;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::build::{BuildEvent, Builder};
 use crate::callstack::CallStack;
 use crate::codepane::CodePane;
 use crate::debug::{self, Debug, Phase, Update};
@@ -22,6 +24,7 @@ use crate::objects::{LoadResult, ObjectEvent, ObjectService};
 use crate::output::Output;
 use crate::panel::{Action, Cx, DebugAction, Panel};
 use crate::replay::{self, Replay, ReplayAction};
+use crate::sys::clipboard;
 use crate::sys::dialog::{self, ComGuard};
 use crate::sys::gfx::{DrawCtx, Frame, Graphics};
 use crate::sys::text::{TextStyle, TextSystem};
@@ -175,6 +178,10 @@ struct Views {
     tab_hover: Option<usize>,
     title_bar: TitleBar,
     menu_bar: MenuBar<MenuCmd>,
+    /// The open right-click menu.
+    popup: MenuBar<Action>,
+    /// The whole client area, which right-click menus stay inside.
+    bounds: RectF,
     /// Where the menu titles end.
     menu_end: f32,
     areas: [DockArea; 2],
@@ -188,6 +195,7 @@ struct Views {
     objects: ObjectService,
     folders: FolderWatcher,
     debug: Debug,
+    build: Builder,
     /// The last recorded run, played back in the Data view.
     replay: Option<Replay>,
     /// Times the replay's steps.
@@ -288,12 +296,14 @@ impl Views {
             stopped: self.debug.stop_description(),
             recording: self.debug.recording(),
             replay: self.replay.as_ref().map(Replay::status),
+            building: self.build.is_building(),
         });
         // The Source panel follows the frame focused in the Data view.
         let target = self.panes.visualizer.code_target();
         self.panes.source.show(target);
 
         let full = RectF::new(0.0, 0.0, size.w, size.h);
+        self.bounds = full;
         let (bar, rest) = full.split_top(TITLE_BAR_H);
         let menus = self.title_bar.layout(bar);
         self.menu_end = self.menu_bar.layout(menus, text);
@@ -421,6 +431,7 @@ impl Views {
         let i = self.tab.index();
         self.areas[i].paint(d, theme, &mut self.panes, self.window_focused);
         self.menu_bar.paint_menus(d, theme);
+        self.popup.paint_menus(d, theme);
     }
 
     /// What the window procedure should treat `p` as: menu titles are
@@ -444,6 +455,44 @@ impl Views {
             self.areas[old].clear_preview();
             self.tab = tab;
             cx.repaint();
+        }
+    }
+
+    /// The open right-click menu: returns whether it took the event.
+    fn popup_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
+        if !self.popup.is_open() {
+            return false;
+        }
+        // Typing closes the menu and reaches the panel.
+        let typed = !matches!(
+            e,
+            Event::KeyDown {
+                key: Key::Escape,
+                ..
+            }
+        ) && matches!(e, Event::KeyDown { .. } | Event::Char(_));
+        if typed {
+            self.popup.close();
+            cx.repaint();
+            return false;
+        }
+        match self.popup.on_event(e, cx.text, |_| Vec::new()) {
+            Outcome::Ignored => {
+                cx.repaint();
+                false
+            }
+            Outcome::Consumed => {
+                if e.pos().is_some() {
+                    self.areas[self.tab.index()].leave(&mut self.panes, cx);
+                }
+                cx.repaint();
+                true
+            }
+            Outcome::Picked(action) => {
+                cx.act(action);
+                cx.repaint();
+                true
+            }
         }
     }
 
@@ -478,6 +527,7 @@ impl Views {
     fn on_event(&mut self, e: &Event, cx: &mut Cx) {
         if let Event::Focus(focused) = *e {
             self.window_focused = focused;
+            self.popup.close();
             cx.repaint();
             return;
         }
@@ -493,7 +543,7 @@ impl Views {
             cx.repaint();
             return;
         }
-        if self.menu_event(e, cx) {
+        if self.popup_event(e, cx) || self.menu_event(e, cx) {
             return;
         }
         if self.global_key(e, cx) {
@@ -626,6 +676,13 @@ impl Views {
             DebugAction::PickProgram => {
                 self.pick_program(cx);
             }
+            DebugAction::Build => match self.panes.explorer.root_path() {
+                Some(_) if self.debug.phase() != Phase::Idle => {
+                    cx.log_error("Stop the program before building it");
+                }
+                Some(root) => self.build.start(root.to_path_buf()),
+                None => cx.log_error("Open a folder first (Ctrl+O), then build it"),
+            },
         }
         cx.repaint();
     }
@@ -741,6 +798,21 @@ impl Views {
             Err(e) => {
                 cx.log_error(format!("File picker failed: {e}"));
                 false
+            }
+        }
+    }
+
+    /// Logs build output; a built program becomes the one to debug.
+    fn drain_build(&mut self, cx: &mut Cx) {
+        while let Some(event) = self.build.try_recv() {
+            match event {
+                BuildEvent::Log { error, text } => cx.act(Action::Log { error, text }),
+                BuildEvent::Done(exe) => {
+                    if let Some(exe) = exe {
+                        self.debug.set_program(exe);
+                    }
+                    cx.repaint();
+                }
             }
         }
     }
@@ -974,6 +1046,41 @@ impl Views {
                         self.panes.visualizer.reveal_frame(i);
                         cx.repaint();
                     }
+                    Action::ContextMenu { pos, items } => {
+                        self.menu_bar.close();
+                        self.popup.popup(items, pos, self.bounds, cx.text);
+                        cx.repaint();
+                    }
+                    Action::Key(key, mods) => {
+                        let e = Event::KeyDown { key, mods };
+                        let i = self.tab.index();
+                        self.areas[i].on_event(&e, &mut self.panes, &mut self.drag, cx);
+                        cx.repaint();
+                    }
+                    Action::CopyText(text) => {
+                        if let Err(e) = clipboard::set_text(cx.window, &text) {
+                            cx.log_error(format!("Copy failed: {e}"));
+                        }
+                    }
+                    Action::Reveal(path) => {
+                        // explorer.exe wants the quotes around the path only,
+                        // so std's argument quoting cannot be used.
+                        let spawned = std::process::Command::new("explorer")
+                            .raw_arg(format!("/select,\"{}\"", path.display()))
+                            .spawn();
+                        if let Err(e) = spawned {
+                            cx.log_error(format!("Could not open File Explorer: {e}"));
+                        }
+                    }
+                    Action::CloseTab(i) => self.panes.editor.close_tab(i, cx),
+                    Action::CloseTabsExcept(keep) => {
+                        self.panes.editor.close_tabs_except(keep, cx);
+                        cx.repaint();
+                    }
+                    Action::ClearOutput => {
+                        self.panes.output.clear();
+                        cx.repaint();
+                    }
                 }
             }
         }
@@ -1013,6 +1120,8 @@ impl Shell {
                 tab_rects: [RectF::default(); 2],
                 tab_hover: None,
                 menu_bar: MenuBar::new(&MENUS),
+                popup: MenuBar::new(&[]),
+                bounds: RectF::default(),
                 title_bar: TitleBar::default(),
                 menu_end: 0.0,
                 areas: TopTab::ALL.map(|t| DockArea::new(default_tree(t))),
@@ -1033,6 +1142,7 @@ impl Shell {
                 objects,
                 folders,
                 debug: Debug::new(waker.clone()),
+                build: Builder::new(waker.clone()),
                 replay: None,
                 waker: waker.clone(),
             },
@@ -1151,6 +1261,7 @@ impl Shell {
         self.views.drain_folders(&mut cx);
         self.views.drain_objects(&mut cx);
         self.views.drain_debug(&mut cx);
+        self.views.drain_build(&mut cx);
         self.views.tick_replay(&mut cx);
         let v = &mut self.views.panes.visualizer;
         let moved = v.update() | v.poll();
@@ -1193,8 +1304,9 @@ impl Shell {
     /// A press on the title bar outside the UI (dragging, caption buttons)
     /// closes any open menu.
     pub fn close_menus(&mut self) -> Response {
-        let open = self.views.menu_bar.is_open();
+        let open = self.views.menu_bar.is_open() || self.views.popup.is_open();
         self.views.menu_bar.close();
+        self.views.popup.close();
         Response { repaint: open }
     }
 

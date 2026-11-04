@@ -588,7 +588,10 @@ fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
         }
         WM_CHAR => {
             if let Some(c) = decode_char(state, loword(wparam.0)) {
-                if !c.is_control() {
+                // Ctrl+Space is a shortcut, not a typed space.
+                let m = modifiers();
+                let shortcut = c == ' ' && m.ctrl && !m.alt;
+                if !c.is_control() && !shortcut {
                     dispatch(hwnd, Event::Char(c));
                 }
             }

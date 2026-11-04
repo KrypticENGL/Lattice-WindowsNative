@@ -1,12 +1,14 @@
 //! Tabbed editor area: a tab strip over the active [`Document`].
 
 mod buffer;
+mod complete;
 mod undo;
 mod view;
 
 use std::path::Path;
 use std::sync::Arc;
 
+use complete::Completion;
 use debugger::Snapshot;
 use view::Document;
 
@@ -14,7 +16,9 @@ use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::geom::{PointF, RectF};
 use crate::hovercard::{self, HoverCard};
 use crate::memory::{self, MemTarget};
-use crate::panel::{Cx, Panel};
+use crate::menubar::Entry;
+use crate::panel::{Action, Cx, Panel};
+use crate::syntax::is_word;
 use crate::sys::dialog::{self, SaveChoice};
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::{TextStyle, TextSystem};
@@ -42,6 +46,8 @@ pub struct EditorArea {
     /// The last stop, for the "View in memory" card on variables.
     snap: Option<Arc<Snapshot>>,
     card: Option<HoverCard>,
+    /// The open completion list.
+    completion: Option<Completion>,
 }
 
 impl EditorArea {
@@ -55,6 +61,7 @@ impl EditorArea {
 
     /// Opens `path`, or activates it if already open.
     pub fn open(&mut self, path: &Path, cx: &mut Cx) {
+        self.completion = None;
         if let Some(i) = self.docs.iter().position(|d| d.path() == path) {
             self.active = i;
             cx.repaint();
@@ -93,6 +100,7 @@ impl EditorArea {
     /// Closes tab `i`, prompting if it has unsaved changes. Returns `false`
     /// if the user cancelled.
     fn close(&mut self, i: usize, cx: &mut Cx) -> bool {
+        self.completion = None;
         let Some(doc) = self.docs.get_mut(i) else {
             return true;
         };
@@ -109,6 +117,120 @@ impl EditorArea {
         self.hover_close = None;
         cx.repaint();
         true
+    }
+
+    pub fn close_tab(&mut self, i: usize, cx: &mut Cx) {
+        self.close(i, cx);
+    }
+
+    /// Closes every tab but `keep`, stopping if an unsaved prompt is
+    /// cancelled.
+    pub fn close_tabs_except(&mut self, keep: Option<usize>, cx: &mut Cx) {
+        for i in (0..self.docs.len()).rev() {
+            if Some(i) != keep && !self.close(i, cx) {
+                return;
+            }
+        }
+        self.active = 0;
+    }
+
+    /// Rebuilds the list for the word at the caret, offering the words of
+    /// every open file. Without `forced`, only C and C++ files offer anything
+    /// and only from the second letter.
+    fn refresh_completion(&mut self, forced: bool, cx: &mut Cx) {
+        self.completion = None;
+        let Some(doc) = self.docs.get_mut(self.active) else {
+            return;
+        };
+        let Some((start, prefix)) = doc.completion_prefix() else {
+            return;
+        };
+        let code = doc.is_code();
+        if !forced && (!code || prefix.len() < 2) {
+            return;
+        }
+        let caret = doc.caret_rect(cx.text);
+        for d in &mut self.docs {
+            d.words();
+        }
+        let sets = self.docs.iter_mut().map(|d| d.words());
+        let items = complete::candidates(&prefix, code, sets);
+        self.completion = Completion::new(items, start, caret, self.body, cx.text);
+    }
+
+    fn accept_completion(&mut self, cx: &mut Cx) {
+        if let (Some(c), Some(doc)) = (self.completion.take(), self.docs.get_mut(self.active)) {
+            doc.accept_completion(c.start_col, c.selected_word(), cx);
+        }
+    }
+
+    /// Input for the open list. Returns `true` if the list used it; anything
+    /// else that isn't editing the word closes it.
+    fn completion_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
+        let Some(c) = &mut self.completion else {
+            return false;
+        };
+        match *e {
+            Event::KeyDown { key: Key::Up, .. } => c.move_by(-1),
+            Event::KeyDown { key: Key::Down, .. } => c.move_by(1),
+            Event::KeyDown {
+                key: Key::Tab | Key::Enter,
+                mods,
+            } if !mods.ctrl && !mods.alt => self.accept_completion(cx),
+            Event::KeyDown {
+                key: Key::Escape, ..
+            } => self.completion = None,
+            Event::MouseDown {
+                pos,
+                button: MouseButton::Left,
+                ..
+            } if c.contains(pos) => {
+                c.select_at(pos);
+                self.accept_completion(cx);
+            }
+            // The press's release, and hovering the list, are the list's.
+            Event::MouseUp { pos, .. } | Event::MouseMove { pos, .. } if c.contains(pos) => {
+                return true;
+            }
+            Event::KeyDown {
+                key: Key::Backspace,
+                ..
+            }
+            | Event::Char(_)
+            | Event::MouseUp { .. }
+            | Event::MouseMove { .. }
+            | Event::MouseLeave
+            | Event::Focus(_) => return false,
+            _ => {
+                self.completion = None;
+                cx.repaint();
+                return false;
+            }
+        }
+        cx.repaint();
+        true
+    }
+
+    fn tab_menu(&self, i: usize) -> Vec<Entry<Action>> {
+        let path = self.docs[i].path().to_path_buf();
+        vec![
+            Entry::item(Action::CloseTab(i), "Close", "Ctrl+W", true),
+            Entry::item(
+                Action::CloseTabsExcept(Some(i)),
+                "Close others",
+                "",
+                self.docs.len() > 1,
+            ),
+            Entry::item(Action::CloseTabsExcept(None), "Close all", "", true),
+            Entry::Separator,
+            Entry::item(
+                Action::CopyText(path.display().to_string()),
+                "Copy path",
+                "",
+                true,
+            ),
+            Entry::item(Action::Reveal(path), "Reveal in File Explorer", "", true),
+        ]
     }
 
     /// Prompts for every dirty document. `false` if the user cancelled.
@@ -203,6 +325,9 @@ impl Panel for EditorArea {
         self.rect = rect;
         let (strip, body) = rect.split_top(STRIP_H);
         self.strip = strip;
+        if self.body != body {
+            self.completion = None;
+        }
         self.body = body;
         self.compute_hits(text);
         if let Some(doc) = self.docs.get_mut(self.active) {
@@ -293,6 +418,9 @@ impl Panel for EditorArea {
                 if let Some(card) = &self.card {
                     card.paint(d, theme);
                 }
+                if let Some(list) = self.completion.as_ref().filter(|_| focused) {
+                    list.paint(d, theme);
+                }
             }
             None => {
                 d.fill_rect(self.body, theme.editor_bg);
@@ -312,7 +440,18 @@ impl Panel for EditorArea {
     }
 
     fn on_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
+        if self.completion_event(e, cx) {
+            return true;
+        }
         match *e {
+            Event::KeyDown {
+                key: Key::Space,
+                mods,
+            } if mods.ctrl => {
+                self.refresh_completion(true, cx);
+                cx.repaint();
+                return true;
+            }
             Event::KeyDown {
                 key: Key::Tab,
                 mods,
@@ -345,6 +484,19 @@ impl Panel for EditorArea {
                         self.active = i;
                         cx.repaint();
                     }
+                }
+                return true;
+            }
+            Event::MouseUp {
+                pos,
+                button: MouseButton::Right,
+                ..
+            } if self.strip.contains(pos) => {
+                if let Some((i, _)) = self.hit(pos) {
+                    cx.act(Action::ContextMenu {
+                        pos,
+                        items: self.tab_menu(i),
+                    });
                 }
                 return true;
             }
@@ -394,12 +546,25 @@ impl Panel for EditorArea {
         if taken {
             return true;
         }
-        match self.docs.get_mut(self.active) {
+        let handled = match self.docs.get_mut(self.active) {
             Some(doc) => {
                 doc.layout(body, text);
                 doc.on_event(e, cx)
             }
             None => false,
+        };
+        // Typing a word opens or narrows the list; anything else typed ends it.
+        match *e {
+            Event::Char(c) if c.is_ascii() && is_word(c as u8) => {
+                self.refresh_completion(false, cx);
+            }
+            Event::Char(_) => self.completion = None,
+            Event::KeyDown {
+                key: Key::Backspace,
+                ..
+            } if self.completion.is_some() => self.refresh_completion(false, cx),
+            _ => {}
         }
+        handled
     }
 }

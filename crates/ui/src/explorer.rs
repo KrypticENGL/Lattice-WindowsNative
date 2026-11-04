@@ -8,8 +8,9 @@ use engine::{CodeGraph, DebugFormat, EdgeKind, Node, NodeId, NodeKind};
 
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::geom::{PointF, RectF};
+use crate::menubar::Entry as Row;
 use crate::objects::is_object_file;
-use crate::panel::{Action, Cx, Panel};
+use crate::panel::{Action, Cx, DebugAction, Panel};
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::{TextStyle, TextSystem};
 use crate::theme::Theme;
@@ -527,6 +528,63 @@ impl Explorer {
         self.hover_row = None;
     }
 
+    /// The right-click menu for an entry, or for the empty space below the
+    /// tree.
+    fn context_menu(&self, idx: Option<usize>) -> Vec<Row<Action>> {
+        let has_root = self.root.is_some();
+        let Some(entry) = idx.map(|i| &self.entries[i]) else {
+            return vec![
+                Row::item(Action::PickFolder, "Open folder\u{2026}", "Ctrl+O", true),
+                Row::item(
+                    Action::LoadFolderObjects,
+                    "Add folder objects",
+                    "",
+                    has_root,
+                ),
+                Row::item(Action::Debug(DebugAction::Build), "Build", "", has_root),
+            ];
+        };
+        let first = match entry.kind {
+            EntryKind::Group => return Vec::new(),
+            EntryKind::Symbol(_) => {
+                let name = Action::CopyText(entry.name.clone());
+                return vec![Row::item(name, "Copy name", "", true)];
+            }
+            EntryKind::File => Some((Action::OpenFile(entry.path.clone()), "Open")),
+            EntryKind::Object(_) => Some((Action::LoadObject(entry.path.clone()), "Load symbols")),
+            EntryKind::Dir => None,
+        };
+        let mut items: Vec<Row<Action>> = first
+            .into_iter()
+            .flat_map(|(a, label)| [Row::item(a, label, "", true), Row::Separator])
+            .collect();
+        let relative = self
+            .root_path()
+            .and_then(|r| entry.path.strip_prefix(r).ok())
+            .unwrap_or(&entry.path);
+        items.extend([
+            Row::item(
+                Action::CopyText(entry.path.display().to_string()),
+                "Copy path",
+                "",
+                true,
+            ),
+            Row::item(
+                Action::CopyText(relative.display().to_string()),
+                "Copy relative path",
+                "",
+                true,
+            ),
+            Row::item(
+                Action::Reveal(entry.path.clone()),
+                "Reveal in File Explorer",
+                "",
+                true,
+            ),
+        ]);
+        items
+    }
+
     fn row_at(&self, p: PointF) -> Option<usize> {
         if !self.list.contains(p) {
             return None;
@@ -770,6 +828,29 @@ impl Panel for Explorer {
                         self.activate(idx, cx);
                     }
                     cx.repaint();
+                }
+                true
+            }
+            Event::MouseDown {
+                pos,
+                button: MouseButton::Right,
+                ..
+            } => {
+                if let Some(row) = self.row_at(pos) {
+                    self.selected = Some(self.rows[row]);
+                    cx.repaint();
+                }
+                true
+            }
+            Event::MouseUp {
+                pos,
+                button: MouseButton::Right,
+                ..
+            } => {
+                let idx = self.row_at(pos).map(|row| self.rows[row]);
+                let items = self.context_menu(idx);
+                if !items.is_empty() {
+                    cx.act(Action::ContextMenu { pos, items });
                 }
                 true
             }

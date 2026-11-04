@@ -75,6 +75,8 @@ pub struct DebugStatus {
     pub recording: Option<usize>,
     /// The recorded run being replayed.
     pub replay: Option<ReplayStatus>,
+    /// The open folder is being compiled.
+    pub building: bool,
 }
 
 impl DebugStatus {
@@ -95,6 +97,7 @@ enum Button {
     AddFolder,
     Fit,
     Clear,
+    Build,
     Program,
     Run,
     Play,
@@ -106,8 +109,9 @@ enum Button {
 }
 
 impl Button {
-    const GRAPH: [Self; 3] = [Self::AddFolder, Self::Fit, Self::Clear];
-    const DATA: [Self; 9] = [
+    const GRAPH: [Self; 4] = [Self::Build, Self::AddFolder, Self::Fit, Self::Clear];
+    const DATA: [Self; 10] = [
+        Self::Build,
         Self::Program,
         Self::Run,
         Self::Play,
@@ -126,6 +130,8 @@ impl Button {
             Self::AddFolder => "Add folder objects".into(),
             Self::Fit => "Fit".into(),
             Self::Clear => "Clear".into(),
+            Self::Build if debug.building => "Building\u{2026}".into(),
+            Self::Build => "Build".into(),
             Self::Program => match &debug.program {
                 Some(p) => format!("Program: {p}"),
                 None => "Choose program\u{2026}".into(),
@@ -158,6 +164,8 @@ impl Button {
             Self::StepOver | Self::StepInto | Self::StepOut => debug.phase == Phase::Stopped,
             Self::Stop => debug.phase != Phase::Idle,
             Self::Program => debug.phase == Phase::Idle,
+            // The running program's exe cannot be relinked.
+            Self::Build => debug.phase == Phase::Idle && !debug.building,
             _ => true,
         }
     }
@@ -604,6 +612,7 @@ impl Visualizer {
             Button::ModeGraph => self.set_mode(Mode::Graph, cx),
             Button::ModeData => self.set_mode(Mode::Data, cx),
             Button::Program => cx.act(Action::Debug(DebugAction::PickProgram)),
+            Button::Build => cx.act(Action::Debug(DebugAction::Build)),
             Button::Run => cx.act(Action::Debug(DebugAction::Run)),
             Button::Play => cx.act(Action::Debug(DebugAction::Play)),
             Button::Pause => cx.act(Action::Debug(DebugAction::Pause)),
@@ -1295,6 +1304,7 @@ impl Panel for Visualizer {
             let label = match b {
                 Button::Run => "Continue".to_string(),
                 Button::Play => "Recording\u{2026}".to_string(),
+                Button::Build => "Building\u{2026}".to_string(),
                 _ => b.label(&self.debug),
             };
             let w = text.measure(TextStyle::Ui, &label) + 2.0 * BUTTON_PAD;

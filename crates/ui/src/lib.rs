@@ -5,6 +5,7 @@
 //! Public APIs expose only safe project types, never `windows::` types. All
 //! Win32/COM calls live in the private `sys` module.
 
+mod build;
 mod callstack;
 mod codepane;
 mod debug;
@@ -25,6 +26,7 @@ mod panel;
 mod playbar;
 mod replay;
 mod shell;
+mod syntax;
 mod sys;
 mod terminal;
 pub mod theme;

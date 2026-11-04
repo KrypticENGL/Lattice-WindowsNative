@@ -1,4 +1,4 @@
-//! Finding `gdb.exe`.
+//! Finding `gdb.exe` and the compilers beside it.
 
 use std::path::{Path, PathBuf};
 
@@ -9,10 +9,20 @@ pub fn find_gdb() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         return p.is_file().then_some(p);
     }
-    let exe = if cfg!(windows) { "gdb.exe" } else { "gdb" };
+    find_tool("gdb")
+}
+
+/// `name` (e.g. `g++`) on `PATH`, else in the usual MinGW-w64 and MSYS2
+/// install folders.
+pub fn find_tool(name: &str) -> Option<PathBuf> {
+    let exe = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
     if let Some(path) = std::env::var_os("PATH") {
         if let Some(p) = std::env::split_paths(&path)
-            .map(|dir| dir.join(exe))
+            .map(|dir| dir.join(&exe))
             .find(|p| p.is_file())
         {
             return Some(p);
@@ -27,6 +37,6 @@ pub fn find_gdb() -> Option<PathBuf> {
         r"C:\MinGW\bin",
     ]
     .iter()
-    .map(|dir| Path::new(dir).join(exe))
+    .map(|dir| Path::new(dir).join(&exe))
     .find(|p| p.is_file())
 }

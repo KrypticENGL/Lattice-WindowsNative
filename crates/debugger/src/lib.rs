@@ -16,6 +16,6 @@ pub mod mi;
 mod session;
 mod snapshot;
 
-pub use locate::find_gdb;
+pub use locate::{find_gdb, find_tool};
 pub use session::{Command, DebugEvent, Session, StartConfig, StopReason};
 pub use snapshot::{Cell, Field, Frame, Object, ObjectKind, Snapshot, Var};

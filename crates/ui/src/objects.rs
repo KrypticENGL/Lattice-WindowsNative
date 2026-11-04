@@ -157,6 +157,12 @@ impl ObjectService {
 
 /// Object files under `root`, sorted; hidden folders (`.git`, ...) skipped.
 fn find_objects(root: &Path) -> Vec<PathBuf> {
+    find_files(root, is_object_file)
+}
+
+/// Files under `root` whose name passes `keep`, sorted; hidden folders
+/// (`.git`, ...) skipped.
+pub fn find_files(root: &Path, keep: fn(&str) -> bool) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
@@ -173,7 +179,7 @@ fn find_objects(root: &Path) -> Vec<PathBuf> {
                 if !name.starts_with('.') {
                     dirs.push(entry.path());
                 }
-            } else if kind.is_file() && is_object_file(&name) {
+            } else if kind.is_file() && keep(&name) {
                 found.push(entry.path());
             }
         }

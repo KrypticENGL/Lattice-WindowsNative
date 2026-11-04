@@ -1,8 +1,9 @@
 //! Output panel: timestamped log lines from the IDE.
 
-use crate::event::Event;
+use crate::event::{Event, MouseButton};
 use crate::geom::{PointF, RectF};
-use crate::panel::{Cx, Panel};
+use crate::menubar::Entry;
+use crate::panel::{Action, Cx, Panel};
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::{TextStyle, TextSystem};
 use crate::sys::time;
@@ -54,6 +55,12 @@ impl Output {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.lines.clear();
+        self.scroll = 0.0;
+        self.follow = true;
+    }
+
     fn max_scroll(&self) -> f32 {
         (self.lines.len() as f32 * self.line_h + 2.0 * PAD - self.rect.h).max(0.0)
     }
@@ -102,6 +109,21 @@ impl Panel for Output {
             self.scroll = (self.scroll - lines * 3.0 * self.line_h).clamp(0.0, self.max_scroll());
             self.follow = self.scroll >= self.max_scroll() - 1.0;
             cx.repaint();
+            return true;
+        }
+        if let Event::MouseUp {
+            pos,
+            button: MouseButton::Right,
+            ..
+        } = *e
+        {
+            let all: Vec<&str> = self.lines.iter().map(|l| l.text.as_str()).collect();
+            let some = !all.is_empty();
+            let items = vec![
+                Entry::item(Action::CopyText(all.join("\r\n")), "Copy all", "", some),
+                Entry::item(Action::ClearOutput, "Clear", "", some),
+            ];
+            cx.act(Action::ContextMenu { pos, items });
             return true;
         }
         matches!(e, Event::MouseDown { .. })

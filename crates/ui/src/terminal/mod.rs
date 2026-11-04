@@ -7,9 +7,10 @@ use std::path::PathBuf;
 
 use grid::{Attr, Grid, TermColor};
 
-use crate::event::{CursorShape, Event, Key, MouseButton};
+use crate::event::{CursorShape, Event, Key, Modifiers, MouseButton};
 use crate::geom::{PointF, RectF};
-use crate::panel::{Cx, Panel};
+use crate::menubar::Entry;
+use crate::panel::{Action, Cx, Panel};
 use crate::sys::clipboard;
 use crate::sys::conpty::{Pty, PtyEvent};
 use crate::sys::gfx::DrawCtx;
@@ -302,6 +303,24 @@ impl Panel for Terminal {
                 button: MouseButton::Left,
                 ..
             } => true,
+            Event::MouseUp {
+                pos,
+                button: MouseButton::Right,
+                ..
+            } => {
+                let item = if self.pty.is_some() {
+                    let paste = Action::Key(Key::Letter('V'), Modifiers::CTRL);
+                    Entry::item(paste, "Paste", "Ctrl+V", true)
+                } else {
+                    let start = Action::Key(Key::Enter, Modifiers::NONE);
+                    Entry::item(start, "Start terminal", "Enter", true)
+                };
+                cx.act(Action::ContextMenu {
+                    pos,
+                    items: vec![item],
+                });
+                true
+            }
             _ => false,
         }
     }
