@@ -32,8 +32,6 @@ pub enum Mark {
 pub enum Entry<C> {
     /// A section title.
     Header(String),
-    /// Dim text that cannot be picked.
-    Note(String),
     Separator,
     Item {
         cmd: C,
@@ -66,7 +64,6 @@ impl<C> Entry<C> {
     fn height(&self) -> f32 {
         match self {
             Self::Header(_) => HEADER_H,
-            Self::Note(_) => ROW_H,
             Self::Separator => SEPARATOR_H,
             Self::Item { .. } | Self::Submenu { .. } => ROW_H,
         }
@@ -77,7 +74,7 @@ impl<C> Entry<C> {
         match self {
             Self::Item { enabled, .. } => *enabled,
             Self::Submenu { .. } => true,
-            Self::Header(_) | Self::Note(_) | Self::Separator => false,
+            Self::Header(_) | Self::Separator => false,
         }
     }
 }
@@ -106,7 +103,7 @@ impl<C: Clone> Level<C> {
         let mut w = MIN_W;
         for e in &entries {
             let (label, hint) = match e {
-                Entry::Header(s) | Entry::Note(s) => (s.as_str(), None),
+                Entry::Header(s) => (s.as_str(), None),
                 Entry::Item { label, hint, .. } => (label.as_str(), hint.as_deref()),
                 Entry::Submenu { label, hint, .. } => (label.as_str(), hint.as_deref()),
                 Entry::Separator => continue,
@@ -455,7 +452,6 @@ fn paint_entry<C>(d: &mut DrawCtx, theme: &Theme, e: &Entry<C>, row: RectF, hove
                 theme.text_dim,
             );
         }
-        Entry::Note(s) => d.text(TextStyle::Ui, s, label_rect, theme.text_dim),
         Entry::Separator => {
             let y = row.y + row.h / 2.0;
             d.fill_rect(RectF::new(row.x + 4.0, y, row.w - 8.0, 1.0), theme.border);
@@ -562,7 +558,6 @@ mod tests {
                     entries: vec![item(10, "Abstracted"), item(11, "Verbose")],
                 },
                 Entry::Separator,
-                Entry::Note("No settings yet".into()),
             ],
         }
     }
@@ -584,12 +579,10 @@ mod tests {
         let (x, y) = centre(bar.titles[1].1);
         assert_eq!(bar.on_event(&down(x, y), &text, menus), Outcome::Consumed);
         assert_eq!(bar.state().0, Some(1));
-        // Header and note rows are inert.
+        // Header rows are inert.
         let rows = bar.open.as_ref().unwrap().levels[0].rows.clone();
         let (hx, hy) = centre(rows[0]);
         assert_eq!(bar.on_event(&down(hx, hy), &text, menus), Outcome::Consumed);
-        let (nx, ny) = centre(rows[3]);
-        assert_eq!(bar.on_event(&down(nx, ny), &text, menus), Outcome::Consumed);
         assert!(bar.is_open());
 
         let (mx, my) = centre(rows[1]);

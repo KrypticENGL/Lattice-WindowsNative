@@ -27,7 +27,7 @@ pub enum Action {
         line: u32,
     },
     PickFolder,
-    /// Debugger controls (Visualizer Data mode, F5/F10/F11).
+    /// Debugger controls (Debugger toolbar, F5/F10/F11).
     Debug(DebugAction),
     /// Add or remove a breakpoint (gutter click).
     ToggleBreakpoint {
@@ -38,7 +38,8 @@ pub enum Action {
         error: bool,
         text: String,
     },
-    /// Focus and centre a frame's box in the Data view (call stack click).
+    /// Select a frame in the debugger, and its box in the Data view (call stack
+    /// click).
     RevealFrame(usize),
     /// A play bar command.
     Replay(ReplayAction),
@@ -58,6 +59,29 @@ pub enum Action {
     /// Close every editor tab but this one, or all of them.
     CloseTabsExcept(Option<usize>),
     ClearOutput,
+    /// Ask for the name of a new file or folder, in `dir` or else in the
+    /// folder of the Explorer's selection.
+    NewEntry {
+        folder: bool,
+        dir: Option<PathBuf>,
+    },
+    /// Ask for a new name for a file or folder.
+    BeginRename(PathBuf),
+    CreatePath {
+        path: PathBuf,
+        folder: bool,
+    },
+    RenamePath {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    /// Move a file or folder to another folder (dragged in the Explorer).
+    MovePath {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    /// Confirm, then move a file or folder to the Recycle Bin.
+    DeletePath(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

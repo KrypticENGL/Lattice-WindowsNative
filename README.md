@@ -10,17 +10,16 @@ top-level workspaces, and every panel in them can be docked anywhere:
   ConPTY terminal. Object files (`.obj`, `.o`) expand in the Explorer into
   their functions, variables and externals, read by `crates/engine`, and
   reload automatically when they change on disk.
-- **Visualizer**, in two modes:
-  - **Call graph:** every loaded object, merged and shown in levels: the
-    source files joined by `#include`; a file's classes, functions and
-    globals with the calls between them; a class's members or a
-    function's locals. Click to go a level down, and at the innermost
-    level click any node for a details window. Laid out by a force
-    simulation on a worker thread; pan, zoom and drag as usual.
-  - **Data:** the live data of a program stopped under GDB, drawn by
-    shape: trees as trees, linked lists as chains, arrays and vectors as
-    rows of cells, 2-D arrays as grids, with the stack frames beside them.
-    Run, break and step from the toolbar or with the usual debugger keys.
+- **Visualizer:** two tabs. **Visualizer**, the call graph: every loaded object,
+  merged and shown in levels: the source files joined by `#include`; a file's classes, functions
+  and globals with the calls between them; a class's members or a function's
+  locals. Click to go a level down, and at the innermost level click any node
+  for a details window. Laid out by a force simulation on a worker thread;
+  pan, zoom and drag as usual. **Data**: the live data of a program stopped
+  under GDB, drawn by shape: trees as trees, linked lists as chains, arrays and
+  vectors as rows of cells, 2-D arrays as grids.
+- **Debugger:** run, break and step a program under GDB from the toolbar or with
+  the usual debugger keys, with its source, variables, call stack and memory.
 
 ## Build
 
@@ -29,7 +28,7 @@ and stable Rust with the MSVC toolchain
 (`rustup default stable-x86_64-pc-windows-msvc`) plus the Visual Studio C++
 build tools.
 
-The Visualizer's Data mode also needs GDB with Python (MinGW-w64 or MSYS2
+The Debugger tab also needs GDB with Python (MinGW-w64 or MSYS2
 builds have it; tested with GDB 16.3) on `PATH`, or `LATTICE_GDB` pointing
 at `gdb.exe`. The programs it debugs must be built with gcc or g++ and
 `-g`; GDB cannot read MSVC's PDB debug info.
@@ -57,22 +56,22 @@ cargo test --workspace
 | Open a folder | `Ctrl+O`, the **Open Folder** button, or a path on the command line |
 | Open a file | Double-click it in the Explorer (or select it and press `Enter`) |
 | Inspect an object file | Click a `.obj` / `.o` in the Explorer. Its symbols load in the background, grouped as Functions / Variables / Externals, with `file:line` when debug info has it. Expand a function to see its parameters and locals, with their types. Standard-library code and compiler-generated symbols are in collapsed **Library** and **Compiler-generated** groups. Rebuilding the file reloads it |
-| Switch top tabs | Click **Code** / **Visualizer**, or `Ctrl+1` / `Ctrl+2` |
+| Switch top tabs | Click **Code** / **Visualizer** / **Debugger**, or `Ctrl+1` / `Ctrl+2` / `Ctrl+3` |
 | See the graph | Every object you load shows up in the **Visualizer**, merged: a call to an external in one object links to its definition in another. **Add folder objects** loads every `.obj` / `.o` under the open folder. The graph opens on **Files**: one blue node per source file, with an arrow for each `#include` (headers are found next to the includer, beside the other sources, and in the open folder and its `include/`) |
 | Go down a level | Click a file to see its classes (pink), free functions (lime) and globals (teal) around the file itself, with the calls between them; calls to and from other files end at amber nodes. Click a class to see its member functions and data members, or a function to see its parameters and locals. The level's subject has a ring around it |
 | Go back up | Click a segment of the breadcrumb over the canvas (`Files › shapes.cpp › Square`), or press `Backspace` (`Esc` too, when nothing is selected). Each level keeps its layout when you come back |
 | Details | At a class or function level, click any node: a fixed window in the middle of the canvas shows what it is, where it is declared, its size and type, its members or locals, and what calls or uses it. Click the level's subject (or the last breadcrumb segment) for its own details, files included. **Open source** jumps to it; `Esc`, `×` or a click outside closes it. Double-click a node to open its source directly |
 | Move around the graph | Drag empty space to pan, wheel to zoom, drag a node to move it. Hover a node for its name. **Fit** (or `F`) frames everything. The arrow keys pan and `+` / `-` zoom. `Space` re-runs the layout |
 | Call graph mode | **Visualizers › Call graph › Mode** in the menu bar. **Abstracted** (the default) shows only code you wrote: no standard library or toolchain headers, no compiler-generated symbols, and no calls into code that no loaded object defines (`printf`, iostream operators). **Verbose** shows all of it. Switching keeps existing nodes where they are |
-| Switch Visualizer mode | **Call graph** / **Data** at the left of the Visualizer toolbar. Each mode keeps its own view |
-| Debug a program (Data mode) | Build it with `g++ -g` (or `gcc -g`). Set breakpoints with `F9` on the caret line, or click the editor's gutter. `F5` runs it: the program is `foo.exe` next to the open `foo.cpp`, or the one chosen with **Program**. With no breakpoints it stops at `main`. It gets its own console window for input and output |
+| Compiler options | **Build › Compiler options…** opens the folder's `.lattice\build.conf` in the editor (created with the defaults the first time): `cflags` for C files, `cxxflags` for C++ files, `ldflags` for linking. Save it and **Build**; changing it recompiles everything. A mistake in the file stops the build and names the line |
+| Debug a program | Open the **Debugger** tab. Build it with **Build**, or yourself with `g++ -g` (or `gcc -g`). Set breakpoints with `F9` on the caret line, or click the editor's gutter. `F5` or **Run**, at the right of the toolbar, runs it: the program is `foo.exe` next to the open `foo.cpp`, or the one chosen with **Program**. With no breakpoints it stops at `main`. It gets its own console window for input and output |
 | Step | `F5` continue, `F10` step over, `F11` step into, `Shift+F11` step out, `Shift+F5` stop, or the toolbar buttons; **Pause** interrupts a running program. In the Code tab the editor follows each stop |
 | Record and replay | **Play** (or `F6`) runs the whole program under GDB once, from `main`, and records the data at every line: into your functions, straight back out of library code (sources under the GDB toolchain, or with no source). Then it replays the run with a play bar under the canvas, like a media player: previous / play-pause / next, the current step, a track to click or drag, the number of steps, speed (0.5× to 4×) and **Record again**. The last step is the last line that ran before the program exited, and playback stops there. With the canvas focused, `←` `→` step, `Space` plays or pauses, `Home` / `End` jump. **Stop** ends a recording early and replays what it has; **Run** goes back to live debugging |
-| Read the data | Frames are on the left, outermost first. Pointers are dots with arrows to what they point at; back pointers (`prev`, `parent`, cycles, shared nodes) are grey curves. A value that changed in the last step is tinted lime. Click a box to focus it: its type, size and address and each field's type appear, and unrelated boxes dim. Double-click a frame to open its source line. Drag to pan, wheel to zoom, `F` or **Fit** to frame everything. Changes animate: the view glides to a new framing, and after a step boxes slide to their new places, new ones fade in and changed values flash |
-| Source and call stack (Data mode) | Two panels, left of the canvas by default. **Source** shows the file of the stopped line, marked with a lime chevron like the editor, and scrolls to it at every stop; the gutter toggles breakpoints, a double-click opens the line in the editor, Shift+wheel scrolls sideways. Below it, the call stack lists the frames innermost first with `file:line` and arguments. Click a frame to focus and centre its box; the Source panel then shows its call site. Close either with its tab's `×` and reopen it from **Panels** in the menu bar |
-| View memory | Once the program has stopped under the debugger at least once (a breakpoint, a step, or a recorded run), hover a variable: a row in a Data view box, a data member, global or local node in the call graph, or a name in the Source panel or editor (`p->next->key` follows the pointers; inside a method a bare member reads through `this`). Choose **View in memory** on the card under it. Before any run the call graph card says to run the program first. The **Memory** panel (a tab beside the call stack) shows the type, size and address, then one row per field with its offset, value and bytes, padding included, and below that the raw bytes (hex and ASCII) tinted by the field they belong to. The field you pointed at is highlighted; hover a row or a byte to see the two together. Bytes that changed since the last stop are lime. A class's field or a recursive function's local can have several live copies: `‹ ›` steps through them. The panel follows its variable at every stop and in replays. GDB sends at most 256 bytes per object |
-| Dock panels | Drag a panel by its tab. Dropping on a side of another panel docks it there, on its tab strip or middle joins its tabs, and on an outer edge of the workspace docks it along that whole edge; a lime overlay shows where. Drag onto the **Code** / **Visualizer** title to move a panel to the other workspace. `Esc` cancels a drag |
-| Close and reopen panels | The `×` on a tab (or a middle-click) closes it; **Panels** in the menu bar lists every panel and reopens a closed one where it was. The editor and the Visualizer canvas can move but not close |
+| Read the data | In the **Data** tab beside the call graph: frames are on the left, outermost first. Pointers are dots with arrows to what they point at; back pointers (`prev`, `parent`, cycles, shared nodes) are grey curves. A value that changed in the last step is tinted lime. Click a box to focus it: its type, size and address and each field's type appear, and unrelated boxes dim. Double-click a frame to open its source line. Drag to pan, wheel to zoom, `F` or **Fit** to frame everything. Changes animate: the view glides to a new framing, and after a step boxes slide to their new places, new ones fade in and changed values flash |
+| Source, variables and call stack | The middle of the Debugger tab shows the file of the stopped line, marked with a lime chevron like the editor, and scrolls to it at every stop; the gutter toggles breakpoints, a double-click opens the line in the editor, Shift+wheel scrolls sideways. **Variables** lists the frame's arguments and locals, then the globals, with their values and types: click a row to open it (pointers open into what they point at), and values that changed in the last step are lime. The **Call stack** lists the frames innermost first with `file:line` and arguments. Click a frame to select it: the source shows its call site and Variables shows its variables. Close a panel with its tab's `×` and reopen it from **Panels** in the menu bar |
+| View memory | Once the program has stopped under the debugger at least once (a breakpoint, a step, or a recorded run), right-click a row in **Variables**, or hover a name in the source or editor (`p->next->key` follows the pointers; inside a method a bare member reads through `this`), and choose **View in memory**. The **Memory** panel (a tab beside the call stack) shows the type, size and address, then one row per field with its offset, value and bytes, padding included, and below that the raw bytes (hex and ASCII) tinted by the field they belong to. The field you pointed at is highlighted; hover a row or a byte to see the two together. Bytes that changed since the last stop are lime. The panel follows its variable at every stop and in replays. GDB sends at most 256 bytes per object |
+| Dock panels | Drag a panel by its tab. Dropping on a side of another panel docks it there, on its tab strip or middle joins its tabs, and on an outer edge of the workspace docks it along that whole edge; a lime overlay shows where. Drag onto a workspace's title (**Code**, **Visualizer**, **Debugger**) to move a panel there. `Esc` cancels a drag |
+| Close and reopen panels | The `×` on a tab (or a middle-click) closes it; **Panels** in the menu bar lists every panel and reopens a closed one where it was. The editor and the Visualizer and Debugger canvases can move but not close |
 | Benchmark | `Ctrl+Shift+G` loads a synthetic 10,000-node graph; `Ctrl+Shift+B` measures frame times and prints them to Output (see [`crates/renderer/DESIGN.md`](crates/renderer/DESIGN.md)) |
 | Editor | Type to edit. `Ctrl+S` save, `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+Z` redo, `Ctrl+A/C/X/V`, `Ctrl+W` close tab, `Ctrl+Tab` next tab. Shift+arrows or a mouse drag selects; double-click selects a word |
 | Terminal | Click its tab or press `` Ctrl+` `` (reopens it if closed). `Ctrl+V` pastes; the mouse wheel scrolls the history. Press `Enter` to restart the shell after it exits |

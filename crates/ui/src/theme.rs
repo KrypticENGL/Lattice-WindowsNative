@@ -74,7 +74,7 @@ pub struct Theme {
     pub graph_card_bg: Color,
     /// Alpha multiplier for nodes unrelated to the selection.
     pub graph_dim: f32,
-    /// Data mode (live program data) boxes and pointers.
+    /// Data view (live program data) boxes and pointers.
     pub data_frame_bg: Color,
     pub data_header_bg: Color,
     pub data_box_bg: Color,

@@ -33,21 +33,32 @@ pub enum PaneId {
     Output,
     Terminal,
     Visualizer,
-    Source,
+    Data,
+    Debugger,
+    Variables,
     CallStack,
     Memory,
+    /// The Visualizer tab's own source, call stack and memory views.
+    VisSource,
+    VisStack,
+    VisMemory,
 }
 
 impl PaneId {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 13] = [
         Self::Explorer,
         Self::Editor,
         Self::Output,
         Self::Terminal,
         Self::Visualizer,
-        Self::Source,
+        Self::Data,
+        Self::Debugger,
+        Self::Variables,
         Self::CallStack,
         Self::Memory,
+        Self::VisSource,
+        Self::VisStack,
+        Self::VisMemory,
     ];
 
     pub fn title(self) -> &'static str {
@@ -57,16 +68,19 @@ impl PaneId {
             Self::Output => "Output",
             Self::Terminal => "Terminal",
             Self::Visualizer => "Visualizer",
-            Self::Source => "Source",
-            Self::CallStack => "Call stack",
-            Self::Memory => "Memory",
+            Self::Data => "Data",
+            Self::Debugger => "Debugger",
+            Self::Variables => "Variables",
+            Self::CallStack | Self::VisStack => "Call stack",
+            Self::Memory | Self::VisMemory => "Memory",
+            Self::VisSource => "Source",
         }
     }
 
-    /// The editor and the Visualizer canvas are the centres of their
-    /// workspaces: they can move but not be closed.
+    /// The editor and the Visualizer and Debugger canvases are the centres
+    /// of their workspaces: they can move but not be closed.
     pub fn closable(self) -> bool {
-        !matches!(self, Self::Editor | Self::Visualizer)
+        !matches!(self, Self::Editor | Self::Visualizer | Self::Debugger)
     }
 }
 
@@ -788,8 +802,8 @@ mod tests {
         assert!(sums_to_one(&n));
         // Into an empty area.
         let mut e = Node::tabs(&[]);
-        e.insert(Source, Some(Editor), Zone::Left);
-        assert_eq!(e, Node::tabs(&[Source]));
+        e.insert(Variables, Some(Editor), Zone::Left);
+        assert_eq!(e, Node::tabs(&[Variables]));
     }
 
     #[test]
@@ -815,7 +829,7 @@ mod tests {
     fn activate_and_hit_tests() {
         let mut n = code();
         assert!(n.activate(Terminal));
-        assert!(!n.activate(Source));
+        assert!(!n.activate(Variables));
         let l = n.layout(area());
         assert_eq!(l.groups[2].active_pane(), Terminal);
         assert_eq!(l.group_at(PointF::new(10.0, 10.0)), Some(0));

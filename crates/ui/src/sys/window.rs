@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP, WM_CLOSE};
 
 /// Posted (no payload) by [`Waker::wake`] when a background thread has data
 /// queued for the UI thread. The app forwards it to `Shell::on_wake`, which
@@ -34,8 +34,25 @@ impl NativeWindow {
         }
     }
 
+    /// No window, for tests that send a panel events. Whatever needs a real
+    /// window (clipboard, dialogs) fails on it, so such tests stay off those.
+    #[cfg(test)]
+    pub(crate) fn none() -> Self {
+        Self {
+            raw: 0,
+            _not_send: PhantomData,
+        }
+    }
+
     pub(crate) fn hwnd(self) -> HWND {
         HWND(self.raw as *mut c_void)
+    }
+
+    /// Asks the window to close, as its close button does: unsaved files
+    /// still prompt.
+    pub fn close(self) {
+        // SAFETY: posting to our own live window; if it fails, it stays open.
+        let _ = unsafe { PostMessageW(Some(self.hwnd()), WM_CLOSE, WPARAM(0), LPARAM(0)) };
     }
 }
 

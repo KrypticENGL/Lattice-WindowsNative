@@ -128,7 +128,13 @@ pub const TYPES: &[&str] = &[
     "wchar_t",
 ];
 
-const LITERALS: &[&str] = &["true", "false", "nullptr", "NULL"];
+pub const LITERALS: &[&str] = &["true", "false", "nullptr", "NULL"];
+
+/// What can follow `#`.
+pub const DIRECTIVES: &[&str] = &[
+    "define", "elif", "else", "endif", "error", "if", "ifdef", "ifndef", "include", "line",
+    "pragma", "undef", "warning",
+];
 
 /// A file this scanner understands.
 pub fn is_c_like(path: &Path) -> bool {

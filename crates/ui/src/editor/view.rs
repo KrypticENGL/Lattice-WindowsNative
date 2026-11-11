@@ -2,8 +2,10 @@
 //! handling and painting. Line layouts are cached by line id (ids change on
 //! every edit) and evicted when the line scrolls out of view.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 
 use super::buffer::{byte_to_utf16, order, utf16_to_byte, Buffer, Pos};
 use super::complete;
@@ -60,6 +62,12 @@ pub struct Document {
     runs: HashMap<u64, (bool, Vec<Run>)>,
     /// The words of the file, for completion; `None` when out of date.
     words: Option<BTreeSet<String>>,
+    /// Where a word was last being typed: that word, unfinished, isn't one
+    /// to offer.
+    typed_at: Option<Pos>,
+    /// What the file includes, and the scan for an update while one runs.
+    included: BTreeSet<String>,
+    included_scan: Option<Receiver<BTreeSet<String>>>,
     dragging: bool,
     /// Breakpoint lines (1-based), drawn as gutter dots.
     breakpoints: Vec<u32>,
@@ -82,10 +90,27 @@ impl Document {
             Ok(s) => (s, false),
             Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), true),
         };
-        Ok(Self::from_text(path, &text, read_only))
+        let mut doc = Self::from_text(path, &text, read_only);
+        doc.scan_includes();
+        Ok(doc)
     }
 
-    fn from_text(path: &Path, text: &str, read_only: bool) -> Self {
+    /// Reads what the saved file includes, in the background: the preprocessor
+    /// takes a moment and typing must not wait for it.
+    fn scan_includes(&mut self) {
+        if !self.code {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let path = self.path.clone();
+        std::thread::spawn(move || {
+            // If the document moved on, nobody is listening; that is fine.
+            let _ = tx.send(complete::included_words(&path));
+        });
+        self.included_scan = Some(rx);
+    }
+
+    pub(super) fn from_text(path: &Path, text: &str, read_only: bool) -> Self {
         let name = path.file_name().map_or_else(
             || path.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
@@ -110,6 +135,9 @@ impl Document {
             in_comment: Vec::new(),
             runs: HashMap::new(),
             words: None,
+            typed_at: None,
+            included: BTreeSet::new(),
+            included_scan: None,
             dragging: false,
             breakpoints: Vec::new(),
             exec_line: None,
@@ -143,7 +171,40 @@ impl Document {
             .map_err(|e| format!("{}: {e}", self.path.display()))?;
         self.saved_state = self.undo.state_id();
         self.undo.seal();
+        // Its includes may have changed.
+        self.scan_includes();
         Ok(())
+    }
+
+    /// Writes to `path`, which becomes this document's file.
+    pub fn save_as(&mut self, path: &Path) -> Result<(), String> {
+        if self.read_only {
+            // The text shown is a lossy copy; writing it would corrupt.
+            return Err(format!(
+                "{}: opened read-only (not valid UTF-8)",
+                self.path.display()
+            ));
+        }
+        std::fs::write(path, self.buffer.to_file_text())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        self.set_path(path);
+        self.saved_state = self.undo.state_id();
+        self.undo.seal();
+        self.scan_includes();
+        Ok(())
+    }
+
+    /// The file moved, or the document now belongs to another.
+    pub fn set_path(&mut self, path: &Path) {
+        self.path = path.to_path_buf();
+        self.name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        // Its extension may say another language now.
+        self.code = syntax::is_c_like(path);
+        self.in_comment.clear();
+        self.runs.clear();
     }
 
     /// Puts the caret at the start of `line` (1-based) and scrolls it to
@@ -175,6 +236,11 @@ impl Document {
     pub fn clear_layouts(&mut self) {
         self.layouts.clear();
         self.runs.clear();
+    }
+
+    #[cfg(test)]
+    pub fn text_for_test(&self) -> String {
+        self.buffer.text_range(Pos::new(0, 0), self.buffer.end())
     }
 
     pub fn is_code(&self) -> bool {
@@ -254,12 +320,55 @@ impl Document {
         Some((start, prefix.to_owned()))
     }
 
-    /// The file's words, rescanned after an edit that could change them.
-    pub fn words(&mut self) -> &BTreeSet<String> {
+    /// The word being typed follows `#`, so it is a directive's name.
+    pub fn is_directive(&self, start_col: usize) -> bool {
+        self.code
+            && self.buffer.line(self.caret.line)[..start_col]
+                .trim()
+                .ends_with('#')
+    }
+
+    /// Brings the word sets up to date; read them with [`Self::own_words`] and
+    /// [`Self::included_words`].
+    pub fn update_words(&mut self) {
+        if let Some(words) = self.included_scan.as_ref().and_then(|r| r.try_recv().ok()) {
+            self.included = words;
+            self.included_scan = None;
+        }
+        if self.words.is_some() {
+            return;
+        }
+        // Without the word still being typed, which isn't a word yet.
+        let skip = self.typed_at.filter(|&at| at == self.caret).map(|at| {
+            let line = self.buffer.line(at.line);
+            let end = line[at.col..]
+                .bytes()
+                .position(|b| !is_word(b))
+                .map_or(line.len(), |i| at.col + i);
+            let start = line[..at.col]
+                .bytes()
+                .rposition(|b| !is_word(b))
+                .map_or(0, |i| i + 1);
+            (at.line, format!("{} {}", &line[..start], &line[end..]))
+        });
         let buffer = &self.buffer;
-        self.words.get_or_insert_with(|| {
-            complete::words_in((0..buffer.line_count()).map(|i| buffer.line(i)))
-        })
+        let lines = (0..buffer.line_count()).map(|i| match &skip {
+            Some((line, text)) if *line == i => Cow::Borrowed(text.as_str()),
+            _ => Cow::Borrowed(buffer.line(i)),
+        });
+        self.words = Some(if self.code {
+            complete::code_words(lines)
+        } else {
+            complete::words_in(lines)
+        });
+    }
+
+    pub fn own_words(&self) -> Option<&BTreeSet<String>> {
+        self.words.as_ref()
+    }
+
+    pub fn included_words(&self) -> &BTreeSet<String> {
+        &self.included
     }
 
     /// The caret's on-screen rect.
@@ -273,10 +382,22 @@ impl Document {
         )
     }
 
-    /// Replaces the word being typed, from `start_col` to the caret.
+    /// Replaces the word at the caret, all of it: completing inside `fo|obar`
+    /// must not leave the old `obar` behind.
     pub fn accept_completion(&mut self, start_col: usize, word: &str, cx: &mut Cx) {
-        let start = Pos::new(self.caret.line, start_col);
-        self.replace(start, self.caret, word, EditKind::Other, cx);
+        let Pos { line, col } = self.caret;
+        let text = self.buffer.line(line);
+        let end = text[col..]
+            .bytes()
+            .position(|b| !is_word(b))
+            .map_or(text.len(), |i| col + i);
+        self.replace(
+            Pos::new(line, start_col),
+            Pos::new(line, end),
+            word,
+            EditKind::Other,
+            cx,
+        );
     }
 
     pub fn layout(&mut self, rect: RectF, text: &TextSystem) {
@@ -403,9 +524,11 @@ impl Document {
         self.preferred_x = None;
         self.in_comment.truncate(start.line + 1);
         // While a word is being typed its letters add nothing worth offering.
-        if kind != EditKind::Typing || !insert.bytes().all(is_word) {
+        let in_word = kind == EditKind::Typing && insert.bytes().all(is_word);
+        if !in_word {
             self.words = None;
         }
+        self.typed_at = (in_word || kind == EditKind::Backspace).then_some(new_end);
         self.undo.record(
             Edit {
                 start,
@@ -927,6 +1050,27 @@ mod tests {
         assert_eq!(at(&mut doc, 1, 13), None, "number");
         doc.anchor = Pos::new(0, 0);
         assert_eq!(doc.completion_prefix(), None, "selection");
+    }
+
+    #[test]
+    fn save_as_moves_the_document_to_its_new_file() {
+        let dir = std::env::temp_dir().join(format!("lattice-saveas-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("a.txt"), dir.join("b.cpp"));
+        std::fs::write(&old, "one\n").unwrap();
+        let mut doc = Document::open(&old).unwrap();
+        assert!(!doc.is_code());
+        doc.save_as(&new).unwrap();
+        assert_eq!(doc.path(), new);
+        assert_eq!(doc.name(), "b.cpp");
+        assert!(doc.is_code());
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "one\n");
+        assert_eq!(
+            std::fs::read_to_string(&old).unwrap(),
+            "one\n",
+            "old file stays"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

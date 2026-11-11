@@ -1,9 +1,9 @@
-//! The debugging session behind the Visualizer's Data mode: which program
+//! The debugging session behind the Debugger tab: which program
 //! to run, the source breakpoints, and the GDB session's state.
 //!
 //! The session itself (`crates/debugger`) runs GDB on its own threads and
 //! wakes the UI thread; [`Debug::drain`] turns its events into Output lines
-//! and [`Update`]s for the Visualizer and the editor.
+//! and [`Update`]s for the Debugger tab and the editor.
 //!
 //! [`Debug::record`] runs the whole program for a replay: from `main` it
 //! steps line by line as soon as each stop's snapshot is in, into the

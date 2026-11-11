@@ -1,5 +1,5 @@
 //! Root of the UI: the title bar with its menus, the top strip
-//! (Code/Visualizer workspaces), each workspace's dock area, focus and input
+//! (Code/Visualizer/Debugger workspaces), each workspace's dock area, focus and input
 //! routing.
 
 use std::collections::HashMap;
@@ -8,14 +8,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::build::{BuildEvent, Builder};
+use crate::build::{self, BuildEvent, Builder};
 use crate::callstack::CallStack;
 use crate::codepane::CodePane;
+use crate::dataview::DataPanel;
 use crate::debug::{self, Debug, Phase, Update};
+use crate::debugview::{DebugStatus, DebugView};
 use crate::dock::{Axis, DockArea, Drop, Node, PaneHost, PaneId, Request, Spot, TabDrag, Zone};
 use crate::editor::EditorArea;
 use crate::event::{CursorShape, Event, Key, MouseButton};
 use crate::explorer::Explorer;
+use crate::fileops;
 use crate::folder_watch::{Changes, FolderWatcher};
 use crate::geom::{PointF, RectF, SizeF};
 use crate::memory::Memory;
@@ -32,7 +35,8 @@ use crate::sys::{NativeWindow, Waker};
 use crate::terminal::Terminal;
 use crate::theme::Theme;
 use crate::titlebar::{TitleBar, WindowHit, TITLE_BAR_H};
-use crate::visualizer::{DebugStatus, Mode, Visualizer};
+use crate::variables::Variables;
+use crate::visualizer::Visualizer;
 use crate::Error;
 use renderer::GraphMode;
 
@@ -42,12 +46,32 @@ const TOP_TAB_PAD: f32 = 16.0;
 /// What a menu row does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuCmd {
+    File(FileCmd),
     TogglePane(PaneId),
     GraphMode(GraphMode),
+    Build,
+    CompilerOptions,
+}
+
+/// The File menu's commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileCmd {
+    NewFile,
+    NewFolder,
+    OpenFile,
+    OpenFolder,
+    Save,
+    SaveAs,
+    SaveAll,
+    Rename,
+    Delete,
+    CloseFile,
+    CloseAll,
+    Exit,
 }
 
 /// The menu bar's titles, in order.
-const MENUS: [&str; 2] = ["Panels", "Visualizers"];
+const MENUS: [&str; 4] = ["File", "Panels", "Build", "Visualizers"];
 
 /// What the app should do after a call into the shell.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -56,15 +80,16 @@ pub struct Response {
     pub repaint: bool,
 }
 
-/// The two workspaces, each with its own dock layout.
+/// The workspaces, each with its own dock layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TopTab {
     Code,
     Visualizer,
+    Debugger,
 }
 
 impl TopTab {
-    const ALL: [Self; 2] = [Self::Code, Self::Visualizer];
+    const ALL: [Self; 3] = [Self::Code, Self::Visualizer, Self::Debugger];
 
     fn index(self) -> usize {
         self as usize
@@ -74,6 +99,7 @@ impl TopTab {
         match self {
             Self::Code => "Code",
             Self::Visualizer => "Visualizer",
+            Self::Debugger => "Debugger",
         }
     }
 }
@@ -92,9 +118,14 @@ struct Panes {
     output: Output,
     terminal: Terminal,
     visualizer: Visualizer,
-    source: CodePane,
+    data: DataPanel,
+    debug_view: DebugView,
+    variables: Variables,
     stack: CallStack,
     memory: Memory,
+    vis_source: CodePane,
+    vis_stack: CallStack,
+    vis_memory: Memory,
 }
 
 impl PaneHost for Panes {
@@ -105,9 +136,14 @@ impl PaneHost for Panes {
             PaneId::Output => &mut self.output,
             PaneId::Terminal => &mut self.terminal,
             PaneId::Visualizer => &mut self.visualizer,
-            PaneId::Source => &mut self.source,
+            PaneId::Data => &mut self.data,
+            PaneId::Debugger => &mut self.debug_view,
+            PaneId::Variables => &mut self.variables,
             PaneId::CallStack => &mut self.stack,
             PaneId::Memory => &mut self.memory,
+            PaneId::VisSource => &mut self.vis_source,
+            PaneId::VisStack => &mut self.vis_stack,
+            PaneId::VisMemory => &mut self.vis_memory,
         }
     }
 }
@@ -135,17 +171,33 @@ fn default_tree(tab: TopTab) -> Node {
         TopTab::Visualizer => Node::split(
             Axis::Horizontal,
             vec![
+                (Node::tabs(&[Visualizer, Data]), 0.72),
                 (
                     Node::split(
                         Axis::Vertical,
                         vec![
-                            (Node::tabs(&[Source]), 0.65),
-                            (Node::tabs(&[CallStack, Memory]), 0.35),
+                            (Node::tabs(&[VisSource]), 0.6),
+                            (Node::tabs(&[VisStack, VisMemory]), 0.4),
                         ],
                     ),
-                    0.3,
+                    0.28,
                 ),
-                (Node::tabs(&[Visualizer]), 0.7),
+            ],
+        ),
+        TopTab::Debugger => Node::split(
+            Axis::Horizontal,
+            vec![
+                (Node::tabs(&[Debugger]), 0.72),
+                (
+                    Node::split(
+                        Axis::Vertical,
+                        vec![
+                            (Node::tabs(&[Variables]), 0.6),
+                            (Node::tabs(&[CallStack, Memory]), 0.4),
+                        ],
+                    ),
+                    0.28,
+                ),
             ],
         ),
     }
@@ -164,9 +216,18 @@ fn default_spot(pane: PaneId) -> (TopTab, Spot) {
         Editor => (TopTab::Code, spot(None, Zone::Center, 1.0)),
         Output | Terminal => (TopTab::Code, spot(Some(Editor), Zone::Bottom, 0.3)),
         Visualizer => (TopTab::Visualizer, spot(None, Zone::Center, 1.0)),
-        Source | CallStack | Memory => {
-            (TopTab::Visualizer, spot(Some(Visualizer), Zone::Left, 0.3))
+        Data => (
+            TopTab::Visualizer,
+            spot(Some(Visualizer), Zone::Center, 1.0),
+        ),
+        Debugger => (TopTab::Debugger, spot(None, Zone::Center, 1.0)),
+        Variables | CallStack | Memory => {
+            (TopTab::Debugger, spot(Some(Debugger), Zone::Right, 0.28))
         }
+        VisSource | VisStack | VisMemory => (
+            TopTab::Visualizer,
+            spot(Some(Visualizer), Zone::Right, 0.28),
+        ),
     }
 }
 
@@ -174,7 +235,7 @@ fn default_spot(pane: PaneId) -> (TopTab, Spot) {
 struct Views {
     tab: TopTab,
     strip: RectF,
-    tab_rects: [RectF; 2],
+    tab_rects: [RectF; 3],
     tab_hover: Option<usize>,
     title_bar: TitleBar,
     menu_bar: MenuBar<MenuCmd>,
@@ -184,7 +245,7 @@ struct Views {
     bounds: RectF,
     /// Where the menu titles end.
     menu_end: f32,
-    areas: [DockArea; 2],
+    areas: [DockArea; 3],
     /// Where each closed panel was, so showing it puts it back.
     closed: HashMap<PaneId, (TopTab, Spot)>,
     /// A tab being pressed or dragged, in either workspace.
@@ -286,8 +347,11 @@ impl Views {
     }
 
     fn layout(&mut self, size: SizeF, text: &TextSystem) {
-        let v = &mut self.panes.visualizer;
-        v.set_debug_status(DebugStatus {
+        let building = self.build.is_building();
+        self.panes
+            .visualizer
+            .set_build_state(building, self.debug.phase() == Phase::Idle && !building);
+        self.panes.debug_view.set_status(DebugStatus {
             phase: self.debug.phase(),
             program: self
                 .debug
@@ -296,11 +360,12 @@ impl Views {
             stopped: self.debug.stop_description(),
             recording: self.debug.recording(),
             replay: self.replay.as_ref().map(Replay::status),
-            building: self.build.is_building(),
+            building,
         });
-        // The Source panel follows the frame focused in the Data view.
-        let target = self.panes.visualizer.code_target();
-        self.panes.source.show(target);
+        // The source follows the frame selected in the call stack.
+        let target = self.panes.debug_view.code_target();
+        self.panes.vis_source.show(target.clone());
+        self.panes.debug_view.source.show(target);
 
         let full = RectF::new(0.0, 0.0, size.w, size.h);
         self.bounds = full;
@@ -325,7 +390,37 @@ impl Views {
     }
 
     /// Each menu's rows, with the current state.
-    fn menus(&self) -> [Vec<Entry<MenuCmd>>; 2] {
+    fn menus(&self) -> [Vec<Entry<MenuCmd>>; 4] {
+        let has_folder = self.panes.explorer.root_path().is_some();
+        let has_doc = self.panes.editor.has_documents();
+        let has_item = self.panes.explorer.selected_path().is_some();
+        let row = |cmd, label: &str, hint: &str, enabled: bool| {
+            Entry::item(MenuCmd::File(cmd), label, hint, enabled)
+        };
+        let file = vec![
+            row(FileCmd::NewFile, "New file\u{2026}", "Ctrl+N", true),
+            row(
+                FileCmd::NewFolder,
+                "New folder\u{2026}",
+                "Ctrl+Shift+N",
+                has_folder,
+            ),
+            Entry::Separator,
+            row(FileCmd::OpenFile, "Open file\u{2026}", "Ctrl+Shift+O", true),
+            row(FileCmd::OpenFolder, "Open folder\u{2026}", "Ctrl+O", true),
+            Entry::Separator,
+            row(FileCmd::Save, "Save", "Ctrl+S", has_doc),
+            row(FileCmd::SaveAs, "Save as\u{2026}", "Ctrl+Shift+S", has_doc),
+            row(FileCmd::SaveAll, "Save all", "", has_doc),
+            Entry::Separator,
+            row(FileCmd::Rename, "Rename\u{2026}", "F2", has_item),
+            row(FileCmd::Delete, "Delete", "Del", has_item),
+            Entry::Separator,
+            row(FileCmd::CloseFile, "Close file", "Ctrl+W", has_doc),
+            row(FileCmd::CloseAll, "Close all files", "", has_doc),
+            Entry::Separator,
+            row(FileCmd::Exit, "Exit", "Alt+F4", true),
+        ];
         let panels = PaneId::ALL
             .into_iter()
             .map(|p| {
@@ -339,6 +434,20 @@ impl Views {
                 }
             })
             .collect();
+        let build = vec![
+            Entry::item(
+                MenuCmd::Build,
+                "Build",
+                "",
+                has_folder && self.debug.phase() == Phase::Idle && !self.build.is_building(),
+            ),
+            Entry::item(
+                MenuCmd::CompilerOptions,
+                "Compiler options\u{2026}",
+                "",
+                has_folder,
+            ),
+        ];
         let current = self.panes.visualizer.graph_mode();
         let modes = GraphMode::ALL
             .into_iter()
@@ -363,20 +472,175 @@ impl Views {
                 hint: Some(current.title().into()),
                 entries: modes,
             },
-            Entry::Separator,
-            Entry::Header("Data visualizer".into()),
-            Entry::Note("No settings yet".into()),
         ];
-        [panels, visualizers]
+        [file, panels, build, visualizers]
     }
 
     fn run_menu(&mut self, cmd: MenuCmd, cx: &mut Cx) {
         match cmd {
+            MenuCmd::File(c) => self.file_cmd(c, cx),
             MenuCmd::TogglePane(p) => self.toggle_pane(p, cx),
             MenuCmd::GraphMode(m) => {
                 self.panes.visualizer.set_graph_mode(m, cx);
                 cx.log(format!("Call graph mode: {}", m.title()));
             }
+            MenuCmd::Build => self.debug_action(DebugAction::Build, cx),
+            MenuCmd::CompilerOptions => self.open_compiler_options(cx),
+        }
+        cx.repaint();
+    }
+
+    /// Opens the folder's compiler options in the editor, first writing the
+    /// defaults if it has none.
+    fn open_compiler_options(&mut self, cx: &mut Cx) {
+        let Some(root) = self.panes.explorer.root_path() else {
+            cx.log_error("Open a folder first (Ctrl+O), then set its compiler options");
+            return;
+        };
+        match build::ensure_options_file(root) {
+            Ok(path) => cx.act(Action::OpenFile(path)),
+            Err(e) => cx.log_error(format!("Could not create the compiler options: {e}")),
+        }
+    }
+
+    fn file_cmd(&mut self, cmd: FileCmd, cx: &mut Cx) {
+        match cmd {
+            FileCmd::NewFile => self.new_entry(false, None, cx),
+            FileCmd::NewFolder => self.new_entry(true, None, cx),
+            FileCmd::OpenFile => match dialog::pick_file(cx.window, "All files (*.*)", "*.*") {
+                Ok(Some(path)) => cx.act(Action::OpenFile(path)),
+                Ok(None) => {}
+                Err(e) => cx.log_error(format!("File picker failed: {e}")),
+            },
+            FileCmd::OpenFolder => cx.act(Action::PickFolder),
+            FileCmd::Save => self.panes.editor.save_active(cx),
+            FileCmd::SaveAs => self.save_as(cx),
+            FileCmd::SaveAll => self.panes.editor.save_all(cx),
+            FileCmd::Rename => {
+                if let Some(p) = self.panes.explorer.selected_path() {
+                    cx.act(Action::BeginRename(p.to_path_buf()));
+                }
+            }
+            FileCmd::Delete => {
+                if let Some(p) = self.panes.explorer.selected_path() {
+                    cx.act(Action::DeletePath(p.to_path_buf()));
+                }
+            }
+            FileCmd::CloseFile => self.panes.editor.close_active(cx),
+            FileCmd::CloseAll => self.panes.editor.close_tabs_except(None, cx),
+            FileCmd::Exit => cx.window.close(),
+        }
+        cx.repaint();
+    }
+
+    /// Asks for a new item's name in the Explorer. With no folder open there
+    /// is no tree to put it in, so a new file picks its place in a dialog.
+    fn new_entry(&mut self, folder: bool, dir: Option<PathBuf>, cx: &mut Cx) {
+        if self.panes.explorer.root_path().is_some() {
+            self.panes.explorer.begin_new(folder, dir);
+            self.reveal_pane(PaneId::Explorer, cx);
+        } else if folder {
+            cx.log_error("Open a folder first (Ctrl+O), then add a folder to it");
+        } else {
+            match dialog::pick_save(cx.window, "untitled.cpp", None) {
+                Ok(Some(path)) => {
+                    // The dialog already asked about replacing a file; this
+                    // never empties one, it just opens what is there.
+                    if let Err(e) = fileops::create(&path, false) {
+                        if e.kind() != std::io::ErrorKind::AlreadyExists {
+                            cx.log_error(format!("Could not create {}: {e}", path.display()));
+                            return;
+                        }
+                    }
+                    cx.act(Action::OpenFile(path));
+                }
+                Ok(None) => {}
+                Err(e) => cx.log_error(format!("Save dialog failed: {e}")),
+            }
+        }
+    }
+
+    fn save_as(&mut self, cx: &mut Cx) {
+        let Some(path) = self.panes.editor.active_path() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let folder = path.parent().map(Path::to_path_buf);
+        match dialog::pick_save(cx.window, &name, folder.as_deref()) {
+            Ok(Some(to)) => self.panes.editor.save_active_as(&to, cx),
+            Ok(None) => {}
+            Err(e) => cx.log_error(format!("Save dialog failed: {e}")),
+        }
+    }
+
+    fn create_path(&mut self, path: &Path, folder: bool, cx: &mut Cx) {
+        if let Err(e) = fileops::create(path, folder) {
+            self.panes.explorer.name_edit_failed(e.to_string());
+            cx.repaint();
+            return;
+        }
+        cx.log(format!("Created {}", path.display()));
+        let explorer = &mut self.panes.explorer;
+        explorer.finish_name_edit();
+        explorer.refresh(None);
+        explorer.reveal(path);
+        if !folder {
+            cx.act(Action::OpenFile(path.to_path_buf()));
+        }
+        cx.repaint();
+    }
+
+    fn rename_path(&mut self, from: &Path, to: &Path, cx: &mut Cx) {
+        if let Err(e) = fileops::rename(from, to) {
+            self.panes.explorer.name_edit_failed(e.to_string());
+            cx.repaint();
+            return;
+        }
+        cx.log(format!("Renamed {} to {}", from.display(), to.display()));
+        self.panes.editor.path_renamed(from, to, cx);
+        let explorer = &mut self.panes.explorer;
+        explorer.finish_name_edit();
+        explorer.refresh(None);
+        explorer.reveal(to);
+        cx.repaint();
+    }
+
+    /// Open files follow the move; if something of that name is already
+    /// there, nothing happens but the message.
+    fn move_path(&mut self, from: &Path, to: &Path, cx: &mut Cx) {
+        if let Err(e) = fileops::rename(from, to) {
+            cx.log_error(format!("Could not move {}: {e}", from.display()));
+            return;
+        }
+        cx.log(format!("Moved {} to {}", from.display(), to.display()));
+        self.panes.editor.path_renamed(from, to, cx);
+        let explorer = &mut self.panes.explorer;
+        explorer.refresh(None);
+        explorer.reveal(to);
+        cx.repaint();
+    }
+
+    /// Asks first; on Yes moves the item to the Recycle Bin and closes any of
+    /// its files that are open.
+    fn delete_path(&mut self, path: &Path, cx: &mut Cx) {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let unsaved = self.panes.editor.has_unsaved_under(path);
+        if !dialog::confirm_delete(cx.window, &name, unsaved) {
+            return;
+        }
+        match dialog::recycle(cx.window, path) {
+            Ok(true) => {
+                cx.log(format!("Moved {} to the Recycle Bin", path.display()));
+                self.panes.editor.forget_under(path, cx);
+                self.panes.explorer.refresh(None);
+            }
+            Ok(false) => cx.log_error(format!("{} was not deleted", path.display())),
+            Err(e) => cx.log_error(format!("Could not delete {}: {e}", path.display())),
         }
         cx.repaint();
     }
@@ -422,11 +686,16 @@ impl Views {
         let debug = &self.debug;
         let p = &mut self.panes;
         p.editor.set_marks(|path| debug.marks_for(path));
-        let lines = p.source.path().map(|path| debug.marks_for(path).0);
-        p.source.set_breakpoints(lines.unwrap_or_default());
         let stale = debug.phase() != Phase::Stopped && self.replay.is_none();
-        p.source.set_stale(stale);
-        p.stack.set_view(p.visualizer.focused_frame(), stale);
+        for source in [&mut p.debug_view.source, &mut p.vis_source] {
+            let lines = source.path().map(|path| debug.marks_for(path).0);
+            source.set_breakpoints(lines.unwrap_or_default());
+            source.set_stale(stale);
+        }
+        let frame = p.debug_view.selected_frame();
+        p.stack.set_view(frame, stale);
+        p.vis_stack.set_view(frame, stale);
+        p.variables.set_view(frame, stale);
 
         let i = self.tab.index();
         self.areas[i].paint(d, theme, &mut self.panes, self.window_focused);
@@ -446,6 +715,11 @@ impl Views {
     /// The Visualizer canvas is on screen.
     fn visualizer_shown(&self) -> bool {
         self.areas[self.tab.index()].is_shown(PaneId::Visualizer)
+    }
+
+    /// The Data canvas is on screen and mid-transition.
+    fn data_animating(&self) -> bool {
+        self.areas[self.tab.index()].is_shown(PaneId::Data) && self.panes.data.is_animating()
     }
 
     fn switch_tab(&mut self, tab: TopTab, cx: &mut Cx) {
@@ -611,7 +885,7 @@ impl Views {
         let Event::KeyDown { key, mods } = *e else {
             return false;
         };
-        // Debugger keys (Visual Studio's), in both tabs.
+        // Debugger keys (Visual Studio's), in every tab.
         if !mods.ctrl && !mods.alt {
             let action = match key {
                 Key::F(5) if mods.shift => Some(DebugAction::Stop),
@@ -636,10 +910,24 @@ impl Views {
         if !mods.ctrl || mods.alt {
             return false;
         }
+        let in_terminal = self.area().focused() == Some(PaneId::Terminal);
+        // Never closes a tab the user can't see.
+        let editor_here = self.area().contains(PaneId::Editor);
         match key {
             Key::Letter('O') if !mods.shift => cx.act(Action::PickFolder),
+            Key::Letter('O') => self.file_cmd(FileCmd::OpenFile, cx),
+            Key::Letter('N') if mods.shift => self.file_cmd(FileCmd::NewFolder, cx),
+            Key::Letter('S') if mods.shift => self.file_cmd(FileCmd::SaveAs, cx),
+            // Without Shift these also mean something to programs in the
+            // terminal, which keeps them while it has the keyboard.
+            Key::Letter('N') if !in_terminal => self.file_cmd(FileCmd::NewFile, cx),
+            Key::Letter('S') if !in_terminal => self.file_cmd(FileCmd::Save, cx),
+            Key::Letter('W') if !in_terminal && editor_here => {
+                self.file_cmd(FileCmd::CloseFile, cx);
+            }
             Key::Digit(1) => self.switch_tab(TopTab::Code, cx),
             Key::Digit(2) => self.switch_tab(TopTab::Visualizer, cx),
+            Key::Digit(3) => self.switch_tab(TopTab::Debugger, cx),
             Key::Backquote => {
                 self.reveal_pane(PaneId::Terminal, cx);
                 if !self.panes.terminal.is_running() {
@@ -670,7 +958,7 @@ impl Views {
             DebugAction::Stop => {
                 if self.debug.is_active() {
                     self.debug.stop(cx);
-                    self.panes.visualizer.set_data_stale(true);
+                    self.panes.data.set_stale(true);
                 }
             }
             DebugAction::PickProgram => {
@@ -711,11 +999,19 @@ impl Views {
     /// drops the replay.
     fn clear_data_view(&mut self, cx: &mut Cx) {
         self.replay = None;
+        // The Code tab stays put: its editor follows the stops. The call graph
+        // shows nothing of a run, so go to where it can be seen.
+        if self.tab == TopTab::Visualizer {
+            self.switch_tab(TopTab::Debugger, cx);
+        }
         let p = &mut self.panes;
-        p.visualizer.clear_data();
-        p.visualizer.set_mode(Mode::Data, cx);
+        p.data.clear();
+        p.debug_view.clear_snapshot();
+        p.variables.clear();
         p.stack.clear();
-        p.source.clear();
+        p.debug_view.source.clear();
+        p.vis_stack.clear();
+        p.vis_source.clear();
     }
 
     /// Play bar commands. With no replay (or on Record), records the
@@ -760,10 +1056,18 @@ impl Views {
         let shared = Arc::new(snap.clone());
         let p = &mut self.panes;
         p.stack.set_frames(&snap.frames);
-        p.visualizer.set_snapshot(snap);
-        p.source.show(p.visualizer.code_target());
-        p.source.stopped();
-        p.source.set_snapshot(shared.clone());
+        p.vis_stack.set_frames(&snap.frames);
+        p.data.set_snapshot(snap);
+        p.variables.set_snapshot(shared.clone());
+        p.debug_view.set_snapshot(shared.clone());
+        let target = p.debug_view.code_target();
+        p.debug_view.source.show(target.clone());
+        p.debug_view.source.stopped();
+        p.debug_view.source.set_snapshot(shared.clone());
+        p.vis_source.show(target);
+        p.vis_source.stopped();
+        p.vis_source.set_snapshot(shared.clone());
+        p.vis_memory.set_snapshot(shared.clone());
         p.editor.set_snapshot(shared.clone());
         p.memory.set_snapshot(shared);
     }
@@ -821,7 +1125,7 @@ impl Views {
     fn drain_debug(&mut self, cx: &mut Cx) {
         for u in self.debug.drain(cx) {
             match u {
-                Update::Running => self.panes.visualizer.set_data_stale(true),
+                Update::Running => self.panes.data.set_stale(true),
                 Update::Stopped { file, line } => {
                     // With the editor in view, follow the stop like any
                     // debugger.
@@ -833,7 +1137,7 @@ impl Views {
                     }
                 }
                 Update::Snapshot(snap) => self.show_snapshot(*snap),
-                Update::Ended => self.panes.visualizer.set_data_stale(true),
+                Update::Ended => self.panes.data.set_stale(true),
                 Update::Recording => {}
                 Update::Recorded(steps) => {
                     let now = Instant::now();
@@ -1038,12 +1342,19 @@ impl Views {
                         cx.repaint();
                     }
                     Action::ShowMemory(target) => {
-                        self.panes.memory.show(target);
-                        self.reveal_pane(PaneId::Memory, cx);
+                        // The memory view of the tab the request came from.
+                        if self.area().contains(PaneId::VisMemory) {
+                            self.panes.vis_memory.show(target);
+                            self.reveal_pane(PaneId::VisMemory, cx);
+                        } else {
+                            self.panes.memory.show(target);
+                            self.reveal_pane(PaneId::Memory, cx);
+                        }
                         cx.repaint();
                     }
                     Action::RevealFrame(i) => {
-                        self.panes.visualizer.reveal_frame(i);
+                        self.panes.debug_view.select_frame(i);
+                        self.panes.data.reveal_frame(i);
                         cx.repaint();
                     }
                     Action::ContextMenu { pos, items } => {
@@ -1081,6 +1392,16 @@ impl Views {
                         self.panes.output.clear();
                         cx.repaint();
                     }
+                    Action::NewEntry { folder, dir } => self.new_entry(folder, dir, cx),
+                    Action::BeginRename(path) => {
+                        self.panes.explorer.begin_rename(&path);
+                        self.reveal_pane(PaneId::Explorer, cx);
+                        cx.repaint();
+                    }
+                    Action::CreatePath { path, folder } => self.create_path(&path, folder, cx),
+                    Action::RenamePath { from, to } => self.rename_path(&from, &to, cx),
+                    Action::MovePath { from, to } => self.move_path(&from, &to, cx),
+                    Action::DeletePath(path) => self.delete_path(&path, cx),
                 }
             }
         }
@@ -1117,7 +1438,7 @@ impl Shell {
             views: Views {
                 tab: TopTab::Code,
                 strip: RectF::default(),
-                tab_rects: [RectF::default(); 2],
+                tab_rects: [RectF::default(); 3],
                 tab_hover: None,
                 menu_bar: MenuBar::new(&MENUS),
                 popup: MenuBar::new(&[]),
@@ -1133,9 +1454,14 @@ impl Shell {
                     output: Output::new(),
                     terminal: Terminal::new(waker.clone()),
                     visualizer,
-                    source: CodePane::default(),
+                    data: DataPanel::default(),
+                    debug_view: DebugView::default(),
+                    variables: Variables::default(),
                     stack: CallStack::default(),
                     memory: Memory::default(),
+                    vis_source: CodePane::default(),
+                    vis_stack: CallStack::default(),
+                    vis_memory: Memory::default(),
                 },
                 owner: None,
                 window_focused: true,
@@ -1336,7 +1662,8 @@ impl Shell {
                     }
                 }
                 Response {
-                    repaint: visualizer && self.views.panes.visualizer.wants_frame(),
+                    repaint: (visualizer && self.views.panes.visualizer.wants_frame())
+                        || self.views.data_animating(),
                 }
             }
             Ok(Frame::DeviceLost) => {
@@ -1354,5 +1681,33 @@ impl Shell {
                 Response::default()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panels_open_in_their_own_tabs() {
+        let areas = TopTab::ALL.map(|t| DockArea::new(default_tree(t)));
+        for pane in PaneId::ALL {
+            let homes: Vec<TopTab> = TopTab::ALL
+                .into_iter()
+                .filter(|t| areas[t.index()].contains(pane))
+                .collect();
+            // Reopening a closed panel puts it back in its default workspace.
+            assert_eq!(homes, [default_spot(pane).0], "{pane:?}");
+        }
+        for pane in [
+            PaneId::Debugger,
+            PaneId::Variables,
+            PaneId::CallStack,
+            PaneId::Memory,
+        ] {
+            assert_eq!(default_spot(pane).0, TopTab::Debugger, "{pane:?}");
+        }
+        // The data visualization is not part of the debugger.
+        assert_eq!(default_spot(PaneId::Data).0, TopTab::Visualizer);
     }
 }

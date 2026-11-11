@@ -5,7 +5,7 @@ mod complete;
 mod undo;
 mod view;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use complete::Completion;
@@ -123,6 +123,92 @@ impl EditorArea {
         self.close(i, cx);
     }
 
+    pub fn close_active(&mut self, cx: &mut Cx) {
+        if !self.docs.is_empty() {
+            self.close(self.active, cx);
+        }
+    }
+
+    /// The file in the active tab.
+    pub fn active_path(&self) -> Option<&Path> {
+        self.docs.get(self.active).map(Document::path)
+    }
+
+    fn save_doc(doc: &mut Document, cx: &mut Cx) {
+        match doc.save() {
+            Ok(()) => cx.log(format!("Saved {}", doc.path().display())),
+            Err(e) => cx.log_error(format!("Save failed: {e}")),
+        }
+        cx.repaint();
+    }
+
+    pub fn save_active(&mut self, cx: &mut Cx) {
+        if let Some(doc) = self.docs.get_mut(self.active) {
+            Self::save_doc(doc, cx);
+        }
+    }
+
+    pub fn save_all(&mut self, cx: &mut Cx) {
+        for doc in self.docs.iter_mut().filter(|d| d.is_dirty()) {
+            Self::save_doc(doc, cx);
+        }
+    }
+
+    /// Saves the active tab to `path`, which no other tab may have open: two
+    /// tabs on one file would overwrite each other.
+    pub fn save_active_as(&mut self, path: &Path, cx: &mut Cx) {
+        let other = self
+            .docs
+            .iter()
+            .enumerate()
+            .any(|(i, d)| i != self.active && d.path() == path);
+        if other {
+            cx.log_error(format!(
+                "Save failed: {} is open in another tab",
+                path.display()
+            ));
+            return;
+        }
+        let Some(doc) = self.docs.get_mut(self.active) else {
+            return;
+        };
+        match doc.save_as(path) {
+            Ok(()) => cx.log(format!("Saved {}", path.display())),
+            Err(e) => cx.log_error(format!("Save failed: {e}")),
+        }
+        cx.repaint();
+    }
+
+    /// `from` (a file or a folder) was renamed: open files follow it.
+    pub fn path_renamed(&mut self, from: &Path, to: &Path, cx: &mut Cx) {
+        for doc in &mut self.docs {
+            if let Some(new) = moved_path(doc.path(), from, to) {
+                doc.set_path(&new);
+            }
+        }
+        cx.repaint();
+    }
+
+    /// An open file at or under `path` has unsaved changes.
+    pub fn has_unsaved_under(&self, path: &Path) -> bool {
+        self.docs
+            .iter()
+            .any(|d| d.is_dirty() && d.path().starts_with(path))
+    }
+
+    /// `path` (a file or a folder) was deleted: closes its tabs unprompted.
+    pub fn forget_under(&mut self, path: &Path, cx: &mut Cx) {
+        let active = self.active_path().map(Path::to_path_buf);
+        self.docs.retain(|d| !d.path().starts_with(path));
+        self.active = active
+            .and_then(|a| self.docs.iter().position(|d| d.path() == a))
+            .unwrap_or_else(|| self.active.min(self.docs.len().saturating_sub(1)));
+        self.completion = None;
+        self.hover = None;
+        self.hover_close = None;
+        cx.repaint();
+    }
+
     /// Closes every tab but `keep`, stopping if an unsaved prompt is
     /// cancelled.
     pub fn close_tabs_except(&mut self, keep: Option<usize>, cx: &mut Cx) {
@@ -150,12 +236,21 @@ impl EditorArea {
             return;
         }
         let caret = doc.caret_rect(cx.text);
+        let directive = doc.is_directive(start);
         for d in &mut self.docs {
-            d.words();
+            d.update_words();
         }
-        let sets = self.docs.iter_mut().map(|d| d.words());
-        let items = complete::candidates(&prefix, code, sets);
+        let own = || self.docs.iter().filter_map(Document::own_words);
+        let included = || self.docs.iter().map(Document::included_words);
+        let items = if directive {
+            complete::directives(&prefix)
+        } else {
+            complete::candidates(&prefix, code, own(), included())
+        };
         self.completion = Completion::new(items, start, caret, self.body, cx.text);
+        if let Some(c) = &mut self.completion {
+            c.enter_makes_newline = complete::is_complete(&prefix, own().chain(included()));
+        }
     }
 
     fn accept_completion(&mut self, cx: &mut Cx) {
@@ -173,6 +268,13 @@ impl EditorArea {
         match *e {
             Event::KeyDown { key: Key::Up, .. } => c.move_by(-1),
             Event::KeyDown { key: Key::Down, .. } => c.move_by(1),
+            Event::KeyDown {
+                key: Key::Enter, ..
+            } if c.enter_makes_newline => {
+                self.completion = None;
+                cx.repaint();
+                return false;
+            }
             Event::KeyDown {
                 key: Key::Tab | Key::Enter,
                 mods,
@@ -300,6 +402,16 @@ impl EditorArea {
             .position(|h| h.tab.contains(p))
             .map(|i| (i, self.hits[i].close.contains(p)))
     }
+}
+
+/// Where `path` is now that `from` is called `to`, if it was affected.
+fn moved_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(from).ok()?;
+    Some(if rest.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(rest)
+    })
 }
 
 /// Asks to save a dirty document. `false` means cancel.
@@ -566,5 +678,194 @@ impl Panel for EditorArea {
             _ => {}
         }
         handled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::Modifiers;
+    use crate::sys::text::TextSystem;
+    use crate::sys::NativeWindow;
+
+    /// An editor on one file, driven by the events the window would send.
+    struct Harness {
+        area: EditorArea,
+        text: TextSystem,
+    }
+
+    impl Harness {
+        fn new(name: &str, content: &str) -> Self {
+            let text = TextSystem::new().expect("DirectWrite");
+            let mut area = EditorArea::default();
+            area.docs
+                .push(Document::from_text(Path::new(name), content, false));
+            area.layout(RectF::new(0.0, 0.0, 800.0, 600.0), &text);
+            Self { area, text }
+        }
+
+        fn send(&mut self, e: Event) {
+            let mut cx = Cx::new(&self.text, NativeWindow::none());
+            self.area.on_event(&e, &mut cx);
+        }
+
+        fn key(&mut self, key: Key, mods: Modifiers) {
+            self.send(Event::KeyDown { key, mods });
+        }
+
+        /// A key press and the character it types, as Windows sends them.
+        fn type_text(&mut self, s: &str) {
+            for c in s.chars() {
+                if c == '\n' {
+                    self.key(Key::Enter, Modifiers::NONE);
+                    continue;
+                }
+                if c.is_ascii_alphabetic() {
+                    let key = Key::Letter(c.to_ascii_uppercase());
+                    self.key(key, Modifiers::NONE);
+                }
+                self.send(Event::Char(c));
+            }
+        }
+
+        fn items(&self) -> Vec<&str> {
+            self.area
+                .completion
+                .iter()
+                .flat_map(|c| c.items())
+                .map(String::as_str)
+                .collect()
+        }
+
+        fn doc(&self) -> String {
+            self.area.docs[0].text_for_test()
+        }
+    }
+
+    #[test]
+    fn typing_offers_your_words_and_tab_takes_one() {
+        let mut h = Harness::new("a.cpp", "");
+        h.type_text("int counter;\nco");
+        assert_eq!(h.items()[0], "counter", "{:?}", h.items());
+        h.type_text("u");
+        assert_eq!(h.items(), ["counter"], "narrowed");
+        h.key(Key::Tab, Modifiers::NONE);
+        assert!(h.area.completion.is_none());
+        assert_eq!(h.doc(), "int counter;\ncounter");
+    }
+
+    #[test]
+    fn enter_after_a_whole_word_starts_a_new_line() {
+        let mut h = Harness::new("a.cpp", "");
+        h.type_text("do");
+        assert!(h.items().contains(&"double"));
+        h.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(h.doc(), "do\n", "not double");
+        assert!(h.area.completion.is_none());
+
+        // A word declared earlier counts as whole too.
+        let mut h = Harness::new("a.cpp", "int count, counter;\n");
+        h.key(Key::End, Modifiers::CTRL);
+        h.type_text("count");
+        assert_eq!(h.items(), ["counter"]);
+        h.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(h.doc(), "int count, counter;\ncount\n");
+
+        // But Enter takes a suggestion for a word that is only partly typed.
+        let mut h = Harness::new("a.cpp", "int counter;\n");
+        h.key(Key::End, Modifiers::CTRL);
+        h.type_text("cou");
+        h.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(h.doc(), "int counter;\ncounter");
+    }
+
+    #[test]
+    fn a_half_typed_word_is_not_offered_back() {
+        let mut h = Harness::new("a.cpp", "");
+        h.type_text("zebra zeb");
+        h.key(Key::Backspace, Modifiers::NONE);
+        assert_eq!(h.items(), ["zebra"], "not `zeb`, just deleted");
+        // Forcing the list on one letter, the unfinished word still isn't there.
+        h.key(Key::Backspace, Modifiers::NONE);
+        h.key(Key::Space, Modifiers::CTRL);
+        assert_eq!(h.items(), ["zebra"]);
+    }
+
+    #[test]
+    fn accepting_inside_a_word_replaces_all_of_it() {
+        let mut h = Harness::new("a.cpp", "format fobar");
+        // Caret inside the second word: fo|bar.
+        for _ in 0..9 {
+            h.key(Key::Right, Modifiers::NONE);
+        }
+        h.key(Key::Space, Modifiers::CTRL);
+        let at = h.items().iter().position(|w| *w == "format").unwrap() as isize;
+        h.area.completion.as_mut().unwrap().move_by(at);
+        h.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(h.doc(), "format format");
+    }
+
+    #[test]
+    fn nothing_offered_in_comments_strings_or_from_them() {
+        let mut h = Harness::new("a.cpp", "// secretword\n");
+        h.key(Key::End, Modifiers::CTRL);
+        h.type_text("sec");
+        assert!(!h.items().contains(&"secretword"), "{:?}", h.items());
+        h.type_text("\n// co");
+        assert!(h.area.completion.is_none(), "in a comment");
+        h.type_text("\ns = \"co");
+        assert!(h.area.completion.is_none(), "in a string");
+    }
+
+    #[test]
+    fn directives_complete_after_a_hash() {
+        let mut h = Harness::new("a.cpp", "");
+        h.type_text("#inc");
+        assert_eq!(h.items(), ["include"]);
+        h.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(h.doc(), "#include");
+    }
+
+    #[test]
+    fn keys_drive_the_list() {
+        let mut h = Harness::new("a.cpp", "zzalpha zzalps zzalto\n");
+        h.key(Key::End, Modifiers::CTRL);
+        h.type_text("zz");
+        assert_eq!(h.items(), ["zzalpha", "zzalps", "zzalto"]);
+        h.key(Key::Down, Modifiers::NONE);
+        h.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(h.doc(), "zzalpha zzalps zzalto\nzzalps");
+
+        h.type_text(" zz");
+        h.key(Key::Up, Modifiers::NONE);
+        let selected = h.area.completion.as_ref().unwrap().selected_word();
+        assert_eq!(selected, "zzalto", "wraps to the last");
+        h.key(Key::Escape, Modifiers::NONE);
+        assert!(h.area.completion.is_none());
+        assert_eq!(
+            h.doc(),
+            "zzalpha zzalps zzalto\nzzalps zz",
+            "Esc types nothing"
+        );
+
+        // Other kinds of file only complete on request.
+        let mut h = Harness::new("notes.txt", "apple ");
+        h.key(Key::End, Modifiers::CTRL);
+        h.type_text("ap");
+        assert!(h.area.completion.is_none());
+        h.key(Key::Space, Modifiers::CTRL);
+        assert_eq!(h.items(), ["apple"]);
+    }
+
+    #[test]
+    fn open_files_follow_a_rename() {
+        let (from, to) = (Path::new(r"C:\p\old"), Path::new(r"C:\p\new"));
+        assert_eq!(moved_path(from, from, to).unwrap(), to);
+        assert_eq!(
+            moved_path(Path::new(r"C:\p\old\a\b.c"), from, to).unwrap(),
+            Path::new(r"C:\p\new\a\b.c")
+        );
+        // `old2` is not inside `old`.
+        assert_eq!(moved_path(Path::new(r"C:\p\old2\b.c"), from, to), None);
     }
 }

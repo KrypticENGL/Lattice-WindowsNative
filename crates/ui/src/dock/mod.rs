@@ -103,6 +103,11 @@ impl DockArea {
         }
     }
 
+    /// The panel with the keyboard.
+    pub fn focused(&self) -> Option<PaneId> {
+        self.focus
+    }
+
     pub fn contains(&self, pane: PaneId) -> bool {
         self.tree.contains(pane)
     }

@@ -4,8 +4,8 @@
 //! are tinted by the field they belong to, so a struct's layout reads at a
 //! glance. Bytes that changed since the previous stop are lit.
 //!
-//! Opened from the "View in memory" hover card on a variable in the Data
-//! view, the call graph or the source; it follows its target from stop to
+//! Opened from "View in memory" on a row of the Variables panel or a hover
+//! card in the source; it follows its target from stop to
 //! stop. It needs a snapshot, so the program must have run (or stopped)
 //! under the debugger at least once.
 
@@ -34,30 +34,11 @@ const ROW_BYTES: usize = 4;
 /// What the user asked to see.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemTarget {
-    /// A Data view slot: `key` is an object id or `frame:N`.
-    Slot {
-        key: String,
-        name: String,
-    },
+    /// A Variables row: `key` is an object id or `frame:N`.
+    Slot { key: String, name: String },
     /// `a`, `a.b` or `p->next->key` in `file`, read in the innermost frame
     /// stopped in that file.
-    Expr {
-        file: PathBuf,
-        path: Vec<String>,
-    },
-    /// Call graph: a data member, in every live object of its class.
-    Field {
-        class: String,
-        name: String,
-    },
-    /// Call graph: a parameter or local, in every frame of its function.
-    Local {
-        func: String,
-        name: String,
-    },
-    Global {
-        name: String,
-    },
+    Expr { file: PathBuf, path: Vec<String> },
 }
 
 /// One variable or object to show.
@@ -102,44 +83,13 @@ impl Region {
     }
 }
 
-/// Everything `t` names in `snap`; several for a class's fields or a
-/// recursive function's locals, none when it is not live.
+/// Everything `t` names in `snap`; none when it is not live.
+// shortcut: at most one region since the call graph lost View in memory, so
+// the panel's picker never shows; drop `pick` and the nav if that stays so.
 pub fn resolve(snap: &Snapshot, t: &MemTarget) -> Vec<Region> {
     match t {
         MemTarget::Slot { key, name } => slot(snap, key, name).into_iter().collect(),
         MemTarget::Expr { file, path } => expr(snap, file, path).into_iter().collect(),
-        MemTarget::Field { class, name } => {
-            let objects = snap
-                .objects
-                .iter()
-                .filter(|(_, o)| same_type(&o.ty, class))
-                .filter_map(|(k, _)| object_region(snap, k, None, Some(name)));
-            let globals = snap
-                .globals
-                .iter()
-                .filter(|g| same_type(&g.ty, class))
-                .map(|g| focused(var_region(snap, g, g.name.clone()), name));
-            let mut all: Vec<Region> = objects.chain(globals).collect();
-            all.sort_by_key(|r| r.addr);
-            all
-        }
-        MemTarget::Local { func, name } => snap
-            .frames
-            .iter()
-            .rev()
-            .filter(|f| same_func(&f.func, func))
-            .filter_map(|f| {
-                let v = f.vars.iter().find(|v| v.name == *name)?;
-                let title = format!("{name} in {} (line {})", f.func, f.line);
-                Some(var_region(snap, v, title))
-            })
-            .collect(),
-        MemTarget::Global { name } => snap
-            .globals
-            .iter()
-            .filter(|g| same_func(&g.name, name))
-            .map(|g| var_region(snap, g, g.name.clone()))
-            .collect(),
     }
 }
 
@@ -342,29 +292,6 @@ fn cell_text(c: &Cell) -> &str {
 
 fn parse_addr(s: &str) -> Option<u64> {
     u64::from_str_radix(s.strip_prefix("0x")?, 16).ok()
-}
-
-/// `const struct ns::Node` and `Node` name the same class.
-fn same_type(a: &str, b: &str) -> bool {
-    fn bare(s: &str) -> &str {
-        let mut s = s.trim();
-        for p in ["const ", "volatile ", "struct ", "class ", "union "] {
-            s = s.strip_prefix(p).unwrap_or(s);
-        }
-        s
-    }
-    same_qualified(bare(a), bare(b))
-}
-
-/// GDB's `Tree::insert(Node*, int)` and the graph's `insert` name the same
-/// function.
-fn same_func(a: &str, b: &str) -> bool {
-    let bare = |s: &str| s.split('(').next().unwrap_or(s).trim().to_string();
-    same_qualified(&bare(a), &bare(b))
-}
-
-fn same_qualified(a: &str, b: &str) -> bool {
-    a == b || a.ends_with(&format!("::{b}")) || b.ends_with(&format!("::{a}"))
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -644,8 +571,13 @@ impl Memory {
         let msg_at = RectF::new(body.x + PAD, body.y + 6.0, body.w - 2.0 * PAD, 22.0);
         let (Some(region), Some(g)) = (self.region(), self.geo()) else {
             let msg = match (&self.snap, &self.target) {
-                (None, _) => "Run the program once (Visualizer \u{2192} Data \u{2192} Run) to see its memory.".to_string(),
-                (Some(_), None) => "Hover a variable in the Data view, call graph or source and choose View in memory.".to_string(),
+                (None, _) => {
+                    "Run the program once (Debugger \u{2192} Run) to see its memory.".to_string()
+                }
+                (Some(_), None) => {
+                    "Right-click a variable in Variables, or hover one in the source, and choose View in memory."
+                        .to_string()
+                }
                 (Some(_), Some(t)) => format!("{} is not live at this stop.", target_label(t)),
             };
             d.text(TextStyle::Ui, &msg, msg_at, theme.text_dim);
@@ -855,10 +787,8 @@ impl Memory {
 
 fn target_label(t: &MemTarget) -> String {
     match t {
-        MemTarget::Slot { name, .. } | MemTarget::Global { name } => name.clone(),
+        MemTarget::Slot { name, .. } => name.clone(),
         MemTarget::Expr { path, .. } => path.join("."),
-        MemTarget::Field { class, name } => format!("No {class} (for {name})"),
-        MemTarget::Local { func, name } => format!("{name} in {func}"),
     }
 }
 
@@ -1010,57 +940,15 @@ mod tests {
     }
 
     #[test]
-    fn graph_targets_find_every_instance() {
-        let s = snap();
-        let nodes = resolve(
-            &s,
-            &MemTarget::Field {
-                class: "ns::Node".into(),
-                name: "key".into(),
-            },
-        );
-        let addrs: Vec<_> = nodes.iter().map(|r| r.addr).collect();
-        assert_eq!(addrs, [Some(0xa0), Some(0xc0)]);
-        assert!(nodes.iter().all(|r| r.focus == Some(0)));
-        // A by-value global of the class counts too.
-        let points = resolve(
-            &s,
-            &MemTarget::Field {
-                class: "Point".into(),
-                name: "y".into(),
-            },
-        );
-        assert_eq!(points.len(), 2);
-        // Both recursive frames of `insert`, innermost first.
-        let ks = resolve(
-            &s,
-            &MemTarget::Local {
-                func: "insert".into(),
-                name: "k".into(),
-            },
-        );
-        let bytes: Vec<u8> = ks.iter().map(|r| r.bytes[0]).collect();
-        assert_eq!(bytes, [7, 5]);
-        let g = resolve(
-            &s,
-            &MemTarget::Global {
-                name: "origin".into(),
-            },
-        );
-        assert_eq!(g[0].addr, Some(0x400));
-    }
-
-    #[test]
     fn card_needs_a_run_and_a_live_target() {
-        let t = MemTarget::Global {
-            name: "origin".into(),
+        let ex = |name: &str| MemTarget::Expr {
+            file: PathBuf::from(r"C:\src\t.cpp"),
+            path: vec![name.to_string()],
         };
+        let t = ex("origin");
         assert!(card_label(None, &t).is_err());
         assert_eq!(card_label(Some(&snap()), &t), Ok("View in memory"));
-        let gone = MemTarget::Global {
-            name: "gone".into(),
-        };
-        assert!(card_label(Some(&snap()), &gone).is_err());
+        assert!(card_label(Some(&snap()), &ex("gone")).is_err());
     }
 
     #[test]
@@ -1091,16 +979,16 @@ mod tests {
     fn following_a_target_across_stops() {
         let mut m = Memory::default();
         assert!(m.region().is_none());
-        m.show(MemTarget::Field {
-            class: "Node".into(),
-            name: "key".into(),
+        m.show(MemTarget::Expr {
+            file: PathBuf::from(r"C:\src\t.cpp"),
+            path: vec!["origin".to_string()],
         });
         let s = Arc::new(snap());
         m.set_snapshot(s.clone());
-        m.pick = 1;
-        // The next stop keeps the picked instance and remembers its bytes.
+        // The next stop keeps the target and remembers its bytes.
         m.set_snapshot(s);
-        assert_eq!(m.region().and_then(|r| r.addr), Some(0xc0));
-        assert_eq!(m.previous.get(&0xc0), Some(&vec![0x46]));
+        let addr = m.region().and_then(|r| r.addr);
+        assert_eq!(addr, Some(0x400));
+        assert!(m.previous.contains_key(&0x400));
     }
 }

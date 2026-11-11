@@ -1,5 +1,5 @@
-//! The "View in memory" card that appears under a hovered variable (Data
-//! view slot, call graph field or variable, identifier in the source). It
+//! The "View in memory" card that appears under a hovered identifier in the
+//! source. It
 //! stays while the pointer is over the variable, the card or the gap
 //! between them, so it can be reached and clicked. When memory cannot be
 //! shown yet (no run, or not live at this stop) it says why instead.
@@ -158,7 +158,10 @@ mod tests {
 
     fn card(anchor: RectF, card: RectF) -> HoverCard {
         HoverCard {
-            target: MemTarget::Global { name: "g".into() },
+            target: MemTarget::Slot {
+                key: "k".into(),
+                name: "g".into(),
+            },
             anchor,
             card,
             label: String::new(),

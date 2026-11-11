@@ -1,7 +1,9 @@
 //! Building the open folder with MinGW gcc/g++ on a background thread.
-//! Each C/C++ source compiles (with `-g`, for the debugger) to
-//! `debug\<its path>.o`, a cache: sources older than their object are not
-//! recompiled. The objects then link into `target\<folder name>.exe`.
+//! Each C/C++ source compiles to `debug\<its path>.o`, a cache: sources older
+//! than their object are not recompiled. The objects then link into
+//! `target\<folder name>.exe`. The flags come from the folder's
+//! `.lattice\build.conf` (see [`Options`]), which defaults to debuggable
+//! `-g -O0`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -88,6 +90,119 @@ impl Builder {
     }
 }
 
+/// Where a folder keeps its compiler options.
+pub fn options_path(root: &Path) -> PathBuf {
+    root.join(".lattice").join("build.conf")
+}
+
+const DEFAULT_OPTIONS: &str = "\
+# Compiler options for this folder, read at every build. Passed to gcc and g++
+# as written; use \"double quotes\" around anything with spaces. Changing them
+# recompiles everything.
+#
+# The debugger needs -g, and works best with -O0.
+
+# C files (gcc).
+cflags = -g -O0
+# C++ files (g++), e.g. -std=c++20 -Wall -I\"C:\\my libs\\include\" -DDEBUG
+cxxflags = -g -O0
+# Linking (g++), after the objects, e.g. -static -lws2_32
+ldflags = -g
+";
+
+/// Flags for gcc, g++ and the link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Options {
+    cflags: Vec<String>,
+    cxxflags: Vec<String>,
+    ldflags: Vec<String>,
+}
+
+impl Options {
+    /// Reads `key = flags` lines. A mistake is an error, not a build with
+    /// flags the user did not mean.
+    fn parse(text: &str) -> Result<Self, String> {
+        let mut o = Self {
+            cflags: Vec::new(),
+            cxxflags: Vec::new(),
+            ldflags: Vec::new(),
+        };
+        for (i, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let at = |what: String| format!("line {}: {what}", i + 1);
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| at("expected `name = flags`".into()))?;
+            let flags = split_flags(value).map_err(at)?;
+            match key.trim() {
+                "cflags" => o.cflags = flags,
+                "cxxflags" => o.cxxflags = flags,
+                "ldflags" => o.ldflags = flags,
+                k => return Err(at(format!("unknown option `{k}`"))),
+            }
+        }
+        Ok(o)
+    }
+
+    /// The folder's options, or the defaults if it has none.
+    fn load(root: &Path) -> Result<Self, String> {
+        let path = options_path(root);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_OPTIONS.to_string(),
+            Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+        };
+        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+}
+
+/// Splits on whitespace; double quotes keep spaces, and backslashes stay
+/// literal so Windows paths need no escaping.
+fn split_flags(s: &str) -> Result<Vec<String>, String> {
+    let mut flags = Vec::new();
+    let mut current: Option<String> = None;
+    let mut quoted = false;
+    for c in s.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                current.get_or_insert_with(String::new);
+            }
+            c if c.is_whitespace() && !quoted => flags.extend(current.take()),
+            c => current.get_or_insert_with(String::new).push(c),
+        }
+    }
+    if quoted {
+        return Err("unclosed quote".into());
+    }
+    flags.extend(current);
+    Ok(flags)
+}
+
+/// Makes sure the folder has an options file to edit, never replacing one.
+pub fn ensure_options_file(root: &Path) -> std::io::Result<PathBuf> {
+    let path = options_path(root);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(DEFAULT_OPTIONS.as_bytes())?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    Ok(path)
+}
+
 fn is_source(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     [".c", ".cc", ".cpp", ".cxx"]
@@ -129,6 +244,8 @@ fn build(root: &Path, log: &dyn Fn(bool, String)) -> Result<PathBuf, String> {
     if sources.is_empty() {
         return Err(format!("no C or C++ sources under {}", root.display()));
     }
+    let options = Options::load(root)?;
+    let conf = options_path(root);
     let tool = |name| {
         debugger::find_tool(name)
             .ok_or_else(|| format!("{name} not found: install MinGW-w64 or put it on PATH"))
@@ -140,27 +257,35 @@ fn build(root: &Path, log: &dyn Fn(bool, String)) -> Result<PathBuf, String> {
         None
     };
     log(false, format!("Building {}…", root.display()));
+    let has_debug_info = |flags: &[String]| flags.iter().any(|f| f.starts_with("-g"));
+    if !has_debug_info(&options.cflags) && gcc.is_some()
+        || !has_debug_info(&options.cxxflags) && sources.iter().any(|s| !is_c(s))
+    {
+        log(
+            false,
+            "Note: compiling without -g, so the debugger cannot show lines or variables".into(),
+        );
+    }
 
     let mut objects = Vec::with_capacity(sources.len());
     let mut failed = 0;
     for source in &sources {
         let object = object_for(root, source);
-        if !up_to_date(source, &object) {
+        // shortcut: deleting the options file does not recompile; touch a
+        // source or delete `debug` if the defaults must take over.
+        if !up_to_date(source, &object) || (conf.is_file() && !up_to_date(&conf, &object)) {
             let rel = source.strip_prefix(root).unwrap_or(source);
             log(false, format!("Compiling {}", rel.display()));
             if let Some(dir) = object.parent() {
                 std::fs::create_dir_all(dir)
                     .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
             }
-            let cc = match &gcc {
-                Some(gcc) if is_c(source) => gcc,
-                _ => &gxx,
+            let (cc, flags) = match &gcc {
+                Some(gcc) if is_c(source) => (gcc, &options.cflags),
+                _ => (&gxx, &options.cxxflags),
             };
             let mut cmd = Command::new(cc);
-            cmd.args(["-g", "-O0", "-c"])
-                .arg(source)
-                .arg("-o")
-                .arg(&object);
+            cmd.args(flags).arg("-c").arg(source).arg("-o").arg(&object);
             if !run(cmd, log)? {
                 // Drop a half-written object so the next build retries it.
                 let _ = std::fs::remove_file(&object);
@@ -184,7 +309,11 @@ fn build(root: &Path, log: &dyn Fn(bool, String)) -> Result<PathBuf, String> {
     log(false, format!("Linking {}", exe.display()));
     // g++ links C objects too, and brings the C++ runtime when needed.
     let mut cmd = Command::new(&gxx);
-    cmd.arg("-g").args(&objects).arg("-o").arg(&exe);
+    // After the objects, where `-l` libraries must come.
+    cmd.args(&objects)
+        .arg("-o")
+        .arg(&exe)
+        .args(&options.ldflags);
     if !run(cmd, log)? {
         return Err("link failed".into());
     }
@@ -208,14 +337,14 @@ fn run(mut cmd: Command, log: &dyn Fn(bool, String)) -> Result<bool, String> {
 }
 
 #[cfg(windows)]
-fn no_console_window(cmd: &mut Command) {
+pub(crate) fn no_console_window(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(windows))]
-fn no_console_window(_: &mut Command) {}
+pub(crate) fn no_console_window(_: &mut Command) {}
 
 #[cfg(test)]
 mod tests {
@@ -234,6 +363,94 @@ mod tests {
         );
         assert!(is_source("A.CPP") && is_source("x.c") && !is_source("x.h"));
         assert!(!is_source("main.cpp.o"));
+    }
+
+    #[test]
+    fn flags_split_like_a_command_line() {
+        assert_eq!(split_flags("  -g   -O0 ").unwrap(), ["-g", "-O0"]);
+        assert_eq!(
+            split_flags(r#"-I"C:\my libs\inc" "-DA=b c" -DX="""#).unwrap(),
+            [r"-IC:\my libs\inc", "-DA=b c", "-DX="]
+        );
+        assert!(split_flags("").unwrap().is_empty());
+        assert_eq!(split_flags(r#""""#).unwrap(), [""]);
+        assert!(split_flags(r#"-I"oops"#).is_err());
+    }
+
+    #[test]
+    fn options_parse_and_reject_mistakes() {
+        let o = Options::parse(DEFAULT_OPTIONS).unwrap();
+        assert_eq!(o.cflags, ["-g", "-O0"]);
+        assert_eq!(o.cxxflags, ["-g", "-O0"]);
+        assert_eq!(o.ldflags, ["-g"]);
+
+        // A value may hold `=`; a name not given stays empty.
+        let o = Options::parse("# c\n\n cxxflags = -std=c++20 -DA=1\n").unwrap();
+        assert_eq!(o.cxxflags, ["-std=c++20", "-DA=1"]);
+        assert!(o.cflags.is_empty());
+
+        assert_eq!(
+            Options::parse("\nnope").unwrap_err(),
+            "line 2: expected `name = flags`"
+        );
+        assert_eq!(
+            Options::parse("cxflags = -g").unwrap_err(),
+            "line 1: unknown option `cxflags`"
+        );
+        assert_eq!(
+            Options::parse("cflags = \"x").unwrap_err(),
+            "line 1: unclosed quote"
+        );
+    }
+
+    #[test]
+    fn the_options_file_is_written_once_and_never_replaced() {
+        let root = std::env::temp_dir().join(format!("lattice-opts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(Options::load(&root).unwrap().ldflags, ["-g"], "defaults");
+
+        let path = ensure_options_file(&root).unwrap();
+        assert_eq!(path, options_path(&root));
+        std::fs::write(&path, "ldflags = -static\n").unwrap();
+        ensure_options_file(&root).unwrap();
+        assert_eq!(Options::load(&root).unwrap().ldflags, ["-static"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Flags reach the compiler, and changing them recompiles.
+    #[test]
+    fn options_change_the_build() {
+        if debugger::find_tool("g++").is_none() {
+            eprintln!("skipped: no MinGW g++");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("lattice-flags-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".lattice")).unwrap();
+        std::fs::write(root.join("main.cpp"), "int main() { return ANSWER; }\n").unwrap();
+        let write = |n: u32| {
+            std::fs::write(options_path(&root), format!("cxxflags = -g -DANSWER={n}\n")).unwrap();
+        };
+        let lines = std::cell::RefCell::new(Vec::new());
+        let log = |_: bool, t: String| lines.borrow_mut().push(t);
+        let run = |exe: &Path| Command::new(exe).status().unwrap().code();
+
+        write(3);
+        let exe = build(&root, &log).unwrap_or_else(|e| panic!("{e}: {:?}", lines.borrow()));
+        assert_eq!(run(&exe), Some(3));
+        write(4);
+        let exe = build(&root, &log).unwrap_or_else(|e| panic!("{e}: {:?}", lines.borrow()));
+        assert_eq!(
+            run(&exe),
+            Some(4),
+            "new flags must recompile: {:?}",
+            lines.borrow()
+        );
+
+        std::fs::write(options_path(&root), "bad line\n").unwrap();
+        assert!(build(&root, &log).unwrap_err().contains("line 1"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Builds a mixed C/C++ folder twice; the second build reuses the cache.

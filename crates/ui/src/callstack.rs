@@ -1,16 +1,17 @@
-//! The call stack beside the Data canvas: the stopped program's frames,
-//! innermost first, rebuilt at every stop. Clicking a frame focuses and
-//! centres its box on the canvas; double-clicking opens its source.
+//! The call stack: the stopped program's frames, innermost first, rebuilt at
+//! every stop. Clicking a frame selects it, so the source and Variables
+//! follow; double-clicking opens its source in the editor.
 
 use debugger::{Cell, Frame};
 
+use crate::debugview::open_frame_source;
 use crate::event::{Event, MouseButton};
 use crate::geom::{PointF, RectF};
 use crate::panel::{Action, Cx, Panel};
 use crate::sys::gfx::DrawCtx;
 use crate::sys::text::{TextStyle, TextSystem};
 use crate::theme::Theme;
-use crate::visualizer::{open_frame_source, rgba};
+use crate::visualizer::rgba;
 
 const HEADER_H: f32 = 30.0;
 const ROW_H: f32 = 40.0;
@@ -23,7 +24,7 @@ const STALE: f32 = 0.55;
 /// What a click in the call stack asks the host to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StackAction {
-    /// Focus and centre the box of `snapshot.frames[i]`.
+    /// Select `snapshot.frames[i]`.
     Reveal(usize),
     /// Open a frame's source at the line.
     Open(String, u32),
@@ -50,7 +51,7 @@ pub struct CallStack {
     rows: Vec<Row>,
     scroll: f32,
     hover: Option<usize>,
-    /// The frame focused on the canvas.
+    /// The frame selected.
     selected: Option<usize>,
     /// The program is running: the stack is from the last stop.
     stale: bool,

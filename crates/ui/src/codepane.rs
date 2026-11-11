@@ -1,4 +1,4 @@
-//! The source pane in the Data mode's debug column: the file of the frame
+//! The source pane in the Debugger tab: the file of the frame
 //! shown in the call stack, scrolled to the line it is stopped at. The
 //! innermost frame's line is marked like the editor's (lime chevron and
 //! tint); a caller's line, its call site, gets a fainter tint.
