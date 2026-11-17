@@ -52,6 +52,10 @@ pub enum Action {
     },
     /// Press a key in the focused panel (menu rows reuse its shortcuts).
     Key(Key, Modifiers),
+    /// Open the editor's Find or Find/Replace bar.
+    Find(bool),
+    /// Open the editor's Go to Line prompt.
+    GoToLine,
     CopyText(String),
     /// Show a file or folder in Windows File Explorer.
     Reveal(PathBuf),

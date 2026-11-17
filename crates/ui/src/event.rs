@@ -65,6 +65,8 @@ pub enum Key {
     Digit(u8),
     /// The key left of `1` (backtick on US layouts).
     Backquote,
+    /// The slash key (layout-dependent position).
+    Slash,
     Space,
     Other,
 }

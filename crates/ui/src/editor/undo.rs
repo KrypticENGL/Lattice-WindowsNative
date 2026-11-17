@@ -1,5 +1,7 @@
 //! Undo/redo as groups of reversible edits, with typing coalesced.
 
+use std::collections::VecDeque;
+
 use super::buffer::{end_after, Buffer, Pos};
 
 /// Replacement of `removed` by `inserted` at `start`.
@@ -43,35 +45,74 @@ struct Group {
     after: Selection,
 }
 
+impl Group {
+    /// Bytes of text this group retains.
+    fn size(&self) -> usize {
+        self.edit.removed.len() + self.edit.inserted.len()
+    }
+}
+
+/// Most edit groups kept; the oldest are dropped past this.
+const MAX_GROUPS: usize = 1_000;
+/// Most removed + inserted text kept across the history, in bytes.
+const MAX_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Default)]
 pub struct UndoStack {
-    undo: Vec<Group>,
+    undo: VecDeque<Group>,
     redo: Vec<Group>,
     next_id: u64,
     sealed: bool,
+    /// Text bytes held by `undo` and `redo` together.
+    bytes: usize,
+    /// Id of the newest group dropped for the limits (0 if none): the state
+    /// reached by undoing everything that is left, which is not the
+    /// original state once anything was dropped.
+    base_id: u64,
 }
 
 impl UndoStack {
     /// Records an edit already applied to the buffer.
     pub fn record(&mut self, edit: Edit, kind: EditKind, before: Selection, after: Selection) {
+        // A new edit abandons the redo branch.
+        self.bytes -= self.redo.iter().map(Group::size).sum::<usize>();
         self.redo.clear();
         if !self.sealed {
-            if let Some(last) = self.undo.last_mut() {
-                if last.kind == kind && merge(&mut last.edit, &edit, kind) {
-                    last.after = after;
-                    return;
+            if let Some(last) = self.undo.back_mut() {
+                if last.kind == kind {
+                    let old = last.size();
+                    if merge(&mut last.edit, &edit, kind) {
+                        last.after = after;
+                        self.bytes = self.bytes - old + last.size();
+                        self.trim();
+                        return;
+                    }
                 }
             }
         }
         self.sealed = false;
         self.next_id += 1;
-        self.undo.push(Group {
+        let group = Group {
             id: self.next_id,
             kind,
             edit,
             before,
             after,
-        });
+        };
+        self.bytes += group.size();
+        self.undo.push_back(group);
+        self.trim();
+    }
+
+    /// Drops the oldest groups until the limits hold, always keeping the
+    /// newest one however large.
+    fn trim(&mut self) {
+        while self.undo.len() > 1 && (self.undo.len() > MAX_GROUPS || self.bytes > MAX_BYTES) {
+            if let Some(old) = self.undo.pop_front() {
+                self.bytes -= old.size();
+                self.base_id = old.id;
+            }
+        }
     }
 
     /// Stops the next edit from merging into the current group.
@@ -81,11 +122,19 @@ impl UndoStack {
 
     /// Identifies the current state; equal ids mean equal text.
     pub fn state_id(&self) -> u64 {
-        self.undo.last().map_or(0, |g| g.id)
+        self.undo.back().map_or(self.base_id, |g| g.id)
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
     }
 
     pub fn undo(&mut self, buf: &mut Buffer) -> Option<Selection> {
-        let group = self.undo.pop()?;
+        let group = self.undo.pop_back()?;
         group.edit.revert(buf);
         let sel = group.before;
         self.redo.push(group);
@@ -97,7 +146,7 @@ impl UndoStack {
         let group = self.redo.pop()?;
         group.edit.apply(buf);
         let sel = group.after;
-        self.undo.push(group);
+        self.undo.push_back(group);
         self.sealed = true;
         Some(sel)
     }

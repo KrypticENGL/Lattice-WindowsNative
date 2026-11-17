@@ -33,6 +33,37 @@ struct TabHit {
     close: RectF,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindField {
+    Query,
+    Replacement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindMode {
+    Find,
+    GoToLine,
+}
+
+struct FindBar {
+    query: String,
+    query_cursor: usize,
+    replacement: String,
+    replacement_cursor: usize,
+    replace_mode: bool,
+    mode: FindMode,
+    field: FindField,
+}
+
+impl FindBar {
+    fn active_value_mut(&mut self) -> (&mut String, &mut usize) {
+        match self.field {
+            FindField::Query => (&mut self.query, &mut self.query_cursor),
+            FindField::Replacement => (&mut self.replacement, &mut self.replacement_cursor),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct EditorArea {
     docs: Vec<Document>,
@@ -48,6 +79,8 @@ pub struct EditorArea {
     card: Option<HoverCard>,
     /// The open completion list.
     completion: Option<Completion>,
+    /// Find and replace bar layered over the editor.
+    find_bar: Option<FindBar>,
 }
 
 impl EditorArea {
@@ -57,6 +90,396 @@ impl EditorArea {
 
     pub fn has_documents(&self) -> bool {
         !self.docs.is_empty()
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.docs.get(self.active).is_some_and(Document::can_undo)
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.docs.get(self.active).is_some_and(Document::can_redo)
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.docs
+            .get(self.active)
+            .is_some_and(Document::has_selection)
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.docs
+            .get(self.active)
+            .is_some_and(Document::is_read_only)
+    }
+
+    /// Runs an editor command against its active document, including when a
+    /// menu rather than the editor surface supplied the command.
+    pub fn command(&mut self, key: Key, mods: crate::event::Modifiers, cx: &mut Cx) -> bool {
+        self.completion = None;
+        self.docs
+            .get_mut(self.active)
+            .is_some_and(|doc| doc.on_key(key, mods, cx))
+    }
+
+    pub fn open_find(&mut self, replace_mode: bool, cx: &mut Cx) {
+        let Some(doc) = self.docs.get(self.active) else {
+            cx.log("Open a file first to search it");
+            return;
+        };
+        let selected = doc.selected_text();
+        let find = self.find_bar.get_or_insert_with(|| FindBar {
+            query: String::new(),
+            query_cursor: 0,
+            replacement: String::new(),
+            replacement_cursor: 0,
+            replace_mode,
+            mode: FindMode::Find,
+            field: FindField::Query,
+        });
+        find.mode = FindMode::Find;
+        find.replace_mode = replace_mode;
+        find.field = FindField::Query;
+        if find.query.is_empty() && !selected.contains('\n') {
+            find.query = selected;
+        }
+        find.query_cursor = find.query.len();
+        self.completion = None;
+        cx.repaint();
+    }
+
+    pub fn open_goto_line(&mut self, cx: &mut Cx) {
+        let Some(doc) = self.docs.get(self.active) else {
+            cx.log("Open a file first to go to a line");
+            return;
+        };
+        let find = self.find_bar.get_or_insert_with(|| FindBar {
+            query: String::new(),
+            query_cursor: 0,
+            replacement: String::new(),
+            replacement_cursor: 0,
+            replace_mode: false,
+            mode: FindMode::GoToLine,
+            field: FindField::Query,
+        });
+        find.mode = FindMode::GoToLine;
+        find.replace_mode = false;
+        find.field = FindField::Query;
+        find.query = doc.caret_line().to_string();
+        find.query_cursor = find.query.len();
+        cx.repaint();
+    }
+
+    fn find_bar_rect(&self) -> RectF {
+        let width = (self.body.w - 16.0).clamp(0.0, 440.0);
+        let height = if self.find_bar.as_ref().is_some_and(|bar| bar.replace_mode) {
+            62.0
+        } else {
+            56.0
+        };
+        RectF::new(
+            self.body.right() - width - 8.0,
+            self.body.y + 8.0,
+            width,
+            height,
+        )
+    }
+
+    fn paint_find_bar(&self, d: &mut DrawCtx, theme: &Theme) {
+        let Some(find) = &self.find_bar else {
+            return;
+        };
+        let bar = self.find_bar_rect();
+        if bar.w < 190.0 {
+            return;
+        }
+        d.fill_round_rect(bar, 4.0, theme.panel_bg);
+        let query = RectF::new(bar.x + 6.0, bar.y + 6.0, bar.w - 12.0, 24.0);
+        let (label, value, active) = if find.field == FindField::Query {
+            (
+                if find.mode == FindMode::GoToLine {
+                    "Line"
+                } else {
+                    "Find"
+                },
+                find.query.as_str(),
+                true,
+            )
+        } else {
+            ("Find", find.query.as_str(), false)
+        };
+        self.paint_find_field(d, theme, query, label, value, active);
+        if find.replace_mode {
+            let replacement = RectF::new(bar.x + 6.0, bar.y + 32.0, bar.w - 12.0, 24.0);
+            self.paint_find_field(
+                d,
+                theme,
+                replacement,
+                "Replace",
+                &find.replacement,
+                find.field == FindField::Replacement,
+            );
+        } else {
+            d.text(
+                TextStyle::UiSmall,
+                "Enter next  ·  Shift+Enter previous  ·  Esc close",
+                RectF::new(bar.x + 10.0, bar.y + 34.0, bar.w - 20.0, 18.0),
+                theme.text_dim,
+            );
+        }
+    }
+
+    fn paint_find_field(
+        &self,
+        d: &mut DrawCtx,
+        theme: &Theme,
+        rect: RectF,
+        label: &str,
+        value: &str,
+        active: bool,
+    ) {
+        d.fill_round_rect(rect, 3.0, theme.editor_bg);
+        let edge = if active { theme.accent } else { theme.border };
+        d.fill_rect(RectF::new(rect.x, rect.y, rect.w, 1.0), edge);
+        d.fill_rect(RectF::new(rect.x, rect.bottom() - 1.0, rect.w, 1.0), edge);
+        d.fill_rect(RectF::new(rect.x, rect.y, 1.0, rect.h), edge);
+        d.fill_rect(RectF::new(rect.right() - 1.0, rect.y, 1.0, rect.h), edge);
+        let label_rect = RectF::new(rect.x + 7.0, rect.y, 54.0, rect.h);
+        let value_rect = RectF::new(rect.x + 63.0, rect.y, rect.w - 70.0, rect.h);
+        d.text(TextStyle::UiSmall, label, label_rect, theme.text_dim);
+        d.text(
+            TextStyle::UiSmall,
+            if value.is_empty() {
+                if label == "Line" {
+                    "Line number"
+                } else {
+                    "Type to search"
+                }
+            } else {
+                value
+            },
+            value_rect,
+            if value.is_empty() {
+                theme.text_dim
+            } else {
+                theme.text
+            },
+        );
+    }
+
+    fn find_bar_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
+        let bar_rect = self.find_bar_rect();
+        let Some(find) = self.find_bar.as_mut() else {
+            return false;
+        };
+        let mut search = None;
+        let mut replace_current = false;
+        let mut replace_all = false;
+        let mut go_to_line = false;
+        match *e {
+            Event::KeyDown {
+                key: Key::Escape, ..
+            } => {
+                self.find_bar = None;
+                cx.repaint();
+                return true;
+            }
+            Event::KeyDown {
+                key: Key::Enter,
+                mods,
+            } => {
+                if find.mode == FindMode::GoToLine {
+                    go_to_line = true;
+                } else if find.replace_mode && find.field == FindField::Replacement {
+                    replace_all = mods.ctrl;
+                    replace_current = !mods.ctrl;
+                } else {
+                    search = Some((mods.shift, true));
+                }
+            }
+            Event::KeyDown {
+                key: Key::Tab,
+                mods,
+            } if mods.ctrl => return false,
+            Event::KeyDown { key: Key::Tab, .. } if find.replace_mode => {
+                find.field = match find.field {
+                    FindField::Query => FindField::Replacement,
+                    FindField::Replacement => FindField::Query,
+                };
+                let (value, cursor) = find.active_value_mut();
+                *cursor = value.len();
+                cx.repaint();
+                return true;
+            }
+            Event::KeyDown { key: Key::Left, .. } => {
+                let (value, cursor) = find.active_value_mut();
+                if *cursor > 0 {
+                    *cursor = value[..*cursor]
+                        .char_indices()
+                        .next_back()
+                        .map_or(0, |(i, _)| i);
+                }
+                cx.repaint();
+                return true;
+            }
+            Event::KeyDown {
+                key: Key::Right, ..
+            } => {
+                let (value, cursor) = find.active_value_mut();
+                if *cursor < value.len() {
+                    *cursor += value[*cursor..].chars().next().map_or(0, char::len_utf8);
+                }
+                cx.repaint();
+                return true;
+            }
+            Event::KeyDown { key: Key::Home, .. } => {
+                *find.active_value_mut().1 = 0;
+                cx.repaint();
+                return true;
+            }
+            Event::KeyDown { key: Key::End, .. } => {
+                let (value, cursor) = find.active_value_mut();
+                *cursor = value.len();
+                cx.repaint();
+                return true;
+            }
+            Event::KeyDown {
+                key: Key::Backspace,
+                ..
+            } => {
+                let (value, cursor) = find.active_value_mut();
+                if *cursor > 0 {
+                    let previous = value[..*cursor]
+                        .char_indices()
+                        .next_back()
+                        .map_or(0, |(i, _)| i);
+                    value.replace_range(previous..*cursor, "");
+                    *cursor = previous;
+                }
+                if find.field == FindField::Query && find.mode == FindMode::Find {
+                    search = Some((false, false));
+                }
+            }
+            Event::KeyDown {
+                key: Key::Delete, ..
+            } => {
+                let (value, cursor) = find.active_value_mut();
+                if *cursor < value.len() {
+                    let next = *cursor + value[*cursor..].chars().next().map_or(0, char::len_utf8);
+                    value.replace_range(*cursor..next, "");
+                }
+                if find.field == FindField::Query && find.mode == FindMode::Find {
+                    search = Some((false, false));
+                }
+            }
+            Event::KeyDown {
+                key: Key::Letter('A'),
+                mods,
+            } if mods.ctrl => {
+                let (value, cursor) = find.active_value_mut();
+                value.clear();
+                *cursor = 0;
+                if find.field == FindField::Query && find.mode == FindMode::Find {
+                    search = Some((false, false));
+                }
+            }
+            Event::KeyDown {
+                key: Key::Letter('C'),
+                mods,
+            } if mods.ctrl => {
+                let (value, _) = find.active_value_mut();
+                if let Err(error) = crate::sys::clipboard::set_text(cx.window, value) {
+                    cx.log_error(format!("Copy failed: {error}"));
+                }
+            }
+            Event::KeyDown {
+                key: Key::Letter('X'),
+                mods,
+            } if mods.ctrl => {
+                let (value, cursor) = find.active_value_mut();
+                if let Err(error) = crate::sys::clipboard::set_text(cx.window, value) {
+                    cx.log_error(format!("Cut failed: {error}"));
+                } else {
+                    value.clear();
+                    *cursor = 0;
+                    if find.field == FindField::Query && find.mode == FindMode::Find {
+                        search = Some((false, false));
+                    }
+                }
+            }
+            Event::KeyDown {
+                key: Key::Letter('V'),
+                mods,
+            } if mods.ctrl => {
+                if let Some(text) = crate::sys::clipboard::get_text(cx.window) {
+                    let text = buffer::normalize_newlines(&text);
+                    let (value, cursor) = find.active_value_mut();
+                    value.insert_str(*cursor, &text);
+                    *cursor += text.len();
+                    if find.field == FindField::Query && find.mode == FindMode::Find {
+                        search = Some((false, false));
+                    }
+                }
+            }
+            Event::Char(ch) if !ch.is_control() => {
+                let (value, cursor) = find.active_value_mut();
+                value.insert(*cursor, ch);
+                *cursor += ch.len_utf8();
+                if find.field == FindField::Query && find.mode == FindMode::Find {
+                    search = Some((false, false));
+                }
+            }
+            Event::MouseDown { pos, .. } if bar_rect.contains(pos) => {
+                if find.replace_mode && pos.y >= bar_rect.y + 32.0 {
+                    find.field = FindField::Replacement;
+                } else {
+                    find.field = FindField::Query;
+                }
+                let (value, cursor) = find.active_value_mut();
+                *cursor = value.len();
+                cx.repaint();
+                return true;
+            }
+            Event::MouseUp { pos, .. } if bar_rect.contains(pos) => return true,
+            Event::MouseDown { .. } => {
+                self.find_bar = None;
+                cx.repaint();
+                return false;
+            }
+            Event::KeyDown { .. } => return true,
+            _ => return false,
+        }
+        let query = find.query.clone();
+        let replacement = find.replacement.clone();
+        if go_to_line {
+            if let (Ok(line), Some(doc)) = (query.parse::<u32>(), self.docs.get_mut(self.active)) {
+                doc.goto_line(line);
+                cx.repaint();
+            } else {
+                cx.log("Enter a valid line number");
+            }
+        } else if replace_all {
+            if let Some(doc) = self.docs.get_mut(self.active) {
+                let count = doc.replace_all(&query, &replacement, cx);
+                cx.log(format!("Replaced {count} occurrence(s)"));
+            }
+        } else if replace_current {
+            if let Some(doc) = self.docs.get_mut(self.active) {
+                doc.replace_find_match(&query, &replacement, cx);
+                if !doc.find_text(&query, false, true, cx) {
+                    cx.log(format!("No match for {query:?}"));
+                }
+            }
+        }
+        if let Some((reverse, repeat)) = search {
+            if let Some(doc) = self.docs.get_mut(self.active) {
+                let found = doc.find_text(&query, reverse, repeat, cx);
+                if repeat && !found {
+                    cx.log(format!("No match for {query:?}"));
+                }
+            }
+        }
+        cx.repaint();
+        true
     }
 
     /// Opens `path`, or activates it if already open.
@@ -549,10 +972,14 @@ impl Panel for EditorArea {
                 );
             }
         }
+        self.paint_find_bar(d, theme);
     }
 
     fn on_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
         if self.completion_event(e, cx) {
+            return true;
+        }
+        if self.find_bar_event(e, cx) {
             return true;
         }
         match *e {

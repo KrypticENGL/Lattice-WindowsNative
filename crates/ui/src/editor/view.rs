@@ -160,6 +160,19 @@ impl Document {
         self.read_only
     }
 
+    pub(super) fn selected_text(&self) -> String {
+        let (start, end) = self.selection();
+        self.buffer.text_range(start, end)
+    }
+
+    pub(super) fn can_undo(&self) -> bool {
+        self.undo.can_undo()
+    }
+
+    pub(super) fn can_redo(&self) -> bool {
+        self.undo.can_redo()
+    }
+
     pub fn save(&mut self) -> Result<(), String> {
         if self.read_only {
             return Err(format!(
@@ -502,12 +515,25 @@ impl Document {
         order(self.anchor, self.caret)
     }
 
-    fn has_selection(&self) -> bool {
+    pub(super) fn has_selection(&self) -> bool {
         self.anchor != self.caret
     }
 
     /// Replaces `start..end` with `insert` and records it for undo.
     fn replace(&mut self, start: Pos, end: Pos, insert: &str, kind: EditKind, cx: &mut Cx) {
+        self.replace_with_selection(start, end, insert, kind, None, cx);
+    }
+
+    /// Replaces text and optionally restores a selection in the new buffer.
+    fn replace_with_selection(
+        &mut self,
+        start: Pos,
+        end: Pos,
+        insert: &str,
+        kind: EditKind,
+        selection_after: Option<(Pos, Pos)>,
+        cx: &mut Cx,
+    ) {
         if self.read_only {
             cx.log_error(format!("{} is read-only", self.name));
             return;
@@ -519,8 +545,9 @@ impl Document {
         if removed.is_empty() && insert.is_empty() {
             return;
         }
-        self.caret = new_end;
-        self.anchor = new_end;
+        (self.caret, self.anchor) = selection_after
+            .map(|(caret, anchor)| (self.buffer.clamp(caret), self.buffer.clamp(anchor)))
+            .unwrap_or((new_end, new_end));
         self.preferred_x = None;
         self.in_comment.truncate(start.line + 1);
         // While a word is being typed its letters add nothing worth offering.
@@ -543,6 +570,137 @@ impl Document {
         cx.repaint();
     }
 
+    fn line_span(&self) -> (usize, usize) {
+        let (start, end) = self.selection();
+        let last = if self.has_selection() && end.col == 0 && end.line > start.line {
+            end.line - 1
+        } else {
+            end.line
+        };
+        (start.line, last)
+    }
+
+    fn indent_lines(&mut self, outdent: bool, cx: &mut Cx) {
+        let (first, last) = self.line_span();
+        let start = Pos::new(first, 0);
+        let end = Pos::new(last, self.buffer.line_len(last));
+        let original = self.buffer.text_range(start, end);
+        let mut deltas = Vec::with_capacity(last - first + 1);
+        let mut lines = Vec::with_capacity(last - first + 1);
+        for line in original.split('\n') {
+            if outdent {
+                let remove = if line.starts_with('\t') {
+                    1
+                } else {
+                    line.bytes().take_while(|&b| b == b' ').count().min(4)
+                };
+                deltas.push(-(remove as isize));
+                lines.push(line[remove..].to_owned());
+            } else {
+                deltas.push(4);
+                lines.push(format!("    {line}"));
+            }
+        }
+        let changed = lines.join("\n");
+        if changed == original {
+            return;
+        }
+        let adjust = |pos: Pos| {
+            if (first..=last).contains(&pos.line) {
+                let delta = deltas[pos.line - first];
+                let col = if delta >= 0 {
+                    pos.col + delta as usize
+                } else {
+                    pos.col.saturating_sub((-delta) as usize)
+                };
+                Pos::new(pos.line, col)
+            } else {
+                pos
+            }
+        };
+        let after = (adjust(self.caret), adjust(self.anchor));
+        self.replace_with_selection(start, end, &changed, EditKind::Other, Some(after), cx);
+    }
+
+    fn toggle_comment(&mut self, cx: &mut Cx) {
+        let (first, last) = self.line_span();
+        let start = Pos::new(first, 0);
+        let end = Pos::new(last, self.buffer.line_len(last));
+        let original = self.buffer.text_range(start, end);
+        let lines: Vec<&str> = original.split('\n').collect();
+        let remove = lines.iter().all(|line| {
+            let indent = line.len() - line.trim_start().len();
+            line[indent..].starts_with("//")
+        });
+        let mut deltas = Vec::with_capacity(lines.len());
+        let mut changed = Vec::with_capacity(lines.len());
+        for line in lines {
+            let indent = line.len() - line.trim_start().len();
+            if remove {
+                let tail = &line[indent + 2..];
+                let spaces = usize::from(tail.starts_with(' '));
+                deltas.push((indent, -((2 + spaces) as isize)));
+                changed.push(format!("{}{}", &line[..indent], &tail[spaces..]));
+            } else {
+                deltas.push((indent, 3));
+                changed.push(format!("{}// {}", &line[..indent], &line[indent..]));
+            }
+        }
+        if changed.join("\n") == original {
+            return;
+        }
+        let adjust = |pos: Pos| {
+            if (first..=last).contains(&pos.line) {
+                let (at, delta) = deltas[pos.line - first];
+                let col = if pos.col < at {
+                    pos.col
+                } else if delta >= 0 {
+                    pos.col + delta as usize
+                } else {
+                    pos.col.saturating_sub((-delta) as usize)
+                };
+                Pos::new(pos.line, col)
+            } else {
+                pos
+            }
+        };
+        let after = (adjust(self.caret), adjust(self.anchor));
+        self.replace_with_selection(
+            start,
+            end,
+            &changed.join("\n"),
+            EditKind::Other,
+            Some(after),
+            cx,
+        );
+    }
+
+    fn duplicate_line(&mut self, cx: &mut Cx) {
+        let line = self.caret.line;
+        let text = self.buffer.line(line).to_owned();
+        let (at, inserted) = if line + 1 < self.buffer.line_count() {
+            (Pos::new(line + 1, 0), format!("{text}\n"))
+        } else {
+            (self.buffer.end(), format!("\n{text}"))
+        };
+        self.replace(at, at, &inserted, EditKind::Other, cx);
+    }
+
+    fn delete_line(&mut self, cx: &mut Cx) {
+        let line = self.caret.line;
+        let (start, end) = if line + 1 < self.buffer.line_count() {
+            (Pos::new(line, 0), Pos::new(line + 1, 0))
+        } else if line > 0 {
+            (
+                Pos::new(line - 1, self.buffer.line_len(line - 1)),
+                self.buffer.end(),
+            )
+        } else {
+            (Pos::new(0, 0), self.buffer.end())
+        };
+        self.replace(start, end, "", EditKind::Other, cx);
+    }
+
     fn replace_selection(&mut self, insert: &str, kind: EditKind, cx: &mut Cx) {
         let (s, e) = self.selection();
         self.replace(s, e, insert, kind, cx);
@@ -555,6 +713,109 @@ impl Document {
         }
         self.ensure_caret_visible(cx.text);
         cx.repaint();
+    }
+
+    fn offset_at(&self, pos: Pos) -> usize {
+        (0..pos.line.min(self.buffer.line_count()))
+            .map(|line| self.buffer.line_len(line) + 1)
+            .sum::<usize>()
+            + pos.col
+    }
+
+    fn pos_at(&self, mut offset: usize) -> Pos {
+        for line in 0..self.buffer.line_count() {
+            let len = self.buffer.line_len(line);
+            if offset <= len {
+                return Pos::new(line, offset);
+            }
+            offset -= len + 1;
+        }
+        self.buffer.end()
+    }
+
+    pub(super) fn find_text(
+        &mut self,
+        query: &str,
+        reverse: bool,
+        repeat: bool,
+        cx: &mut Cx,
+    ) -> bool {
+        if query.is_empty() {
+            return false;
+        }
+        let text = self.buffer.text_range(Pos::new(0, 0), self.buffer.end());
+        let (selection_start, selection_end) = self.selection();
+        let from = if repeat && self.has_selection() {
+            if reverse {
+                selection_start
+            } else {
+                selection_end
+            }
+        } else if self.has_selection() {
+            selection_start
+        } else {
+            self.caret
+        };
+        let offset = self.offset_at(from).min(text.len());
+        let found = if reverse {
+            text[..offset].rfind(query).or_else(|| text.rfind(query))
+        } else {
+            text[offset..]
+                .find(query)
+                .map(|relative| offset + relative)
+                .or_else(|| text[..offset].find(query))
+        };
+        let Some(found) = found else {
+            return false;
+        };
+        self.anchor = self.pos_at(found);
+        self.caret = self.pos_at(found + query.len());
+        self.preferred_x = None;
+        self.ensure_caret_visible(cx.text);
+        cx.repaint();
+        true
+    }
+
+    pub(super) fn replace_find_match(
+        &mut self,
+        query: &str,
+        replacement: &str,
+        cx: &mut Cx,
+    ) -> bool {
+        if self.read_only {
+            cx.log_error(format!("{} is read-only", self.name));
+            return false;
+        }
+        let (start, end) = self.selection();
+        if query.is_empty() || self.buffer.text_range(start, end) != query {
+            return false;
+        }
+        if query != replacement {
+            self.replace(start, end, replacement, EditKind::Other, cx);
+        }
+        true
+    }
+
+    pub(super) fn replace_all(&mut self, query: &str, replacement: &str, cx: &mut Cx) -> usize {
+        if self.read_only {
+            cx.log_error(format!("{} is read-only", self.name));
+            return 0;
+        }
+        if query.is_empty() {
+            return 0;
+        }
+        let start = Pos::new(0, 0);
+        let end = self.buffer.end();
+        let original = self.buffer.text_range(start, end);
+        let count = original.matches(query).count();
+        if count > 0 {
+            let changed = original.replace(query, replacement);
+            if changed == original {
+                return count;
+            }
+            self.replace(start, end, &changed, EditKind::Other, cx);
+        }
+        count
     }
 
     fn vertical(&mut self, delta: isize, extend: bool, cx: &mut Cx) {
@@ -606,7 +867,7 @@ impl Document {
         true
     }
 
-    fn on_key(&mut self, key: Key, mods: Modifiers, cx: &mut Cx) -> bool {
+    pub(super) fn on_key(&mut self, key: Key, mods: Modifiers, cx: &mut Cx) -> bool {
         let extend = mods.shift;
         match key {
             Key::Left if mods.ctrl => {
@@ -685,11 +946,17 @@ impl Document {
                 self.replace_selection(&format!("\n{indent}"), EditKind::Other, cx);
             }
             Key::Tab if !mods.ctrl => {
-                let chars = self.buffer.line(self.caret.line)[..self.caret.col]
-                    .chars()
-                    .count();
-                let n = TAB_WIDTH - chars % TAB_WIDTH;
-                self.replace_selection(&" ".repeat(n), EditKind::Typing, cx);
+                if mods.shift {
+                    self.indent_lines(true, cx);
+                } else if self.has_selection() {
+                    self.indent_lines(false, cx);
+                } else {
+                    let chars = self.buffer.line(self.caret.line)[..self.caret.col]
+                        .chars()
+                        .count();
+                    let n = TAB_WIDTH - chars % TAB_WIDTH;
+                    self.replace_selection(&" ".repeat(n), EditKind::Typing, cx);
+                }
             }
             Key::Letter('A') if mods.ctrl => {
                 self.anchor = Pos::new(0, 0);
@@ -711,6 +978,9 @@ impl Document {
             }
             Key::Letter('Z') if mods.ctrl => self.undo_redo(mods.shift, cx),
             Key::Letter('Y') if mods.ctrl => self.undo_redo(true, cx),
+            Key::Slash if mods.ctrl => self.toggle_comment(cx),
+            Key::Letter('D') if mods.ctrl => self.duplicate_line(cx),
+            Key::Letter('K') if mods.ctrl && mods.shift => self.delete_line(cx),
             Key::Letter('S') if mods.ctrl => match self.save() {
                 Ok(()) => {
                     cx.log(format!("Saved {}", self.path.display()));
@@ -734,13 +1004,46 @@ impl Document {
         let write = !self.read_only;
         let sel = self.has_selection();
         vec![
-            Entry::item(key('Z', ctrl), "Undo", "Ctrl+Z", write),
-            Entry::item(key('Y', ctrl), "Redo", "Ctrl+Y", write),
+            Entry::item(
+                key('Z', ctrl),
+                "Undo",
+                "Ctrl+Z",
+                write && self.undo.can_undo(),
+            ),
+            Entry::item(
+                key('Y', ctrl),
+                "Redo",
+                "Ctrl+Y",
+                write && self.undo.can_redo(),
+            ),
             Entry::Separator,
             Entry::item(key('X', ctrl), "Cut", "Ctrl+X", write && sel),
             Entry::item(key('C', ctrl), "Copy", "Ctrl+C", sel),
             Entry::item(key('V', ctrl), "Paste", "Ctrl+V", write),
             Entry::item(key('A', ctrl), "Select all", "Ctrl+A", true),
+            Entry::Separator,
+            Entry::item(Action::Find(false), "Find", "Ctrl+F", true),
+            Entry::item(
+                Action::Find(true),
+                "Find and replace",
+                "Ctrl+H",
+                !self.read_only,
+            ),
+            Entry::item(Action::GoToLine, "Go to line", "Ctrl+G", true),
+            Entry::Separator,
+            Entry::item(
+                Action::Key(Key::Slash, ctrl),
+                "Toggle line comment",
+                "Ctrl+/",
+                write,
+            ),
+            Entry::item(key('D', ctrl), "Duplicate line", "Ctrl+D", write),
+            Entry::item(
+                Action::Key(Key::Letter('K'), Modifiers::CTRL_SHIFT),
+                "Delete line",
+                "Ctrl+Shift+K",
+                write,
+            ),
             Entry::Separator,
             Entry::item(key('S', ctrl), "Save", "Ctrl+S", write),
             Entry::item(

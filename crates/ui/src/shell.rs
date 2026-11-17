@@ -16,7 +16,7 @@ use crate::debug::{self, Debug, Phase, Update};
 use crate::debugview::{DebugStatus, DebugView};
 use crate::dock::{Axis, DockArea, Drop, Node, PaneHost, PaneId, Request, Spot, TabDrag, Zone};
 use crate::editor::EditorArea;
-use crate::event::{CursorShape, Event, Key, MouseButton};
+use crate::event::{CursorShape, Event, Key, Modifiers, MouseButton};
 use crate::explorer::Explorer;
 use crate::fileops;
 use crate::folder_watch::{Changes, FolderWatcher};
@@ -47,10 +47,27 @@ const TOP_TAB_PAD: f32 = 16.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuCmd {
     File(FileCmd),
+    Edit(EditCmd),
     TogglePane(PaneId),
     GraphMode(GraphMode),
     Build,
     CompilerOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditCmd {
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+    Find,
+    FindReplace,
+    GoToLine,
+    ToggleComment,
+    DuplicateLine,
+    DeleteLine,
 }
 
 /// The File menu's commands.
@@ -71,7 +88,7 @@ enum FileCmd {
 }
 
 /// The menu bar's titles, in order.
-const MENUS: [&str; 4] = ["File", "Panels", "Build", "Visualizers"];
+const MENUS: [&str; 5] = ["File", "Edit", "Panels", "Build", "Visualizers"];
 
 /// What the app should do after a call into the shell.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -248,6 +265,9 @@ struct Views {
     areas: [DockArea; 3],
     /// Where each closed panel was, so showing it puts it back.
     closed: HashMap<PaneId, (TopTab, Spot)>,
+    /// Where the Visualizer tab's Memory panel goes back to: it is only
+    /// docked while the Data view (a running program) is shown.
+    parked_memory: Option<Spot>,
     /// A tab being pressed or dragged, in either workspace.
     drag: Option<TabDrag>,
     panes: Panes,
@@ -387,12 +407,39 @@ impl Views {
         for area in &mut self.areas {
             area.layout(body, text, &mut self.panes);
         }
+        if self.sync_memory_pane() {
+            let vis = &mut self.areas[TopTab::Visualizer.index()];
+            vis.layout(body, text, &mut self.panes);
+        }
+    }
+
+    /// Memory needs a live process, so in the Visualizer tab it is only
+    /// docked beside the Data view, not the call graph. Returns whether the
+    /// tab's layout changed.
+    fn sync_memory_pane(&mut self) -> bool {
+        let area = &mut self.areas[TopTab::Visualizer.index()];
+        if !area.is_shown(PaneId::Data) {
+            if let Some(spot) = area.tree.remove(PaneId::VisMemory) {
+                self.parked_memory = Some(spot);
+                return true;
+            }
+        } else if let Some(spot) = self.parked_memory.take() {
+            if !area.contains(PaneId::VisMemory) {
+                area.tree.restore(PaneId::VisMemory, spot);
+                return true;
+            }
+        }
+        false
     }
 
     /// Each menu's rows, with the current state.
-    fn menus(&self) -> [Vec<Entry<MenuCmd>>; 4] {
+    fn menus(&self) -> [Vec<Entry<MenuCmd>>; 5] {
         let has_folder = self.panes.explorer.root_path().is_some();
         let has_doc = self.panes.editor.has_documents();
+        let has_selection = self.panes.editor.has_selection();
+        let read_only = self.panes.editor.is_read_only();
+        let can_undo = self.panes.editor.can_undo();
+        let can_redo = self.panes.editor.can_redo();
         let has_item = self.panes.explorer.selected_path().is_some();
         let row = |cmd, label: &str, hint: &str, enabled: bool| {
             Entry::item(MenuCmd::File(cmd), label, hint, enabled)
@@ -411,7 +458,7 @@ impl Views {
             Entry::Separator,
             row(FileCmd::Save, "Save", "Ctrl+S", has_doc),
             row(FileCmd::SaveAs, "Save as\u{2026}", "Ctrl+Shift+S", has_doc),
-            row(FileCmd::SaveAll, "Save all", "", has_doc),
+            row(FileCmd::SaveAll, "Save all", "Ctrl+Alt+S", has_doc),
             Entry::Separator,
             row(FileCmd::Rename, "Rename\u{2026}", "F2", has_item),
             row(FileCmd::Delete, "Delete", "Del", has_item),
@@ -421,6 +468,73 @@ impl Views {
             Entry::Separator,
             row(FileCmd::Exit, "Exit", "Alt+F4", true),
         ];
+        let edit = vec![
+            Entry::item(MenuCmd::Edit(EditCmd::Undo), "Undo", "Ctrl+Z", can_undo),
+            Entry::item(
+                MenuCmd::Edit(EditCmd::Redo),
+                "Redo",
+                "Ctrl+Shift+Z",
+                can_redo,
+            ),
+            Entry::Separator,
+            Entry::item(
+                MenuCmd::Edit(EditCmd::Cut),
+                "Cut",
+                "Ctrl+X",
+                has_selection && !read_only,
+            ),
+            Entry::item(
+                MenuCmd::Edit(EditCmd::Copy),
+                "Copy",
+                "Ctrl+C",
+                has_selection,
+            ),
+            Entry::item(
+                MenuCmd::Edit(EditCmd::Paste),
+                "Paste",
+                "Ctrl+V",
+                has_doc && !read_only,
+            ),
+            Entry::item(
+                MenuCmd::Edit(EditCmd::SelectAll),
+                "Select all",
+                "Ctrl+A",
+                has_doc,
+            ),
+            Entry::Separator,
+            Entry::item(MenuCmd::Edit(EditCmd::Find), "Find", "Ctrl+F", has_doc),
+            Entry::item(
+                MenuCmd::Edit(EditCmd::FindReplace),
+                "Find and replace",
+                "Ctrl+H",
+                has_doc && !read_only,
+            ),
+            Entry::item(
+                MenuCmd::Edit(EditCmd::GoToLine),
+                "Go to line",
+                "Ctrl+G",
+                has_doc,
+            ),
+            Entry::Separator,
+            Entry::item(
+                MenuCmd::Edit(EditCmd::ToggleComment),
+                "Toggle line comment",
+                "Ctrl+/",
+                has_doc && !read_only,
+            ),
+            Entry::item(
+                MenuCmd::Edit(EditCmd::DuplicateLine),
+                "Duplicate line",
+                "Ctrl+D",
+                has_doc && !read_only,
+            ),
+            Entry::item(
+                MenuCmd::Edit(EditCmd::DeleteLine),
+                "Delete line",
+                "Ctrl+Shift+K",
+                has_doc && !read_only,
+            ),
+        ];
         let panels = PaneId::ALL
             .into_iter()
             .map(|p| {
@@ -429,8 +543,16 @@ impl Views {
                     cmd: MenuCmd::TogglePane(p),
                     label: p.title().into(),
                     mark: Mark::Dot(ws.is_some()),
-                    hint: Some(ws.map_or("closed", TopTab::title).into()),
-                    enabled: true,
+                    hint: Some(
+                        match ws {
+                            Some(t) => t.title(),
+                            None if p == PaneId::VisMemory => "Data view only",
+                            None => "closed",
+                        }
+                        .into(),
+                    ),
+                    // Shown again when the Data view is.
+                    enabled: !(p == PaneId::VisMemory && self.parked_memory.is_some()),
                 }
             })
             .collect();
@@ -473,12 +595,40 @@ impl Views {
                 entries: modes,
             },
         ];
-        [file, panels, build, visualizers]
+        [file, edit, panels, build, visualizers]
     }
 
     fn run_menu(&mut self, cmd: MenuCmd, cx: &mut Cx) {
         match cmd {
             MenuCmd::File(c) => self.file_cmd(c, cx),
+            MenuCmd::Edit(c) => {
+                let command = match c {
+                    EditCmd::Undo => Some((Key::Letter('Z'), Modifiers::CTRL)),
+                    EditCmd::Redo => Some((Key::Letter('Z'), Modifiers::CTRL_SHIFT)),
+                    EditCmd::Cut => Some((Key::Letter('X'), Modifiers::CTRL)),
+                    EditCmd::Copy => Some((Key::Letter('C'), Modifiers::CTRL)),
+                    EditCmd::Paste => Some((Key::Letter('V'), Modifiers::CTRL)),
+                    EditCmd::SelectAll => Some((Key::Letter('A'), Modifiers::CTRL)),
+                    EditCmd::ToggleComment => Some((Key::Slash, Modifiers::CTRL)),
+                    EditCmd::DuplicateLine => Some((Key::Letter('D'), Modifiers::CTRL)),
+                    EditCmd::DeleteLine => Some((Key::Letter('K'), Modifiers::CTRL_SHIFT)),
+                    EditCmd::Find => {
+                        self.focus_editor_find(false, cx);
+                        None
+                    }
+                    EditCmd::FindReplace => {
+                        self.focus_editor_find(true, cx);
+                        None
+                    }
+                    EditCmd::GoToLine => {
+                        self.focus_editor_goto_line(cx);
+                        None
+                    }
+                };
+                if let Some((key, mods)) = command {
+                    self.panes.editor.command(key, mods, cx);
+                }
+            }
             MenuCmd::TogglePane(p) => self.toggle_pane(p, cx),
             MenuCmd::GraphMode(m) => {
                 self.panes.visualizer.set_graph_mode(m, cx);
@@ -488,6 +638,18 @@ impl Views {
             MenuCmd::CompilerOptions => self.open_compiler_options(cx),
         }
         cx.repaint();
+    }
+
+    fn focus_editor_find(&mut self, replace: bool, cx: &mut Cx) {
+        self.switch_tab(TopTab::Code, cx);
+        self.reveal_pane(PaneId::Editor, cx);
+        self.panes.editor.open_find(replace, cx);
+    }
+
+    fn focus_editor_goto_line(&mut self, cx: &mut Cx) {
+        self.switch_tab(TopTab::Code, cx);
+        self.reveal_pane(PaneId::Editor, cx);
+        self.panes.editor.open_goto_line(cx);
     }
 
     /// Opens the folder's compiler options in the editor, first writing the
@@ -907,10 +1069,14 @@ impl Views {
                 return true;
             }
         }
+        let in_terminal = self.area().focused() == Some(PaneId::Terminal);
+        if mods.ctrl && mods.alt && key == Key::Letter('S') && !in_terminal {
+            self.file_cmd(FileCmd::SaveAll, cx);
+            return true;
+        }
         if !mods.ctrl || mods.alt {
             return false;
         }
-        let in_terminal = self.area().focused() == Some(PaneId::Terminal);
         // Never closes a tab the user can't see.
         let editor_here = self.area().contains(PaneId::Editor);
         match key {
@@ -922,6 +1088,13 @@ impl Views {
             // terminal, which keeps them while it has the keyboard.
             Key::Letter('N') if !in_terminal => self.file_cmd(FileCmd::NewFile, cx),
             Key::Letter('S') if !in_terminal => self.file_cmd(FileCmd::Save, cx),
+            Key::Letter('F') if !in_terminal && !mods.shift => {
+                self.focus_editor_find(false, cx);
+            }
+            Key::Letter('H') if !in_terminal => self.focus_editor_find(true, cx),
+            Key::Letter('G') if !in_terminal && !mods.shift => {
+                self.focus_editor_goto_line(cx);
+            }
             Key::Letter('W') if !in_terminal && editor_here => {
                 self.file_cmd(FileCmd::CloseFile, cx);
             }
@@ -1368,6 +1541,8 @@ impl Views {
                         self.areas[i].on_event(&e, &mut self.panes, &mut self.drag, cx);
                         cx.repaint();
                     }
+                    Action::Find(replace) => self.focus_editor_find(replace, cx),
+                    Action::GoToLine => self.focus_editor_goto_line(cx),
                     Action::CopyText(text) => {
                         if let Err(e) = clipboard::set_text(cx.window, &text) {
                             cx.log_error(format!("Copy failed: {e}"));
@@ -1447,6 +1622,7 @@ impl Shell {
                 menu_end: 0.0,
                 areas: TopTab::ALL.map(|t| DockArea::new(default_tree(t))),
                 closed: HashMap::new(),
+                parked_memory: None,
                 drag: None,
                 panes: Panes {
                     explorer: Explorer::default(),
