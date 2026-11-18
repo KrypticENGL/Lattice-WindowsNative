@@ -48,6 +48,8 @@ enum FindMode {
 struct FindBar {
     query: String,
     query_cursor: usize,
+    line_query: String,
+    line_cursor: usize,
     replacement: String,
     replacement_cursor: usize,
     replace_mode: bool,
@@ -57,6 +59,9 @@ struct FindBar {
 
 impl FindBar {
     fn active_value_mut(&mut self) -> (&mut String, &mut usize) {
+        if self.mode == FindMode::GoToLine {
+            return (&mut self.line_query, &mut self.line_cursor);
+        }
         match self.field {
             FindField::Query => (&mut self.query, &mut self.query_cursor),
             FindField::Replacement => (&mut self.replacement, &mut self.replacement_cursor),
@@ -130,6 +135,8 @@ impl EditorArea {
         let find = self.find_bar.get_or_insert_with(|| FindBar {
             query: String::new(),
             query_cursor: 0,
+            line_query: String::new(),
+            line_cursor: 0,
             replacement: String::new(),
             replacement_cursor: 0,
             replace_mode,
@@ -155,6 +162,8 @@ impl EditorArea {
         let find = self.find_bar.get_or_insert_with(|| FindBar {
             query: String::new(),
             query_cursor: 0,
+            line_query: String::new(),
+            line_cursor: 0,
             replacement: String::new(),
             replacement_cursor: 0,
             replace_mode: false,
@@ -164,8 +173,8 @@ impl EditorArea {
         find.mode = FindMode::GoToLine;
         find.replace_mode = false;
         find.field = FindField::Query;
-        find.query = doc.caret_line().to_string();
-        find.query_cursor = find.query.len();
+        find.line_query = doc.caret_line().to_string();
+        find.line_cursor = find.line_query.len();
         cx.repaint();
     }
 
@@ -194,16 +203,10 @@ impl EditorArea {
         }
         d.fill_round_rect(bar, 4.0, theme.panel_bg);
         let query = RectF::new(bar.x + 6.0, bar.y + 6.0, bar.w - 12.0, 24.0);
-        let (label, value, active) = if find.field == FindField::Query {
-            (
-                if find.mode == FindMode::GoToLine {
-                    "Line"
-                } else {
-                    "Find"
-                },
-                find.query.as_str(),
-                true,
-            )
+        let (label, value, active) = if find.mode == FindMode::GoToLine {
+            ("Line", find.line_query.as_str(), true)
+        } else if find.field == FindField::Query {
+            ("Find", find.query.as_str(), true)
         } else {
             ("Find", find.query.as_str(), false)
         };
@@ -268,6 +271,9 @@ impl EditorArea {
 
     fn find_bar_event(&mut self, e: &Event, cx: &mut Cx) -> bool {
         let bar_rect = self.find_bar_rect();
+        if bar_rect.w < 190.0 {
+            return false;
+        }
         let Some(find) = self.find_bar.as_mut() else {
             return false;
         };
@@ -445,15 +451,20 @@ impl EditorArea {
                 cx.repaint();
                 return false;
             }
-            Event::KeyDown { .. } => return true,
+            Event::KeyDown { .. } => return false,
             _ => return false,
         }
         let query = find.query.clone();
+        let line_query = find.line_query.clone();
         let replacement = find.replacement.clone();
         if go_to_line {
-            if let (Ok(line), Some(doc)) = (query.parse::<u32>(), self.docs.get_mut(self.active)) {
+            if let (Ok(line), Some(doc)) =
+                (line_query.parse::<u32>(), self.docs.get_mut(self.active))
+            {
                 doc.goto_line(line);
+                self.find_bar = None;
                 cx.repaint();
+                return true;
             } else {
                 cx.log("Enter a valid line number");
             }
@@ -486,12 +497,16 @@ impl EditorArea {
     pub fn open(&mut self, path: &Path, cx: &mut Cx) {
         self.completion = None;
         if let Some(i) = self.docs.iter().position(|d| d.path() == path) {
+            if self.active != i {
+                self.find_bar = None;
+            }
             self.active = i;
             cx.repaint();
             return;
         }
         match Document::open(path) {
             Ok(mut doc) => {
+                self.find_bar = None;
                 if doc.is_read_only() {
                     cx.log_error(format!(
                         "{} is not valid UTF-8; opened read-only",
@@ -531,6 +546,7 @@ impl EditorArea {
             return false;
         }
         self.docs.remove(i);
+        self.find_bar = None;
         if self.active >= self.docs.len() {
             self.active = self.docs.len().saturating_sub(1);
         } else if self.active > i {
@@ -655,7 +671,8 @@ impl EditorArea {
             return;
         };
         let code = doc.is_code();
-        if !forced && (!code || prefix.len() < 2) {
+        let member_access = doc.is_member_access(start);
+        if !forced && (!code || (prefix.len() < 2 && (!member_access || prefix.is_empty()))) {
             return;
         }
         let caret = doc.caret_rect(cx.text);
@@ -663,16 +680,57 @@ impl EditorArea {
         for d in &mut self.docs {
             d.update_words();
         }
-        let own = || self.docs.iter().filter_map(Document::own_words);
-        let included = || self.docs.iter().map(Document::included_words);
+        let mut own = Vec::with_capacity(self.docs.len());
+        if let Some(words) = self.docs[self.active].own_words() {
+            own.push(words);
+        }
+        own.extend(
+            self.docs
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != self.active)
+                .filter_map(|(_, doc)| doc.own_words()),
+        );
+        let included: Vec<_> = if prefix.len() >= 3 {
+            self.docs.iter().map(Document::included_words).collect()
+        } else {
+            Vec::new()
+        };
         let items = if directive {
             complete::directives(&prefix)
+        } else if member_access {
+            let mut members = Vec::with_capacity(self.docs.len());
+            members.push(self.docs[self.active].member_words());
+            members.extend(
+                self.docs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != self.active)
+                    .map(|(_, doc)| doc.member_words()),
+            );
+            let matches = complete::candidates(
+                &prefix,
+                false,
+                members.iter().copied(),
+                std::iter::empty::<&std::collections::BTreeSet<String>>(),
+            );
+            if matches.is_empty() {
+                complete::candidates(
+                    &prefix,
+                    false,
+                    own.iter().copied(),
+                    included.iter().copied(),
+                )
+            } else {
+                matches
+            }
         } else {
-            complete::candidates(&prefix, code, own(), included())
+            complete::candidates(&prefix, code, own.iter().copied(), included.iter().copied())
         };
         self.completion = Completion::new(items, start, caret, self.body, cx.text);
         if let Some(c) = &mut self.completion {
-            c.enter_makes_newline = complete::is_complete(&prefix, own().chain(included()));
+            c.enter_makes_newline =
+                complete::is_complete(&prefix, own.iter().chain(included.iter()).copied());
         }
     }
 
@@ -693,13 +751,24 @@ impl EditorArea {
             Event::KeyDown { key: Key::Down, .. } => c.move_by(1),
             Event::KeyDown {
                 key: Key::Enter, ..
-            } if c.enter_makes_newline => {
+            } if c.enter_makes_newline && !c.has_choice() => {
                 self.completion = None;
                 cx.repaint();
                 return false;
             }
             Event::KeyDown {
-                key: Key::Tab | Key::Enter,
+                key: Key::Enter, ..
+            } if !c.has_choice() => {
+                self.completion = None;
+                cx.repaint();
+                return false;
+            }
+            Event::KeyDown {
+                key: Key::Tab,
+                mods,
+            } if !mods.ctrl && !mods.alt => self.accept_completion(cx),
+            Event::KeyDown {
+                key: Key::Enter,
                 mods,
             } if !mods.ctrl && !mods.alt => self.accept_completion(cx),
             Event::KeyDown {
@@ -864,6 +933,9 @@ impl Panel for EditorArea {
             self.completion = None;
         }
         self.body = body;
+        if body.w < 206.0 {
+            self.find_bar = None;
+        }
         self.compute_hits(text);
         if let Some(doc) = self.docs.get_mut(self.active) {
             doc.layout(body, text);
@@ -996,6 +1068,7 @@ impl Panel for EditorArea {
                 mods,
             } if mods.ctrl => {
                 if !self.docs.is_empty() {
+                    self.find_bar = None;
                     let n = self.docs.len();
                     self.active = if mods.shift {
                         (self.active + n - 1) % n
@@ -1020,6 +1093,9 @@ impl Panel for EditorArea {
                     if button == MouseButton::Middle || (button == MouseButton::Left && on_close) {
                         self.close(i, cx);
                     } else if button == MouseButton::Left {
+                        if self.active != i {
+                            self.find_bar = None;
+                        }
                         self.active = i;
                         cx.repaint();
                     }
@@ -1094,7 +1170,9 @@ impl Panel for EditorArea {
         };
         // Typing a word opens or narrows the list; anything else typed ends it.
         match *e {
-            Event::Char(c) if c.is_ascii() && is_word(c as u8) => {
+            Event::Char(c)
+                if c.is_ascii() && (is_word(c as u8) || matches!(c, '.' | '>' | ':')) =>
+            {
                 self.refresh_completion(false, cx);
             }
             Event::Char(_) => self.completion = None,

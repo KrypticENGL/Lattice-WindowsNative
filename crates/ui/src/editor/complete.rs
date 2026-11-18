@@ -55,6 +55,48 @@ pub fn code_words(text: impl Iterator<Item = impl AsRef<str>>) -> BTreeSet<Strin
     words
 }
 
+/// Identifiers used after `.`, `->`, or `::` in the source. This is lexical
+/// context only; it provides member names without claiming to resolve types.
+pub fn member_words(text: impl Iterator<Item = impl AsRef<str>>) -> BTreeSet<String> {
+    let mut words = BTreeSet::new();
+    let mut in_comment = false;
+    for line in text {
+        let line = line.as_ref();
+        let (spans, open) = syntax::scan_line(line, in_comment);
+        in_comment = open;
+        let mut visible = line.as_bytes().to_vec();
+        for span in spans.iter().filter(|span| {
+            matches!(
+                span.kind,
+                Kind::Comment | Kind::Str | Kind::Preproc | Kind::Number
+            )
+        }) {
+            visible[span.start..span.end].fill(b' ');
+        }
+        let visible = String::from_utf8(visible).unwrap_or_default();
+        let bytes = visible.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if !is_word(bytes[i]) || bytes[i].is_ascii_digit() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_word(bytes[i]) {
+                i += 1;
+            }
+            let before = visible[..start].trim_end();
+            if (before.ends_with('.') || before.ends_with("->") || before.ends_with("::"))
+                && i - start >= 2
+            {
+                words.insert(visible[start..i].to_owned());
+            }
+        }
+    }
+    words
+}
+
 /// The public names in preprocessor output. Leading underscores are the
 /// standard library's private names, thousands of them.
 fn public_words(output: &str) -> BTreeSet<String> {
@@ -101,9 +143,9 @@ pub fn directives(prefix: &str) -> Vec<String> {
         .collect()
 }
 
-/// What to offer for `prefix`: exact-case matches first; within those, words
-/// of the open files, then keywords, then what they include; then
-/// alphabetically. The prefix itself is not offered.
+/// What to offer for `prefix`: exact-case matches first; then the active file,
+/// other open files, keywords, and included headers; alphabetically within
+/// each source. The prefix itself is not offered.
 pub fn candidates<'a>(
     prefix: &str,
     keywords: bool,
@@ -122,18 +164,18 @@ pub fn candidates<'a>(
             ));
         }
     };
-    for set in own {
-        set.iter().for_each(|w| consider(0, w));
+    for (rank, set) in own.enumerate() {
+        set.iter().for_each(|w| consider(rank.min(1) as u8, w));
     }
     if keywords {
         syntax::KEYWORDS
             .iter()
             .chain(syntax::TYPES)
             .chain(syntax::LITERALS)
-            .for_each(|w| consider(1, w));
+            .for_each(|w| consider(2, w));
     }
     for set in included {
-        set.iter().for_each(|w| consider(2, w));
+        set.iter().for_each(|w| consider(3, w));
     }
     found
         .into_iter()
@@ -158,6 +200,7 @@ pub fn is_complete(
 pub struct Completion {
     items: Vec<String>,
     selected: usize,
+    chosen: bool,
     /// Where the prefix being completed starts on the caret's line.
     pub start_col: usize,
     /// What is typed is a word already: Enter starts a new line (Tab still
@@ -194,6 +237,7 @@ impl Completion {
         Some(Self {
             items,
             selected: 0,
+            chosen: false,
             start_col,
             enter_makes_newline: false,
             rect: RectF::new(x, y, w, h),
@@ -210,10 +254,15 @@ impl Completion {
         &self.items[self.selected]
     }
 
+    pub fn has_choice(&self) -> bool {
+        self.chosen
+    }
+
     /// Moves the selection, wrapping at the ends.
     pub fn move_by(&mut self, delta: isize) {
         let n = self.items.len() as isize;
         self.selected = (self.selected as isize + delta).rem_euclid(n) as usize;
+        self.chosen = true;
     }
 
     /// The first row shown: the list scrolls to keep the selection in view.
@@ -229,6 +278,7 @@ impl Completion {
     pub fn select_at(&mut self, p: PointF) {
         let row = ((p.y - self.rect.y) / self.row_h) as usize;
         self.selected = (self.first() + row).min(self.items.len() - 1);
+        self.chosen = true;
     }
 
     pub fn paint(&self, d: &mut DrawCtx, theme: &Theme) {
@@ -238,7 +288,7 @@ impl Completion {
             for (i, word) in self.items.iter().enumerate().skip(first).take(MAX_ROWS) {
                 let y = self.rect.y + (i - first) as f32 * self.row_h;
                 let row = RectF::new(self.rect.x, y, self.rect.w, self.row_h);
-                let selected = i == self.selected;
+                let selected = self.chosen && i == self.selected;
                 if selected {
                     d.fill_rect(row, theme.selection_bg);
                 }

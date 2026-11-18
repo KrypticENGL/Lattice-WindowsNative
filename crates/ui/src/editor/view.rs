@@ -62,6 +62,8 @@ pub struct Document {
     runs: HashMap<u64, (bool, Vec<Run>)>,
     /// The words of the file, for completion; `None` when out of date.
     words: Option<BTreeSet<String>>,
+    /// Names used after member/scope operators, for context-filtered completion.
+    members: BTreeSet<String>,
     /// Where a word was last being typed: that word, unfinished, isn't one
     /// to offer.
     typed_at: Option<Pos>,
@@ -135,6 +137,7 @@ impl Document {
             in_comment: Vec::new(),
             runs: HashMap::new(),
             words: None,
+            members: BTreeSet::new(),
             typed_at: None,
             included: BTreeSet::new(),
             included_scan: None,
@@ -341,6 +344,12 @@ impl Document {
                 .ends_with('#')
     }
 
+    /// Whether the current word follows a member or scope operator.
+    pub fn is_member_access(&self, start_col: usize) -> bool {
+        let before = self.buffer.line(self.caret.line)[..start_col].trim_end();
+        before.ends_with('.') || before.ends_with("->") || before.ends_with("::")
+    }
+
     /// Brings the word sets up to date; read them with [`Self::own_words`] and
     /// [`Self::included_words`].
     pub fn update_words(&mut self) {
@@ -365,19 +374,30 @@ impl Document {
             (at.line, format!("{} {}", &line[..start], &line[end..]))
         });
         let buffer = &self.buffer;
-        let lines = (0..buffer.line_count()).map(|i| match &skip {
-            Some((line, text)) if *line == i => Cow::Borrowed(text.as_str()),
-            _ => Cow::Borrowed(buffer.line(i)),
-        });
+        let lines: Vec<Cow<'_, str>> = (0..buffer.line_count())
+            .map(|i| match &skip {
+                Some((line, text)) if *line == i => Cow::Borrowed(text.as_str()),
+                _ => Cow::Borrowed(buffer.line(i)),
+            })
+            .collect();
         self.words = Some(if self.code {
-            complete::code_words(lines)
+            complete::code_words(lines.iter().map(|line| line.as_ref()))
         } else {
-            complete::words_in(lines)
+            complete::words_in(lines.iter().map(|line| line.as_ref()))
         });
+        self.members = if self.code {
+            complete::member_words(lines.iter().map(|line| line.as_ref()))
+        } else {
+            BTreeSet::new()
+        };
     }
 
     pub fn own_words(&self) -> Option<&BTreeSet<String>> {
         self.words.as_ref()
+    }
+
+    pub fn member_words(&self) -> &BTreeSet<String> {
+        &self.members
     }
 
     pub fn included_words(&self) -> &BTreeSet<String> {
@@ -596,6 +616,9 @@ impl Document {
                 };
                 deltas.push(-(remove as isize));
                 lines.push(line[remove..].to_owned());
+            } else if line.trim().is_empty() {
+                deltas.push(0);
+                lines.push(line.to_owned());
             } else {
                 deltas.push(4);
                 lines.push(format!("    {line}"));
@@ -623,27 +646,37 @@ impl Document {
     }
 
     fn toggle_comment(&mut self, cx: &mut Cx) {
+        let Some(prefix) = self.comment_prefix() else {
+            return;
+        };
         let (first, last) = self.line_span();
         let start = Pos::new(first, 0);
         let end = Pos::new(last, self.buffer.line_len(last));
         let original = self.buffer.text_range(start, end);
         let lines: Vec<&str> = original.split('\n').collect();
-        let remove = lines.iter().all(|line| {
-            let indent = line.len() - line.trim_start().len();
-            line[indent..].starts_with("//")
-        });
+        let remove = lines
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| {
+                let indent = line.len() - line.trim_start().len();
+                line[indent..].starts_with(prefix)
+            });
         let mut deltas = Vec::with_capacity(lines.len());
         let mut changed = Vec::with_capacity(lines.len());
         for line in lines {
             let indent = line.len() - line.trim_start().len();
-            if remove {
-                let tail = &line[indent + 2..];
+            if line.trim().is_empty() {
+                deltas.push((indent, 0));
+                changed.push(line.to_owned());
+            } else if remove {
+                let tail = &line[indent + prefix.len()..];
                 let spaces = usize::from(tail.starts_with(' '));
-                deltas.push((indent, -((2 + spaces) as isize)));
+                deltas.push((indent, -((prefix.len() + spaces) as isize)));
                 changed.push(format!("{}{}", &line[..indent], &tail[spaces..]));
             } else {
-                deltas.push((indent, 3));
-                changed.push(format!("{}// {}", &line[..indent], &line[indent..]));
+                let marker = format!("{prefix} ");
+                deltas.push((indent, marker.len() as isize));
+                changed.push(format!("{}{marker}{}", &line[..indent], &line[indent..]));
             }
         }
         if changed.join("\n") == original {
@@ -684,6 +717,22 @@ impl Document {
             (self.buffer.end(), format!("\n{text}"))
         };
         self.replace(at, at, &inserted, EditKind::Other, cx);
+    }
+
+    pub(super) fn comment_prefix(&self) -> Option<&'static str> {
+        let extension = self.path.extension()?.to_str()?.to_ascii_lowercase();
+        Some(match extension.as_str() {
+            "c" | "h" | "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" | "inl" | "rs" => "//",
+            "py" | "ps1" | "toml" | "sh" | "bash" | "zsh" | "yml" | "yaml" | "mk" => "#",
+            _ if self
+                .path
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("Makefile")) =>
+            {
+                "#"
+            }
+            _ => return None,
+        })
     }
 
     fn delete_line(&mut self, cx: &mut Cx) {
@@ -868,6 +917,11 @@ impl Document {
     }
 
     pub(super) fn on_key(&mut self, key: Key, mods: Modifiers, cx: &mut Cx) -> bool {
+        // Ctrl+Alt is also how Windows reports AltGr. None of the editor's
+        // commands use it, so preserve those layouts for text input.
+        if mods.ctrl && mods.alt {
+            return false;
+        }
         let extend = mods.shift;
         match key {
             Key::Left if mods.ctrl => {

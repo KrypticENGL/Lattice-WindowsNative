@@ -436,6 +436,8 @@ impl Views {
     fn menus(&self) -> [Vec<Entry<MenuCmd>>; 5] {
         let has_folder = self.panes.explorer.root_path().is_some();
         let has_doc = self.panes.editor.has_documents();
+        let editor_visible =
+            self.tab == TopTab::Code && self.areas[self.tab.index()].contains(PaneId::Editor);
         let has_selection = self.panes.editor.has_selection();
         let read_only = self.panes.editor.is_read_only();
         let can_undo = self.panes.editor.can_undo();
@@ -458,7 +460,7 @@ impl Views {
             Entry::Separator,
             row(FileCmd::Save, "Save", "Ctrl+S", has_doc),
             row(FileCmd::SaveAs, "Save as\u{2026}", "Ctrl+Shift+S", has_doc),
-            row(FileCmd::SaveAll, "Save all", "Ctrl+Alt+S", has_doc),
+            row(FileCmd::SaveAll, "Save all", "", has_doc),
             Entry::Separator,
             row(FileCmd::Rename, "Rename\u{2026}", "F2", has_item),
             row(FileCmd::Delete, "Delete", "Del", has_item),
@@ -469,37 +471,42 @@ impl Views {
             row(FileCmd::Exit, "Exit", "Alt+F4", true),
         ];
         let edit = vec![
-            Entry::item(MenuCmd::Edit(EditCmd::Undo), "Undo", "Ctrl+Z", can_undo),
+            Entry::item(
+                MenuCmd::Edit(EditCmd::Undo),
+                "Undo",
+                "Ctrl+Z",
+                editor_visible && can_undo,
+            ),
             Entry::item(
                 MenuCmd::Edit(EditCmd::Redo),
                 "Redo",
                 "Ctrl+Shift+Z",
-                can_redo,
+                editor_visible && can_redo,
             ),
             Entry::Separator,
             Entry::item(
                 MenuCmd::Edit(EditCmd::Cut),
                 "Cut",
                 "Ctrl+X",
-                has_selection && !read_only,
+                editor_visible && has_selection && !read_only,
             ),
             Entry::item(
                 MenuCmd::Edit(EditCmd::Copy),
                 "Copy",
                 "Ctrl+C",
-                has_selection,
+                editor_visible && has_selection,
             ),
             Entry::item(
                 MenuCmd::Edit(EditCmd::Paste),
                 "Paste",
                 "Ctrl+V",
-                has_doc && !read_only,
+                editor_visible && has_doc && !read_only,
             ),
             Entry::item(
                 MenuCmd::Edit(EditCmd::SelectAll),
                 "Select all",
                 "Ctrl+A",
-                has_doc,
+                editor_visible && has_doc,
             ),
             Entry::Separator,
             Entry::item(MenuCmd::Edit(EditCmd::Find), "Find", "Ctrl+F", has_doc),
@@ -507,7 +514,7 @@ impl Views {
                 MenuCmd::Edit(EditCmd::FindReplace),
                 "Find and replace",
                 "Ctrl+H",
-                has_doc && !read_only,
+                editor_visible && has_doc && !read_only,
             ),
             Entry::item(
                 MenuCmd::Edit(EditCmd::GoToLine),
@@ -520,19 +527,19 @@ impl Views {
                 MenuCmd::Edit(EditCmd::ToggleComment),
                 "Toggle line comment",
                 "Ctrl+/",
-                has_doc && !read_only,
+                editor_visible && has_doc && !read_only,
             ),
             Entry::item(
                 MenuCmd::Edit(EditCmd::DuplicateLine),
                 "Duplicate line",
                 "Ctrl+D",
-                has_doc && !read_only,
+                editor_visible && has_doc && !read_only,
             ),
             Entry::item(
                 MenuCmd::Edit(EditCmd::DeleteLine),
                 "Delete line",
                 "Ctrl+Shift+K",
-                has_doc && !read_only,
+                editor_visible && has_doc && !read_only,
             ),
         ];
         let panels = PaneId::ALL
@@ -1070,10 +1077,6 @@ impl Views {
             }
         }
         let in_terminal = self.area().focused() == Some(PaneId::Terminal);
-        if mods.ctrl && mods.alt && key == Key::Letter('S') && !in_terminal {
-            self.file_cmd(FileCmd::SaveAll, cx);
-            return true;
-        }
         if !mods.ctrl || mods.alt {
             return false;
         }
@@ -1088,11 +1091,17 @@ impl Views {
             // terminal, which keeps them while it has the keyboard.
             Key::Letter('N') if !in_terminal => self.file_cmd(FileCmd::NewFile, cx),
             Key::Letter('S') if !in_terminal => self.file_cmd(FileCmd::Save, cx),
-            Key::Letter('F') if !in_terminal && !mods.shift => {
+            Key::Letter('F')
+                if !in_terminal && !mods.shift && editor_here && self.tab == TopTab::Code =>
+            {
                 self.focus_editor_find(false, cx);
             }
-            Key::Letter('H') if !in_terminal => self.focus_editor_find(true, cx),
-            Key::Letter('G') if !in_terminal && !mods.shift => {
+            Key::Letter('H') if !in_terminal && editor_here && self.tab == TopTab::Code => {
+                self.focus_editor_find(true, cx);
+            }
+            Key::Letter('G')
+                if !in_terminal && !mods.shift && editor_here && self.tab == TopTab::Code =>
+            {
                 self.focus_editor_goto_line(cx);
             }
             Key::Letter('W') if !in_terminal && editor_here => {
