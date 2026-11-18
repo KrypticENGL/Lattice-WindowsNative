@@ -62,6 +62,7 @@ pub struct Document {
     runs: HashMap<u64, (bool, Vec<Run>)>,
     /// The words of the file, for completion; `None` when out of date.
     words: Option<BTreeSet<String>>,
+    functions: BTreeSet<String>,
     /// Names used after member/scope operators, for context-filtered completion.
     members: BTreeSet<String>,
     /// Where a word was last being typed: that word, unfinished, isn't one
@@ -69,7 +70,10 @@ pub struct Document {
     typed_at: Option<Pos>,
     /// What the file includes, and the scan for an update while one runs.
     included: BTreeSet<String>,
-    included_scan: Option<Receiver<BTreeSet<String>>>,
+    included_functions: BTreeSet<String>,
+    included_scan: Option<Receiver<(BTreeSet<String>, BTreeSet<String>)>>,
+    include_paths: BTreeSet<String>,
+    include_paths_scan: Option<Receiver<BTreeSet<String>>>,
     dragging: bool,
     /// Breakpoint lines (1-based), drawn as gutter dots.
     breakpoints: Vec<u32>,
@@ -94,6 +98,7 @@ impl Document {
         };
         let mut doc = Self::from_text(path, &text, read_only);
         doc.scan_includes();
+        doc.scan_include_paths();
         Ok(doc)
     }
 
@@ -107,9 +112,21 @@ impl Document {
         let path = self.path.clone();
         std::thread::spawn(move || {
             // If the document moved on, nobody is listening; that is fine.
-            let _ = tx.send(complete::included_words(&path));
+            let _ = tx.send(complete::included_index(&path));
         });
         self.included_scan = Some(rx);
+    }
+
+    fn scan_include_paths(&mut self) {
+        if !self.code {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let path = self.path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(complete::include_paths(&path));
+        });
+        self.include_paths_scan = Some(rx);
     }
 
     pub(super) fn from_text(path: &Path, text: &str, read_only: bool) -> Self {
@@ -137,10 +154,14 @@ impl Document {
             in_comment: Vec::new(),
             runs: HashMap::new(),
             words: None,
+            functions: BTreeSet::new(),
             members: BTreeSet::new(),
             typed_at: None,
             included: BTreeSet::new(),
+            included_functions: BTreeSet::new(),
             included_scan: None,
+            include_paths: BTreeSet::new(),
+            include_paths_scan: None,
             dragging: false,
             breakpoints: Vec::new(),
             exec_line: None,
@@ -189,6 +210,7 @@ impl Document {
         self.undo.seal();
         // Its includes may have changed.
         self.scan_includes();
+        self.scan_include_paths();
         Ok(())
     }
 
@@ -207,6 +229,7 @@ impl Document {
         self.saved_state = self.undo.state_id();
         self.undo.seal();
         self.scan_includes();
+        self.scan_include_paths();
         Ok(())
     }
 
@@ -336,6 +359,34 @@ impl Document {
         Some((start, prefix.to_owned()))
     }
 
+    /// The path inside an unfinished `#include <...>` or `#include "..."`.
+    pub fn include_completion_prefix(&self) -> Option<(usize, String)> {
+        if !self.code || self.read_only {
+            return None;
+        }
+        let line = self.buffer.line(self.caret.line);
+        let before = &line[..self.caret.col];
+        let trimmed = before.trim_start();
+        let after_directive = trimmed.strip_prefix("#include")?;
+        let leading = before.len() - trimmed.len();
+        let marker_at = leading
+            + "#include".len()
+            + after_directive
+                .len()
+                .saturating_sub(after_directive.trim_start().len());
+        let after_space = after_directive.trim_start();
+        let opener = *after_space.as_bytes().first()?;
+        if opener != b'"' && opener != b'<' {
+            return None;
+        }
+        let start = marker_at + 1;
+        let closer = if opener == b'"' { b'"' } else { b'>' };
+        if line.as_bytes()[start..self.caret.col].contains(&closer) {
+            return None;
+        }
+        Some((start, line[start..self.caret.col].to_owned()))
+    }
+
     /// The word being typed follows `#`, so it is a directive's name.
     pub fn is_directive(&self, start_col: usize) -> bool {
         self.code
@@ -353,9 +404,20 @@ impl Document {
     /// Brings the word sets up to date; read them with [`Self::own_words`] and
     /// [`Self::included_words`].
     pub fn update_words(&mut self) {
-        if let Some(words) = self.included_scan.as_ref().and_then(|r| r.try_recv().ok()) {
+        if let Some((words, functions)) =
+            self.included_scan.as_ref().and_then(|r| r.try_recv().ok())
+        {
             self.included = words;
+            self.included_functions = functions;
             self.included_scan = None;
+        }
+        if let Some(paths) = self
+            .include_paths_scan
+            .as_ref()
+            .and_then(|r| r.try_recv().ok())
+        {
+            self.include_paths = paths;
+            self.include_paths_scan = None;
         }
         if self.words.is_some() {
             return;
@@ -385,6 +447,11 @@ impl Document {
         } else {
             complete::words_in(lines.iter().map(|line| line.as_ref()))
         });
+        self.functions = if self.code {
+            complete::function_words(lines.iter().map(|line| line.as_ref()))
+        } else {
+            BTreeSet::new()
+        };
         self.members = if self.code {
             complete::member_words(lines.iter().map(|line| line.as_ref()))
         } else {
@@ -400,8 +467,20 @@ impl Document {
         &self.members
     }
 
+    pub fn function_words(&self) -> &BTreeSet<String> {
+        &self.functions
+    }
+
     pub fn included_words(&self) -> &BTreeSet<String> {
         &self.included
+    }
+
+    pub fn included_function_words(&self) -> &BTreeSet<String> {
+        &self.included_functions
+    }
+
+    pub fn include_paths(&self) -> &BTreeSet<String> {
+        &self.include_paths
     }
 
     /// The caret's on-screen rect.
@@ -417,13 +496,32 @@ impl Document {
 
     /// Replaces the word at the caret, all of it: completing inside `fo|obar`
     /// must not leave the old `obar` behind.
-    pub fn accept_completion(&mut self, start_col: usize, word: &str, cx: &mut Cx) {
+    pub fn accept_completion(
+        &mut self,
+        start_col: usize,
+        include_path: bool,
+        word: &str,
+        cx: &mut Cx,
+    ) {
         let Pos { line, col } = self.caret;
         let text = self.buffer.line(line);
-        let end = text[col..]
-            .bytes()
-            .position(|b| !is_word(b))
-            .map_or(text.len(), |i| col + i);
+        let end = if include_path {
+            let line = &text[col..];
+            let closer = if text[..start_col].trim_end().ends_with('<') {
+                b'>'
+            } else {
+                b'"'
+            };
+            line.as_bytes()
+                .iter()
+                .position(|&b| b == closer)
+                .map_or(text.len(), |i| col + i)
+        } else {
+            text[col..]
+                .bytes()
+                .position(|b| !is_word(b))
+                .map_or(text.len(), |i| col + i)
+        };
         self.replace(
             Pos::new(line, start_col),
             Pos::new(line, end),

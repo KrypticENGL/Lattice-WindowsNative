@@ -7,7 +7,7 @@
 //! wanted.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::geom::{PointF, RectF};
@@ -51,6 +51,23 @@ pub fn code_words(text: impl Iterator<Item = impl AsRef<str>>) -> BTreeSet<Strin
             )
         });
         words.extend(words_in(code.map(|s| &line[s.start..s.end])));
+    }
+    words
+}
+
+pub fn function_words(text: impl Iterator<Item = impl AsRef<str>>) -> BTreeSet<String> {
+    let mut words = BTreeSet::new();
+    let mut in_comment = false;
+    for line in text {
+        let line = line.as_ref();
+        let (spans, open) = syntax::scan_line(line, in_comment);
+        in_comment = open;
+        words.extend(
+            spans
+                .iter()
+                .filter(|span| span.kind == Kind::Function)
+                .map(|span| line[span.start..span.end].to_owned()),
+        );
     }
     words
 }
@@ -107,12 +124,17 @@ fn public_words(output: &str) -> BTreeSet<String> {
 
 /// Everything `path` includes, by asking the compiler what the file expands
 /// to. Empty if there is no compiler; a missing include still gives the rest.
+#[cfg(test)]
 pub fn included_words(path: &Path) -> BTreeSet<String> {
+    included_index(path).0
+}
+
+pub fn included_index(path: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
     let c = path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("c"));
     let Some(tool) = debugger::find_tool(if c { "gcc" } else { "g++" }) else {
-        return BTreeSet::new();
+        return (BTreeSet::new(), BTreeSet::new());
     };
     let mut cmd = Command::new(tool);
     // -dD keeps macros; the language is spelled out as `.h` would mean C.
@@ -122,8 +144,17 @@ pub fn included_words(path: &Path) -> BTreeSet<String> {
         .stderr(Stdio::null());
     crate::build::no_console_window(&mut cmd);
     cmd.output().map_or_else(
-        |_| BTreeSet::new(),
-        |out| public_words(&String::from_utf8_lossy(&out.stdout)),
+        |_| (BTreeSet::new(), BTreeSet::new()),
+        |out| {
+            let text = String::from_utf8_lossy(&out.stdout);
+            (
+                public_words(&text),
+                function_words(text.lines())
+                    .into_iter()
+                    .filter(|w| !w.starts_with('_'))
+                    .collect(),
+            )
+        },
     )
 }
 
@@ -141,6 +172,137 @@ pub fn directives(prefix: &str) -> Vec<String> {
         .filter(|w| has_prefix(w, prefix) && *w != prefix)
         .map(str::to_string)
         .collect()
+}
+
+/// Recursively indexes project headers for `#include` completion. Paths are
+/// relative to the nearest repository root, with directory names ending in `/`.
+pub fn include_paths(path: &Path) -> BTreeSet<String> {
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let root = base
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .unwrap_or(base);
+    let c = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("c"));
+    let mut roots = vec![(root.to_path_buf(), root.to_path_buf())];
+    if let Some(tool) = debugger::find_tool(if c { "gcc" } else { "g++" }) {
+        let mut cmd = Command::new(tool);
+        cmd.args(["-E", "-x", if c { "c" } else { "c++" }, "-", "-v"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        crate::build::no_console_window(&mut cmd);
+        if let Ok(output) = cmd.output() {
+            let mut in_search = false;
+            for line in String::from_utf8_lossy(&output.stderr).lines() {
+                let line = line.trim();
+                if line == "#include <...> search starts here:" {
+                    in_search = true;
+                } else if line == "End of search list." {
+                    break;
+                } else if in_search {
+                    let dir = line.strip_suffix(" (framework directory)").unwrap_or(line);
+                    let dir = PathBuf::from(dir);
+                    if dir.is_dir() {
+                        roots.push((dir.clone(), dir));
+                    }
+                }
+            }
+        }
+    }
+    let mut pending: Vec<_> = roots
+        .into_iter()
+        .map(|(dir, display_root)| (dir, display_root, 0usize))
+        .collect();
+    pending.reverse();
+    let mut dirs = BTreeSet::new();
+    let mut files = BTreeSet::new();
+    let mut seen = 0usize;
+    while let Some((dir, display_root, depth)) = pending.pop() {
+        if depth > 12 || seen >= 50_000 {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || matches!(name.as_ref(), "target" | "build" | "out") {
+                continue;
+            }
+            let full = entry.path();
+            if full.is_dir() {
+                pending.push((full, display_root.clone(), depth + 1));
+            } else if full.extension().is_some_and(|ext| {
+                ["h", "hh", "hpp", "hxx", "inc", "ipp", "tpp"]
+                    .iter()
+                    .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+            }) {
+                let relative = full
+                    .strip_prefix(&display_root)
+                    .or_else(|_| full.strip_prefix(root));
+                let Ok(relative) = relative else {
+                    continue;
+                };
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                files.insert(relative.clone());
+                let mut parent = PathBuf::from(&relative);
+                parent.pop();
+                let mut chain = Vec::new();
+                while parent.components().count() > 0 {
+                    chain.push(format!("{}/", parent.to_string_lossy().replace('\\', "/")));
+                    if !parent.pop() {
+                        break;
+                    }
+                }
+                dirs.extend(chain);
+            }
+            if seen >= 50_000 {
+                break;
+            }
+        }
+    }
+    dirs.extend(files);
+    dirs
+}
+
+pub fn include_candidates(prefix: &str, paths: &BTreeSet<String>) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| path.starts_with(prefix) && path != &prefix)
+        .take(MAX_ITEMS)
+        .cloned()
+        .collect()
+}
+
+fn glyph(word: &str, function: bool, include_path: bool) -> (&'static str, u8, &'static str) {
+    if word.ends_with('/') {
+        return (">", 0, "folder");
+    }
+    if include_path {
+        return ("H", 1, "header");
+    }
+    let lower = word.to_ascii_lowercase();
+    if ["h", "hh", "hpp", "hxx", "inc", "ipp", "tpp"]
+        .iter()
+        .any(|ext| lower.ends_with(&format!(".{ext}")))
+    {
+        return ("H", 1, "header");
+    }
+    if syntax::KEYWORDS.contains(&word) || syntax::DIRECTIVES.contains(&word) {
+        ("K", 2, "keyword")
+    } else if syntax::TYPES.contains(&word) || word.chars().next().is_some_and(char::is_uppercase) {
+        ("T", 3, "type")
+    } else if word.chars().all(|c| !c.is_ascii_lowercase()) {
+        ("#", 4, "macro")
+    } else if function {
+        ("ƒ", 5, "function")
+    } else {
+        ("v", 5, "variable")
+    }
 }
 
 /// What to offer for `prefix`: exact-case matches first; then the active file,
@@ -201,6 +363,8 @@ pub struct Completion {
     items: Vec<String>,
     selected: usize,
     chosen: bool,
+    pub include_path: bool,
+    functions: BTreeSet<String>,
     /// Where the prefix being completed starts on the caret's line.
     pub start_col: usize,
     /// What is typed is a word already: Enter starts a new line (Tab still
@@ -225,7 +389,7 @@ impl Completion {
         let cell = text.cell_size();
         let row_h = caret.h;
         let longest = items.iter().map(|w| w.chars().count()).max().unwrap_or(0);
-        let w = (longest as f32 * cell.w + 2.0 * PAD).min(body.w);
+        let w = (longest as f32 * cell.w + 2.0 * PAD + 88.0).min(body.w);
         let h = items.len().min(MAX_ROWS) as f32 * row_h;
         // Below the caret, or above it if only that fits.
         let y = if caret.bottom() + h <= body.bottom() {
@@ -238,6 +402,8 @@ impl Completion {
             items,
             selected: 0,
             chosen: false,
+            include_path: false,
+            functions: BTreeSet::new(),
             start_col,
             enter_makes_newline: false,
             rect: RectF::new(x, y, w, h),
@@ -256,6 +422,10 @@ impl Completion {
 
     pub fn has_choice(&self) -> bool {
         self.chosen
+    }
+
+    pub fn set_functions(&mut self, functions: BTreeSet<String>) {
+        self.functions = functions;
     }
 
     /// Moves the selection, wrapping at the ends.
@@ -297,8 +467,23 @@ impl Completion {
                 } else {
                     theme.text
                 };
-                let text = RectF::new(row.x + PAD, y, row.w - PAD, row.h);
+                let (mark, kind, detail) =
+                    glyph(word, self.functions.contains(word), self.include_path);
+                let color = match kind {
+                    0 => theme.dirty,
+                    1 => theme.syntax_preproc,
+                    2 => theme.syntax_keyword,
+                    3 => theme.syntax_type,
+                    4 => theme.syntax_number,
+                    _ => theme.syntax_function,
+                };
+                let icon = RectF::new(row.x + 5.0, y + 3.0, self.row_h - 6.0, self.row_h - 6.0);
+                d.fill_round_rect(icon, 2.0, color.with_alpha(0.22));
+                d.text(TextStyle::Mono, mark, icon, color);
+                let text = RectF::new(row.x + PAD + 16.0, y, (row.w - 104.0).max(0.0), row.h);
                 d.text(TextStyle::Mono, word, text, ink);
+                let detail_rect = RectF::new(row.right() - 78.0, y, 72.0, row.h);
+                d.text(TextStyle::Mono, detail, detail_rect, theme.text_dim);
             }
         });
         d.stroke_rect(self.rect, theme.border, 1.0);

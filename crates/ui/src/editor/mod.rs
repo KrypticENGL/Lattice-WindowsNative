@@ -667,12 +667,18 @@ impl EditorArea {
         let Some(doc) = self.docs.get_mut(self.active) else {
             return;
         };
-        let Some((start, prefix)) = doc.completion_prefix() else {
+        let include_prefix = doc.include_completion_prefix();
+        let Some((start, prefix)) = include_prefix.clone().or_else(|| doc.completion_prefix())
+        else {
             return;
         };
         let code = doc.is_code();
+        let is_include_path = include_prefix.is_some();
         let member_access = doc.is_member_access(start);
-        if !forced && (!code || (prefix.len() < 2 && (!member_access || prefix.is_empty()))) {
+        if !forced
+            && !is_include_path
+            && (!code || (prefix.len() < 2 && (!member_access || prefix.is_empty())))
+        {
             return;
         }
         let caret = doc.caret_rect(cx.text);
@@ -696,7 +702,19 @@ impl EditorArea {
         } else {
             Vec::new()
         };
-        let items = if directive {
+        let functions: std::collections::BTreeSet<String> = self
+            .docs
+            .iter()
+            .flat_map(|doc| {
+                doc.function_words()
+                    .iter()
+                    .chain(doc.included_function_words())
+                    .cloned()
+            })
+            .collect();
+        let items = if is_include_path {
+            complete::include_candidates(&prefix, self.docs[self.active].include_paths())
+        } else if directive {
             complete::directives(&prefix)
         } else if member_access {
             let mut members = Vec::with_capacity(self.docs.len());
@@ -729,6 +747,8 @@ impl EditorArea {
         };
         self.completion = Completion::new(items, start, caret, self.body, cx.text);
         if let Some(c) = &mut self.completion {
+            c.include_path = is_include_path;
+            c.set_functions(functions);
             c.enter_makes_newline =
                 complete::is_complete(&prefix, own.iter().chain(included.iter()).copied());
         }
@@ -736,7 +756,7 @@ impl EditorArea {
 
     fn accept_completion(&mut self, cx: &mut Cx) {
         if let (Some(c), Some(doc)) = (self.completion.take(), self.docs.get_mut(self.active)) {
-            doc.accept_completion(c.start_col, c.selected_word(), cx);
+            doc.accept_completion(c.start_col, c.include_path, c.selected_word(), cx);
         }
     }
 
@@ -1170,6 +1190,14 @@ impl Panel for EditorArea {
         };
         // Typing a word opens or narrows the list; anything else typed ends it.
         match *e {
+            Event::Char(_)
+                if self
+                    .docs
+                    .get(self.active)
+                    .is_some_and(|doc| doc.include_completion_prefix().is_some()) =>
+            {
+                self.refresh_completion(false, cx);
+            }
             Event::Char(c)
                 if c.is_ascii() && (is_word(c as u8) || matches!(c, '.' | '>' | ':')) =>
             {
